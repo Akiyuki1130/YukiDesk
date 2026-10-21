@@ -392,6 +392,77 @@ namespace DesktopBar
             barBody.Children.Add(Row("颜色", NewColorEditor(S.BarBgColor, h => { S.BarBgColor = h; Save(); })));
             barBody.Children.Add(Row("不透明度", NumberSlider(0, 100, S.BarBgOpacity * 100, "%", v => { S.BarBgOpacity = Math.Round(v) / 100; Save(); })));
             AppearanceHost.Children.Add(barCard);
+
+            BuildMicaCard();
+        }
+
+        /// <summary>
+        /// 胶囊云母材质卡片。云母 = 壁纸重模糊 + 亮度压带 + 主题染色 + 细噪点,
+        /// 一次性烘焙成位图,所以静止时 0 重绘——与液态玻璃每帧采样背景不是一个量级。
+        /// 只有"模糊半径/细节对比/彩度/染色/噪点"会触发重烘焙(后台线程约 0.3 秒),
+        /// 不透明度走画笔层,改立即生效。
+        /// </summary>
+        private void BuildMicaCard()
+        {
+            var card = Card("胶囊材质 · 云母",
+                "自绘 Mica：采样壁纸 → 重模糊 → 亮度压带 → 主题染色 → 细噪点，烘焙成一张位图。"
+                + "零屏幕捕获、零每帧开销，静止时不重绘；每个胶囊按自己在屏幕上的位置取对应一段。",
+                out var body);
+            body.Children.Add(Row("材质", BuildPillMaterialPicker()));
+            body.Children.Add(Row("不透明度", NumberSlider(5, 100, S.MicaOpacity * 100, "%",
+                v => { S.MicaOpacity = Math.Max(0.05, Math.Round(v) / 100); ApplyMica(); })));
+            body.Children.Add(Row("模糊半径", NumberSlider(4, 80, S.MicaBlurRadius, " px",
+                v => { S.MicaBlurRadius = Math.Round(v); ApplyMica(); })));
+            body.Children.Add(Row("细节对比", NumberSlider(0, 100, S.MicaContrast * 100, "%",
+                v => { S.MicaContrast = Math.Round(v) / 100; ApplyMica(); })));
+            body.Children.Add(Row("彩度", NumberSlider(0, 100, S.MicaSaturation * 100, "%",
+                v => { S.MicaSaturation = Math.Round(v) / 100; ApplyMica(); })));
+            body.Children.Add(Row("主题染色", NumberSlider(0, 100, S.MicaTint * 100, "%",
+                v => { S.MicaTint = Math.Round(v) / 100; ApplyMica(); })));
+            body.Children.Add(Row("细噪点", NumberSlider(0, 20, S.MicaNoise * 100, "%",
+                v => { S.MicaNoise = Math.Round(v) / 100; ApplyMica(); })));
+            body.Children.Add(MakeHint("「模糊半径/细节对比/彩度/主题染色/细噪点」改动会重新烘焙位图（后台线程约 0.3 秒）；"
+                + "「不透明度」改立即生效。壁纸或系统主题变化时会自动重算。", 12));
+            AppearanceHost.Children.Add(card);
+        }
+
+        /// <summary>胶囊材质二选：纯色（默认，沿用上方主题色）/ 云母（自绘 Mica）。</summary>
+        private FrameworkElement BuildPillMaterialPicker()
+        {
+            var panel = new StackPanel { Orientation = Orientation.Horizontal };
+            var options = new (string Label, int Mode)[]
+            {
+                ("纯色", 0), ("云母", 1)
+            };
+            foreach (var (label, mode) in options)
+            {
+                var rb = new RadioButton
+                {
+                    Content = label,
+                    GroupName = "pillmaterial",
+                    IsChecked = S.PillMaterial == mode,
+                    Style = (Style)FindResource("NavRadio"),
+                    Margin = new Thickness(0, 0, 14, 0)
+                };
+                int captured = mode;
+                rb.Checked += (s, e) => { S.PillMaterial = captured; ApplyMica(); };
+                panel.Children.Add(rb);
+            }
+            return panel;
+        }
+
+        /// <summary>
+        /// 云母参数变更：写盘 + 触发重算。首次开启时位图还不存在,
+        /// 同步算一次(约 0.3 秒)避免先闪一下纯色;之后都走后台线程。
+        /// </summary>
+        private void ApplyMica()
+        {
+            Save();
+            if (S.PillMaterial == 1 && Services.MicaService.Backdrop == null)
+                Services.MicaService.BakeOnce();
+            else
+                Services.MicaService.Invalidate();
+            Services.ThemeService.Refresh();
         }
 
         // ---------- 时间 ----------

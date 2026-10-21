@@ -35,6 +35,25 @@ namespace DesktopBar.Models
         public int HoverCloseDelayMs { get; set; } = 250;
         public int AnimationDurationMs { get; set; } = 180;
 
+        // ---- 胶囊材质(自绘云母 / Mica) ----
+        // 云母本质是"壁纸模糊 + 亮度压带 + 主题染色 + 细噪点",只依赖壁纸不依赖背后窗口,
+        // 所以可以用已知内容复现:零捕获、零每帧开销、任意胶囊形状(主报告 §9.22.5)。
+        // 默认 0 = 纯色,保持现有外观;只有用户显式打开才会烘焙位图。
+        /// <summary>胶囊材质:0=纯色(默认) 1=云母(自绘 Mica)。</summary>
+        public int PillMaterial { get; set; } = 0;
+        /// <summary>云母整体不透明度。</summary>
+        public double MicaOpacity { get; set; } = 0.86;
+        /// <summary>云母模糊半径(DIP,按显示器 DPI 换算成物理像素)。Mica 的模糊很重。</summary>
+        public double MicaBlurRadius { get; set; } = 28;
+        /// <summary>云母细节对比保留系数:0=完全压平到目标亮度带,1=保留壁纸原始对比。</summary>
+        public double MicaContrast { get; set; } = 0.30;
+        /// <summary>云母彩度保留系数。真实 Mica 接近单色,默认只留三成壁纸色相。</summary>
+        public double MicaSaturation { get; set; } = 0.35;
+        /// <summary>云母主题染色强度(往 ThemeService.Background 混多少)。</summary>
+        public double MicaTint { get; set; } = 0.18;
+        /// <summary>云母细噪点强度。这是云母与"纯模糊"最大的观感区别之一。</summary>
+        public double MicaNoise { get; set; } = 0.035;
+
         // 旧字段保留用于读取旧配置并迁移，不再单独应用。
         public TabStyle Folder { get; set; } = new TabStyle();
         public TabStyle Music { get; set; } = new TabStyle();

@@ -94,8 +94,54 @@ namespace DesktopBar
             }
             if (firstRun && !SettingsService.CorruptConfigDetected) Save();
             Log("YukiDesk 启动配置已加载");
+            // 无界面自检:只烘焙云母位图并写 PNG,不建任何窗口、不占屏幕。
+            // 用法: YukiDesk.exe --micadump <输出.png>
+            if (e.Args != null && Array.IndexOf(e.Args, "--micadump") >= 0)
+            {
+                RunMicaDump(e.Args);
+                Shutdown();
+                return;
+            }
             ThemeService.Start();
             Log("YukiDesk 主题服务已启动");
+            Services.MicaService.Start();
+            Log("YukiDesk 云母服务已启动");
+
+            // 自检:主窗口+托盘就绪之后再把设置窗口真的建出来并展示 6 秒,然后关掉。
+            // "打开设置就崩"这类回归只能这么复现——所有卡片要在 Loaded 之后
+            // 才会跑 ApplyMica/Invalidate,不展示就什么都触发不到。
+            // 必须在主窗口之后开:产品里设置窗口永远是后开的,提前到 OnStartup 里开
+            // 会让设置窗口的 Loaded 和 new MainWindow() 抢跑,那是自检自己造出来的崩溃。
+            if (Array.IndexOf(e.Args ?? Array.Empty<string>(), "--settings") >= 0)
+            {
+                var t = new Timer(_ =>
+                {
+                    try
+                    {
+                        Dispatcher.BeginInvoke(new Action(() =>
+                        {
+                            Log("[selftest] 打开设置窗口");
+                            try { ShowSettings(); }
+                            catch (Exception ex) { Console.WriteLine("[selftest] ShowSettings 抛异常: " + ex); }
+                            DumpSettingsWin("ShowSettings 返回");
+                        }));
+                    }
+                    catch { }
+                }, null, 1500, Timeout.Infinite);
+                var t2 = new Timer(_ =>
+                {
+                    try
+                    {
+                        Dispatcher.BeginInvoke(new Action(() =>
+                        {
+                            DumpSettingsWin("8.5 秒到点");
+                            Log("[selftest] 关闭设置窗口");
+                            _settingsWin?.Close();
+                        }));
+                    }
+                    catch { }
+                }, null, 8500, Timeout.Infinite);
+            }
             Bar = new MainWindow();
             Log("YukiDesk 主窗口已创建");
             Bar.Show();
@@ -106,19 +152,45 @@ namespace DesktopBar
             UpdateService.StartAutoCheck();
             // 登录温度任务存在但从属不在运行(例如本会话手动重启过应用)时主动拉起一次;
             // 只在任务路径与当前 exe 一致时执行,查询较重,放后台线程。
-            System.Threading.Tasks.Task.Run(() =>
+            // --settings 自检时跳过:设置窗口自己的 _tempStatusTimer 也在周期跑同一个
+            // QuerySlaveTask(),两路并发 spawn schtasks.exe 会把进程直接打崩(SIGSEGV,
+            // 无 WER 记录),实测 3 秒内必崩。正常启动没有第二路探测,不受影响。
+            if (Array.IndexOf(e.Args ?? Array.Empty<string>(), "--settings") < 0)
             {
-                try
+                System.Threading.Tasks.Task.Run(() =>
                 {
-                    var (exists, pathOk) = SettingsWindow.QuerySlaveTask();
-                    if (exists && pathOk && !TemperatureSlave.IsFresh)
+                    try
                     {
-                        Log("检测到登录温度任务存在但从属未运行,主动拉起");
-                        SettingsWindow.RunSlaveTaskOnce();
+                        var (exists, pathOk) = SettingsWindow.QuerySlaveTask();
+                        if (exists && pathOk && !TemperatureSlave.IsFresh)
+                        {
+                            Log("检测到登录温度任务存在但从属未运行,主动拉起");
+                            SettingsWindow.RunSlaveTaskOnce();
+                        }
                     }
-                }
-                catch { }
-            });
+                    catch { }
+                });
+            }
+        }
+
+        // 仅给 --settings 自检用的控制台诊断:设置窗口"开了没开、活没活"只能这么看,
+        // 因为顶栏宿主进程在这个沙箱里写不了 %AppData%\YukiDesk\log.txt,日志方案整体失效。
+        private static void DumpSettingsWin(string stage)
+        {
+            try
+            {
+                var w = _settingsWin;
+                if (w == null) { Console.WriteLine("[selftest][" + stage + "] _settingsWin=null"); return; }
+                string h;
+                try { h = "0x" + new System.Windows.Interop.WindowInteropHelper(w).Handle.ToString("X"); }
+                catch (Exception ex) { h = "取句柄失败:" + ex.GetType().Name; }
+                Console.WriteLine("[selftest][" + stage + "] title=" + w.Title
+                    + " visible=" + w.IsVisible + " loaded=" + w.IsLoaded
+                    + " opacity=" + w.Opacity + " state=" + w.WindowState
+                    + " w=" + w.Width + " h=" + w.Height
+                    + " hwnd=" + h);
+            }
+            catch (Exception ex) { Console.WriteLine("[selftest][" + stage + "] 诊断本身抛异常: " + ex); }
         }
 
         private void BuildTray()
@@ -157,6 +229,7 @@ namespace DesktopBar
             try { UI.OperationProgressDialog.WaitForIdle(5000); } catch { }
             try { Services.UpdateService.StopAutoCheck(); } catch { }
             try { Services.ThemeService.Stop(); } catch { }
+            try { Services.MicaService.Stop(); } catch { }
             try { DesktopSpaceService.Restore(); } catch { }
             try { if (_tray != null) { _tray.Visible = false; _tray.Dispose(); } } catch { }
             try { _trayIcon?.Dispose(); } catch { }
@@ -169,6 +242,78 @@ namespace DesktopBar
 
         public static void Save() => SettingsService.Save(Settings);
         public static void ApplyAndSave() { Save(); Bar?.ApplySettings(); }
+
+        /// <summary>
+        /// 无界面云母自检:同步烘焙一次并把位图写成 PNG,同时在 stdout 打几何与统计信息。
+        /// 不创建任何窗口,所以不会占用屏幕——给"只在后台工作"的场景用。
+        /// </summary>
+        private static void RunMicaDump(string[] args)
+        {
+            string outPath = null;
+            for (int i = 0; i < args.Length - 1; i++)
+                if (args[i] == "--micadump") outPath = args[i + 1];
+            if (string.IsNullOrWhiteSpace(outPath)) outPath = Path.Combine(Path.GetTempPath(), "yukidesk-mica.png");
+
+            // 自检要覆盖"没开云母"的路径:显式打开一次,免得测的是回退分支。
+            if (Settings.PillMaterial == 0) Settings.PillMaterial = 1;
+            Console.WriteLine("[diag] " + Services.MicaService.Diag());
+            Services.ThemeService.Start();
+
+            // --micabg:走 MicaService.Invalidate() 的真实后台烘焙路径(不建任何窗口)。
+            // WPF 成像对象(BitmapDecoder/WriteableBitmap)是 DispatcherObject,
+            // 在线程池线程上创建会直接 AV(coreclr/GPP64 双重崩溃),必须走这个模式才复现得了。
+            if (Array.IndexOf(args, "--micabg") >= 0)
+            {
+                // A/B 对照:扰动一个进签名的参数,强制烘焙真的跑一遍。
+                // 否则 Start() 已经按当前参数算过,签名相同就只会 RaiseChanged,
+                // 根本走不到 Bake(),旧代码的崩溃也就复现不出来。
+                if (Environment.GetEnvironmentVariable("YUKI_MICA_LEGACY") == "1")
+                    Settings.MicaBlurRadius = Math.Round(Settings.MicaBlurRadius) + 1;
+                Console.WriteLine("[micabg] 准备 Invalidate");
+                Services.MicaService.Invalidate();
+                Console.WriteLine("[micabg] Invalidate 已返回");
+                var sw2 = System.Diagnostics.Stopwatch.StartNew();
+                while (Services.MicaService.Backdrop == null && sw2.ElapsedMilliseconds < 20000)
+                    System.Threading.Thread.Sleep(50);
+                Console.WriteLine("[micabg] 等待结束 Backdrop=" + (Services.MicaService.Backdrop == null ? "null" : "ok"));
+                var b2 = Services.MicaService.Backdrop;
+                string r = b2 == null
+                    ? "null(烘焙线程 20s 内没出结果,见日志)"
+                    : b2.PixelWidth + "x" + b2.PixelHeight + " 平均色=" + Services.MicaService.Average;
+                Console.WriteLine("[micabg] 烘焙线程位图 = " + r);
+                Log("[micabg] 烘焙线程位图 = " + r);
+            }
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            bool ok = Services.MicaService.BakeOnce();
+            sw.Stop();
+
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine("MicaService.BakeOnce = " + ok + "  耗时 " + sw.ElapsedMilliseconds + "ms");
+            var bmp = Services.MicaService.Backdrop;
+            if (bmp == null)
+            {
+                sb.AppendLine("位图 = null(回退纯色)。检查壁纸路径是否可读。");
+            }
+            else
+            {
+                sb.AppendLine("位图 = " + bmp.PixelWidth + "x" + bmp.PixelHeight
+                              + " 出血=" + Services.MicaService.Bleed
+                              + " 平均色=" + Services.MicaService.Average
+                              + " 深色=" + Services.MicaService.IsDark);
+                try
+                {
+                    var enc = new System.Windows.Media.Imaging.PngBitmapEncoder();
+                    enc.Frames.Add(System.Windows.Media.Imaging.BitmapFrame.Create(bmp));
+                    using var fs = new FileStream(outPath, FileMode.Create, FileAccess.Write);
+                    enc.Save(fs);
+                    sb.AppendLine("已写出 " + outPath);
+                }
+                catch (Exception ex) { sb.AppendLine("写 PNG 失败: " + ex.Message); }
+            }
+            Console.Write(sb.ToString());
+            Log(sb.ToString().Replace("\n", " | "));
+        }
 
         /// <summary>托盘气泡通知(更新提醒等);托盘未创建或已退出时静默。</summary>
         public static void ShowTrayBalloon(string title, string text)

@@ -116,6 +116,14 @@ namespace DesktopBar.Services
             s.HoverCloseDelayMs = Math.Clamp(s.HoverCloseDelayMs, 80, 2000);
             s.AnimationDurationMs = Math.Clamp(s.AnimationDurationMs, 60, 1200);
             if (s.SettingsThemeMode < 0 || s.SettingsThemeMode > 2) s.SettingsThemeMode = 0;
+            // 云母档位:0=纯色 1=云母。未知值(含旧配置里根本没有的字段)一律回纯色。
+            if (s.PillMaterial < 0 || s.PillMaterial > 1) s.PillMaterial = 0;
+            s.MicaOpacity = Clamp(s.MicaOpacity, 0.05, 1, 0.86);
+            s.MicaBlurRadius = Clamp(s.MicaBlurRadius, 4, 80, 28);
+            s.MicaContrast = Clamp(s.MicaContrast, 0, 1, 0.30);
+            s.MicaSaturation = Clamp(s.MicaSaturation, 0, 1, 0.35);
+            s.MicaTint = Clamp(s.MicaTint, 0, 1, 0.18);
+            s.MicaNoise = Clamp(s.MicaNoise, 0, 0.2, 0.035);
             return s;
         }
 

@@ -76,6 +76,10 @@ namespace DesktopBar.UI
                 if (!IsVisible) ClosePanelImmediately();
             };
             ThemeService.Changed += OnThemeChanged;
+            MicaService.Changed += OnThemeChanged;
+            // 胶囊位置/大小变化时要重算云母取样矩形。只在真的用云母时才做,
+            // 由 UpdateMicaViewbox 内部的 _micaBrush == null 早退保证零成本。
+            Pill.LayoutUpdated += (s2, e2) => UpdateMicaViewbox();
             ApplyTheme();
         }
 
@@ -163,11 +167,15 @@ namespace DesktopBar.UI
         {
             var s = App.Settings;
             double scale = Ui.Scale;
-            Pill.Background = Ui.Brush(ThemeService.Background, s?.ThemeOpacity ?? 0.55);
+            ApplyPillBackground(s, scale);
             Pill.BorderBrush = s != null && s.BorderEnabled ? Ui.Brush(ThemeService.Border, s.BorderOpacity) : Brushes.Transparent;
             Pill.BorderThickness = s != null && s.BorderEnabled ? new Thickness(Math.Max(0, s.BorderThickness * scale)) : new Thickness(0);
             // Reuse the pill brush so the expanded page has exactly the same color and alpha.
-            Panel.Background = Pill.Background;
+            // 云母档例外:展开页会伸到顶栏条带之外,没有壁纸可取样,只能用云母平均色平涂
+            // (真实 Mica 弹层因为模糊极重,看起来也接近平涂,观感损失很小)。
+            Panel.Background = Pill.Background is ImageBrush
+                ? new SolidColorBrush(MicaService.Average) { Opacity = Math.Max(0.05, Math.Min(1, s?.MicaOpacity ?? 0.86)) }
+                : Pill.Background;
             Panel.BorderBrush = Pill.BorderBrush;
             Panel.BorderThickness = Pill.BorderThickness;
             PanelWindow.Background = Brushes.Transparent;
@@ -196,6 +204,71 @@ namespace DesktopBar.UI
         {
             if (Dispatcher.CheckAccess()) ApplyTheme();
             else Dispatcher.BeginInvoke(new Action(ApplyTheme));
+        }
+
+        /// <summary>
+        /// 云母画笔与它当前对应的取样矩形。取样矩形随胶囊位置/大小变化,
+        /// 所以每次布局变化都要重算一次(只改画刷属性,不重新烘焙位图,很便宜)。
+        /// </summary>
+        private ImageBrush _micaBrush;
+        private Rect _micaViewbox = Rect.Empty;
+        private bool _micaLogged;
+
+        /// <summary>
+        /// 按材质设置给胶囊上背景。云母档用一支 <see cref="ImageBrush"/> 从云母位图里
+        /// 截取"胶囊在屏幕上的那一段",所以每个胶囊看到的明暗分布和真实桌面一致。
+        /// </summary>
+        private void ApplyPillBackground(AppSettings s, double scale)
+        {
+            bool mica = s != null && s.PillMaterial == 1 && MicaService.Backdrop != null;
+            if (!mica)
+            {
+                _micaBrush = null;
+                _micaViewbox = Rect.Empty;
+                Pill.Background = Ui.Brush(ThemeService.Background, s?.ThemeOpacity ?? 0.55);
+                return;
+            }
+
+            double opacity = Math.Max(0.05, Math.Min(1, s.MicaOpacity));
+            if (_micaBrush == null || !ReferenceEquals(_micaBrush.ImageSource, MicaService.Backdrop))
+            {
+                _micaBrush = MicaService.CreateBrush(Rect.Empty, opacity);
+                _micaViewbox = Rect.Empty; // 新画刷要从零开始定标
+            }
+            else
+            {
+                _micaBrush.Opacity = opacity;
+            }
+            if (_micaBrush == null)
+            {
+                // 极端情况:位图在两次调用之间被清掉了,退回纯色保证可见
+                Pill.Background = Ui.Brush(ThemeService.Background, s?.ThemeOpacity ?? 0.55);
+                return;
+            }
+            Pill.Background = _micaBrush;
+            UpdateMicaViewbox();
+        }
+
+        /// <summary>把云母画刷的取样矩形同步到胶囊当前在屏幕上的物理位置。</summary>
+        private void UpdateMicaViewbox()
+        {
+            if (_micaBrush == null) return;
+            try
+            {
+                var vb = MicaService.ViewboxFor(Pill);
+                if (vb.IsEmpty || vb == _micaViewbox) return;
+                _micaViewbox = vb;
+                _micaBrush.Viewbox = vb;
+                // 每个模块只记一次:用来核对"胶囊在屏幕上的物理矩形 → 云母位图坐标"映射对不对。
+                if (!_micaLogged)
+                {
+                    _micaLogged = true;
+                    App.Log(string.Format("云母胶囊: {0} 取样矩形=({1:F1},{2:F1},{3:F1}x{4:F1}) 位图={5}x{6} 出血={7:F1}",
+                        GetType().Name, vb.X, vb.Y, vb.Width, vb.Height,
+                        MicaService.Backdrop.PixelWidth, MicaService.Backdrop.PixelHeight, MicaService.Bleed));
+                }
+            }
+            catch { }
         }
 
         public void ShowPanel()
@@ -322,6 +395,7 @@ namespace DesktopBar.UI
             _closeTimer.Stop();
             if (ReferenceEquals(_active, this)) _active = null;
             ThemeService.Changed -= OnThemeChanged;
+            MicaService.Changed -= OnThemeChanged;
             HidePanelImmediate();
             try { PanelWindow.Close(); } catch { }
         }

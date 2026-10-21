@@ -509,6 +509,27 @@ namespace DesktopBar.Interop
         private static extern UIntPtr SHAppBarMessage(uint message, ref APPBARDATA data);
         [DllImport("user32.dll")]
         private static extern uint GetDpiForWindow(IntPtr hwnd);
+        // 系统级 DPI:不需要任何 DC,任意线程都能安全调。
+        // 云母烘焙跑在后台线程,绝不能用 Graphics.FromHwnd(NULL) 拿 DPI——
+        // 那是 GDI+ 且要共享桌面 DC,后台线程上和 UI 线程的 GDI+ 并发会直接 AV(GPP64.dll)。
+        [DllImport("user32.dll")]
+        private static extern uint GetDpiForSystem();
+        [DllImport("user32.dll")]
+        private static extern int GetSystemMetrics(int index);
+        private const int SM_CXSCREEN = 0, SM_CYSCREEN = 1;
+
+        /// <summary>主屏逻辑像素宽(任意线程安全,替代 SystemParameters.PrimaryScreenWidth)。</summary>
+        internal static int ScreenWidth() => GetSystemMetrics(SM_CXSCREEN);
+
+        /// <summary>主屏逻辑像素高(任意线程安全,替代 SystemParameters.PrimaryScreenHeight)。</summary>
+        internal static int ScreenHeight() => GetSystemMetrics(SM_CYSCREEN);
+
+        /// <summary>系统 DPI 缩放(96=100%)。Win10 1607 之前没有这个 API,退回 1.0。</summary>
+        internal static double SystemDpiScale()
+        {
+            try { uint d = GetDpiForSystem(); return d > 0 ? d / 96.0 : 1.0; }
+            catch { return 1.0; }
+        }
 
         private const uint SPI_GETWORKAREA = 0x0030;
         private const uint SPI_SETWORKAREA = 0x002F;
