@@ -540,39 +540,49 @@ namespace DesktopBar.UI
             string directory = Dir;
             var snapshot = FileClipboard.CapturePasteSnapshot();
             if (snapshot == null || string.IsNullOrEmpty(directory)) return;
-            FileClipboard.PasteResult paste = null;
-            var result = await OperationProgressDialog.RunDetailedAsync("正在粘贴文件", false, snapshot.Paths.Count,
-                progress => Task.Run(() =>
+            try
+            {
+                FileClipboard.PasteResult paste = null;
+                var result = await OperationProgressDialog.RunDetailedAsync("正在粘贴文件", false, snapshot.Paths.Count,
+                    progress => Task.Run(() =>
+                    {
+                        paste = FileClipboard.PasteSnapshotDetailed(snapshot, directory,
+                            (completed, name, placed) => progress.Report(completed, name, placed));
+                    }));
+                if (!_disposed) LoadFiles();
+                if (!result.Started)
                 {
-                    paste = FileClipboard.PasteSnapshotDetailed(snapshot, directory,
-                        (completed, name, placed) => progress.Report(completed, name, placed));
-                }));
-            if (!_disposed) LoadFiles();
-            if (!result.Started)
-            {
-                ConfirmDialog.Notice("操作进行中", "已有文件操作正在进行，请稍后再试。");
-                return;
+                    ConfirmDialog.Notice("操作进行中", "已有文件操作正在进行，请稍后再试。");
+                    return;
+                }
+                if (result.Error != null)
+                {
+                    ConfirmDialog.Notice("移动未完成",
+                        "操作被中断：" + result.Error.Message + "\n部分项目可能已移动，请检查目标文件夹。");
+                    return;
+                }
+                int succeeded = paste?.Succeeded ?? result.Succeeded;
+                int total = paste?.Total ?? snapshot.Paths.Count;
+                // 剪切语义已完整消费:清掉剪贴板,符合资源管理器惯例,避免"再粘贴"静默无效。
+                if (snapshot.Move && paste != null && paste.Total > 0 && paste.Succeeded == paste.Total)
+                {
+                    try { Clipboard.Clear(); } catch { }
+                }
+                if (succeeded < total)
+                {
+                    var failed = paste?.FailedItems ?? Array.Empty<string>();
+                    ConfirmDialog.Notice("粘贴未全部完成",
+                        "已完成 " + succeeded + "/" + total + " 项。"
+                        + (failed.Count == 0 ? "" : "\n\n" + string.Join("\n", failed.Take(5))
+                            + (failed.Count > 5 ? "\n……" : "")));
+                }
             }
-            if (result.Error != null)
+            // async void 的异常不会进调用方,只会落到全局兜底被静默吞掉;粘贴是用户显式动作,
+            // 失败必须留下日志和提示,否则表现为"点了没反应"。
+            catch (Exception ex)
             {
-                ConfirmDialog.Notice("移动未完成",
-                    "操作被中断：" + result.Error.Message + "\n部分项目可能已移动，请检查目标文件夹。");
-                return;
-            }
-            int succeeded = paste?.Succeeded ?? result.Succeeded;
-            int total = paste?.Total ?? snapshot.Paths.Count;
-            // 剪切语义已完整消费:清掉剪贴板,符合资源管理器惯例,避免"再粘贴"静默无效。
-            if (snapshot.Move && paste != null && paste.Total > 0 && paste.Succeeded == paste.Total)
-            {
-                try { Clipboard.Clear(); } catch { }
-            }
-            if (succeeded < total)
-            {
-                var failed = paste?.FailedItems ?? Array.Empty<string>();
-                ConfirmDialog.Notice("粘贴未全部完成",
-                    "已完成 " + succeeded + "/" + total + " 项。"
-                    + (failed.Count == 0 ? "" : "\n\n" + string.Join("\n", failed.Take(5))
-                        + (failed.Count > 5 ? "\n……" : "")));
+                App.Log("粘贴文件失败: " + ex.Message);
+                ConfirmDialog.Notice("粘贴失败", "操作意外中断: " + ex.Message);
             }
         }
 
@@ -626,6 +636,13 @@ namespace DesktopBar.UI
                 _filesDirty = false;
             }
             catch (InvalidOperationException) { _filesDirty = true; }
+            // InvalidOperationException 是面板竞态的预期路径;其余异常(目录被占用的 IO 等)
+            // 也标记脏,下次打开面板会重试,同时留日志供排查。
+            catch (Exception ex)
+            {
+                _filesDirty = true;
+                App.Log("加载小文件夹失败: " + ex.Message);
+            }
         }
 
         private static List<FileSystemInfo> SnapshotFiles(string directory)
@@ -762,21 +779,29 @@ namespace DesktopBar.UI
         private async void DeleteItem(FileSystemInfo f)
         {
             if (!ConfirmDialog.ShowDanger("删除", "确定要把“" + f.Name + "”移到回收站吗？", "删除")) return;
-            bool success = false;
-            var result = await OperationProgressDialog.RunDetailedAsync("正在移入回收站", true, 1,
-                progress => Task.Run(() =>
-                {
-                    success = NativeMethods.DeleteToRecycleBin(new[] { f.FullName });
-                    progress.Report(1, f.Name, success);
-                }));
-            if (_disposed) return;
-            if (!result.Started)
+            try
             {
-                ConfirmDialog.Notice("操作进行中", "已有文件操作正在进行，请稍后再试。");
-                return;
+                bool success = false;
+                var result = await OperationProgressDialog.RunDetailedAsync("正在移入回收站", true, 1,
+                    progress => Task.Run(() =>
+                    {
+                        success = NativeMethods.DeleteToRecycleBin(new[] { f.FullName });
+                        progress.Report(1, f.Name, success);
+                    }));
+                if (_disposed) return;
+                if (!result.Started)
+                {
+                    ConfirmDialog.Notice("操作进行中", "已有文件操作正在进行，请稍后再试。");
+                    return;
+                }
+                if (success) LoadFiles();
+                else ConfirmDialog.Notice("删除失败", "无法把“" + f.Name + "”移到回收站。");
             }
-            if (success) LoadFiles();
-            else ConfirmDialog.Notice("删除失败", "无法把“" + f.Name + "”移到回收站。");
+            catch (Exception ex)
+            {
+                App.Log("移入回收站失败: " + ex.Message);
+                ConfirmDialog.Notice("删除失败", "操作意外中断: " + ex.Message);
+            }
         }
         private void EnableDragDrop()
         {
@@ -1074,6 +1099,8 @@ namespace DesktopBar.UI
                 }
             }
             catch (InvalidOperationException) { }
+            // 面板竞态是预期路径;其余异常(磁盘枚举失败等)留日志,面板内容可能不新但不崩。
+            catch (Exception ex) { App.Log("加载回收站失败: " + ex.Message); }
         }
 
         private FrameworkElement MakeRecycleItem(RecycleItem item)
@@ -1238,87 +1265,112 @@ namespace DesktopBar.UI
 
         private async void RestoreItemAsync(RecycleItem item)
         {
-            bool success = false;
-            var result = await OperationProgressDialog.RunDetailedAsync("正在还原文件", true, 1,
-                progress => Task.Run(() =>
-                {
-                    success = RecycleBin.Restore(item);
-                    progress.Report(1, item.Name, success);
-                }));
-            if (_disposed) return;
-            if (!result.Started)
+            try
             {
-                ConfirmDialog.Notice("操作进行中", "已有文件操作正在进行，请稍后再试。");
-                return;
+                bool success = false;
+                var result = await OperationProgressDialog.RunDetailedAsync("正在还原文件", true, 1,
+                    progress => Task.Run(() =>
+                    {
+                        success = RecycleBin.Restore(item);
+                        progress.Report(1, item.Name, success);
+                    }));
+                if (_disposed) return;
+                if (!result.Started)
+                {
+                    ConfirmDialog.Notice("操作进行中", "已有文件操作正在进行，请稍后再试。");
+                    return;
+                }
+                if (success) LoadItems();
+                else ConfirmDialog.Notice("还原失败", "还原“" + item.Name + "”失败，请检查原始位置是否可用。");
             }
-            if (success) LoadItems();
-            else ConfirmDialog.Notice("还原失败", "还原“" + item.Name + "”失败，请检查原始位置是否可用。");
+            catch (Exception ex)
+            {
+                App.Log("还原回收站项目失败: " + ex.Message);
+                ConfirmDialog.Notice("还原失败", "操作意外中断: " + ex.Message);
+            }
         }
 
         private async void DeletePermanentlyAsync(RecycleItem item)
         {
-            bool dataDeleted = false;
-            bool metaDeleted = false;
-            var result = await OperationProgressDialog.RunDetailedAsync("正在永久删除", true, 1,
-                progress => Task.Run(() =>
-                {
-                    try
+            try
+            {
+                bool dataDeleted = false;
+                bool metaDeleted = false;
+                var result = await OperationProgressDialog.RunDetailedAsync("正在永久删除", true, 1,
+                    progress => Task.Run(() =>
                     {
-                        if (item.IsDirectory) Directory.Delete(item.DataPath, true);
-                        else File.Delete(item.DataPath);
-                        dataDeleted = true;
                         try
                         {
-                            File.Delete(item.MetaFile);
-                            metaDeleted = true;
+                            if (item.IsDirectory) Directory.Delete(item.DataPath, true);
+                            else File.Delete(item.DataPath);
+                            dataDeleted = true;
+                            try
+                            {
+                                File.Delete(item.MetaFile);
+                                metaDeleted = true;
+                            }
+                            catch (Exception ex) { App.Log("永久删除元数据失败: " + ex.Message); }
                         }
-                        catch (Exception ex) { App.Log("永久删除元数据失败: " + ex.Message); }
-                    }
-                    catch (Exception ex) { App.Log("永久删除失败: " + ex.Message); }
-                    progress.Report(1, item.Name, dataDeleted && metaDeleted);
-                }));
-            if (_disposed) return;
-            if (!result.Started)
-            {
-                ConfirmDialog.Notice("操作进行中", "已有文件操作正在进行，请稍后再试。");
-                return;
+                        catch (Exception ex) { App.Log("永久删除失败: " + ex.Message); }
+                        progress.Report(1, item.Name, dataDeleted && metaDeleted);
+                    }));
+                if (_disposed) return;
+                if (!result.Started)
+                {
+                    ConfirmDialog.Notice("操作进行中", "已有文件操作正在进行，请稍后再试。");
+                    return;
+                }
+                if (dataDeleted && metaDeleted) LoadItems();
+                else if (dataDeleted)
+                    ConfirmDialog.Notice("永久删除部分完成", "内容已删除，但回收站元数据清理失败，请检查回收站。");
+                else
+                    ConfirmDialog.Notice("永久删除失败", "无法删除“" + item.Name + "”。");
+                if (!dataDeleted || !metaDeleted) LoadItems();
             }
-            if (dataDeleted && metaDeleted) LoadItems();
-            else if (dataDeleted)
-                ConfirmDialog.Notice("永久删除部分完成", "内容已删除，但回收站元数据清理失败，请检查回收站。");
-            else
-                ConfirmDialog.Notice("永久删除失败", "无法删除“" + item.Name + "”。");
-            if (!dataDeleted || !metaDeleted) LoadItems();
+            catch (Exception ex)
+            {
+                App.Log("永久删除失败: " + ex.Message);
+                ConfirmDialog.Notice("永久删除失败", "操作意外中断: " + ex.Message);
+            }
         }
 
         private async void CopyRecycleItem(RecycleItem item)
         {
-            string temporaryPath = null;
-            var result = await OperationProgressDialog.RunDetailedAsync("正在准备复制", true, 1,
-                progress => Task.Run(() =>
+            try
+            {
+                string temporaryPath = null;
+                var result = await OperationProgressDialog.RunDetailedAsync("正在准备复制", true, 1,
+                    progress => Task.Run(() =>
+                    {
+                        try
+                        {
+                            temporaryPath = FileClipboard.CreateNamedTemporaryCopy(item.DataPath, item.Name);
+                            progress.Report(1, item.Name, true);
+                        }
+                        catch (Exception ex)
+                        {
+                            App.Log("复制回收站项目失败: " + ex.Message);
+                            progress.Report(1, "操作失败", false);
+                        }
+                    }));
+                if (!result.Started)
                 {
-                    try
-                    {
-                        temporaryPath = FileClipboard.CreateNamedTemporaryCopy(item.DataPath, item.Name);
-                        progress.Report(1, item.Name, true);
-                    }
-                    catch (Exception ex)
-                    {
-                        App.Log("复制回收站项目失败: " + ex.Message);
-                        progress.Report(1, "操作失败", false);
-                    }
-                }));
-            if (!result.Started)
-            {
-                ConfirmDialog.Notice("操作进行中", "已有文件操作正在进行，请稍后再试。");
-                return;
+                    ConfirmDialog.Notice("操作进行中", "已有文件操作正在进行，请稍后再试。");
+                    return;
+                }
+                // 剪贴板写入口(OLE)在被他进程短暂占用时会抛 COMException,这里必须兜住。
+                bool copied = !string.IsNullOrEmpty(temporaryPath)
+                    && FileClipboard.WriteTemporaryPath(temporaryPath);
+                if (!copied)
+                {
+                    FileClipboard.CleanupTemporaryPath(temporaryPath);
+                    ConfirmDialog.Notice("复制失败", "无法复制“" + item.Name + "”。");
+                }
             }
-            bool copied = !string.IsNullOrEmpty(temporaryPath)
-                && FileClipboard.WriteTemporaryPath(temporaryPath);
-            if (!copied)
+            catch (Exception ex)
             {
-                FileClipboard.CleanupTemporaryPath(temporaryPath);
-                ConfirmDialog.Notice("复制失败", "无法复制“" + item.Name + "”。");
+                App.Log("复制回收站项目失败: " + ex.Message);
+                ConfirmDialog.Notice("复制失败", "操作意外中断: " + ex.Message);
             }
         }
 
@@ -1368,23 +1420,31 @@ namespace DesktopBar.UI
         {
             if (!ConfirmDialog.ShowDanger("清空回收站", "所有项目将被永久删除，此操作不可恢复。\n确定要继续吗？", "清空回收站"))
                 return;
-            int hr = int.MinValue;
-            var result = await OperationProgressDialog.RunDetailedAsync("正在清空回收站", true, 1,
-                progress => Task.Run(() =>
-                {
-                    hr = NativeMethods.EmptyRecycleBin();
-                    progress.Report(1, hr == 0 ? "已完成" : "操作失败", hr == 0);
-                }));
-            if (!result.Started)
+            try
             {
-                ConfirmDialog.Notice("操作进行中", "已有文件操作正在进行，请稍后再试。");
-                return;
+                int hr = int.MinValue;
+                var result = await OperationProgressDialog.RunDetailedAsync("正在清空回收站", true, 1,
+                    progress => Task.Run(() =>
+                    {
+                        hr = NativeMethods.EmptyRecycleBin();
+                        progress.Report(1, hr == 0 ? "已完成" : "操作失败", hr == 0);
+                    }));
+                if (!result.Started)
+                {
+                    ConfirmDialog.Notice("操作进行中", "已有文件操作正在进行，请稍后再试。");
+                    return;
+                }
+                App.Log("清空回收站 hr=0x" + hr.ToString("X8"));
+                if (!_disposed) LoadItems();
+                // 空桶调用 SHEmptyRecycleBin 常返回 E_UNEXPECTED,实际无事发生,不能当失败吓用户。
+                if (hr != 0 && hr != NativeMethods.E_UNEXPECTED)
+                    ConfirmDialog.Notice("清空回收站失败", "Windows 未能完成清空操作。\n错误代码: 0x" + hr.ToString("X8"));
             }
-            App.Log("清空回收站 hr=0x" + hr.ToString("X8"));
-            if (!_disposed) LoadItems();
-            // 空桶调用 SHEmptyRecycleBin 常返回 E_UNEXPECTED,实际无事发生,不能当失败吓用户。
-            if (hr != 0 && hr != NativeMethods.E_UNEXPECTED)
-                ConfirmDialog.Notice("清空回收站失败", "Windows 未能完成清空操作。\n错误代码: 0x" + hr.ToString("X8"));
+            catch (Exception ex)
+            {
+                App.Log("清空回收站失败: " + ex.Message);
+                ConfirmDialog.Notice("清空回收站失败", "操作意外中断: " + ex.Message);
+            }
         }
 
     }
