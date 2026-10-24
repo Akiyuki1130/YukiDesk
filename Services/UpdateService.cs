@@ -132,11 +132,18 @@ namespace DesktopBar.Services
 
         private static string FindChecksumAsset(JsonElement root, string version)
         {
-            string name1 = "SHA256SUMS-" + version + ".txt";
+            // 兼容两种清单命名:tag 三段版(SHA256SUMS-1.0.8.txt)与程序集四段版
+            // (SHA256SUMS-1.0.8.0.txt,2026-10 之前的 packaging.cmd 用 FileVersion 命名,
+            // 已发布的 Release 带的就是四段名)。没有这个回退时四段清单永远匹配不上,
+            // ChecksumUrl 为 null → VerifyChecksumAsync 静默跳过,宣称的 SHA-256 校验
+            // 实际不生效。与 FindAsset 的双名匹配(expectedShort/expectedAssembly)同构。
+            string nameTag = "SHA256SUMS-" + version + ".txt";
+            string nameAssembly = "SHA256SUMS-" + version + ".0.txt";
             foreach (var asset in root.GetProperty("assets").EnumerateArray())
             {
                 string name = asset.GetProperty("name").GetString() ?? "";
-                if (!string.Equals(name, name1, StringComparison.OrdinalIgnoreCase)) continue;
+                if (!string.Equals(name, nameTag, StringComparison.OrdinalIgnoreCase)
+                    && !string.Equals(name, nameAssembly, StringComparison.OrdinalIgnoreCase)) continue;
                 string url = asset.GetProperty("browser_download_url").GetString() ?? "";
                 if (Uri.TryCreate(url, UriKind.Absolute, out var uri)
                     && string.Equals(uri.Host, "github.com", StringComparison.OrdinalIgnoreCase))

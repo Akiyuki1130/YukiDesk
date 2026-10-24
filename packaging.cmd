@@ -63,12 +63,23 @@ if not defined VER (
     exit /b 1
 )
 
+rem Installer filenames carry the 4-segment FileVersion (%VER%), but the checksum
+rem manifest MUST be named with the 3-segment tag version (%VER3%): the updater
+rem matches SHA256SUMS-<tag>.txt first, and builds already in the field (v1.0.0
+rem through v1.0.8) match ONLY that exact name, so a 4-segment manifest would
+rem silently disable integrity checks for users updating from those versions.
+for /f "tokens=1-3 delims=." %%a in ("%VER%") do set "VER3=%%a.%%b.%%c"
+if not defined VER3 (
+    echo [ERROR] cannot derive tag version from %VER%
+    exit /b 1
+)
+
 echo ========== Clean stale installers (keep %VER%) ==========
 rem Keep only current-version assets so manual upload cannot pick up a stale installer.
 powershell -NoProfile -Command "Get-ChildItem 'installers\YukiDesk-Setup-*.exe' | Where-Object { $_.Name -notlike '*-%VER%.exe' } | Remove-Item -Force" 2>nul
 
-rem SHA256SUMS-<ver>.txt: the updater downloads this manifest to verify installer integrity.
-set "SUMS=installers\SHA256SUMS-%VER%.txt"
+rem SHA256SUMS-<tag>.txt: the updater downloads this manifest to verify installer integrity.
+set "SUMS=installers\SHA256SUMS-%VER3%.txt"
 powershell -NoProfile -Command "$f = Get-ChildItem 'installers\YukiDesk-Setup-*-%VER%.exe'; if (-not $f) { exit 1 }; $f | ForEach-Object { '{0}  {1}' -f (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLower(), $_.Name } | Set-Content -Encoding Ascii '%SUMS%'"
 if errorlevel 1 (
     echo [ERROR] no installers found for version %VER%, checksum manifest not written
@@ -80,6 +91,6 @@ echo Done. Assets for release:
 dir /b "installers\YukiDesk-Setup-*.exe"
 if exist "%SUMS%" (
     type "%SUMS%"
-    echo Upload the SHA256SUMS-%VER%.txt above together with the 4 installers.
+    echo Upload the SHA256SUMS-%VER3%.txt above together with the 4 installers.
 )
 endlocal
