@@ -647,99 +647,23 @@ namespace DesktopBar.UI
         private FrameworkElement MakeItem(FileSystemInfo f)
         {
             bool isDir = f is DirectoryInfo;
-            double scale = Ui.Scale;
-            var img = new Image
-            {
-                Width = 40 * scale,
-                Height = 40 * scale,
-                Source = IconCache.GetFallback(isDir, f.Extension),
-                HorizontalAlignment = HorizontalAlignment.Center,
-                Stretch = Stretch.Uniform,
-                SnapsToDevicePixels = true,
-                UseLayoutRounding = true
-            };
-            IconCache.LoadAsync(f.FullName, isDir, f.Extension, icon =>
-            {
-                // 缓存命中时会在 img 加入可视化树之前同步回调，此时 IsVisible 必为 false，
-                // 不能用它做守卫，否则真实图标会被静默丢弃、条目永远停在占位图标上。
-                if (!_disposed) img.Source = icon;
-            });
-            RenderOptions.SetBitmapScalingMode(img, BitmapScalingMode.HighQuality);
-
             string displayName =
                 (string.Equals(f.Extension, ".lnk", StringComparison.OrdinalIgnoreCase)
                  || string.Equals(f.Extension, ".url", StringComparison.OrdinalIgnoreCase))
                     ? f.Name.Substring(0, f.Name.Length - f.Extension.Length)
                     : f.Name;
-            var name = new TextBlock
-            {
-                Text = displayName,
-                TextWrapping = TextWrapping.Wrap,
-                TextAlignment = TextAlignment.Center,
-                FontSize = 11 * scale,
-                Opacity = 0.9,
-                MaxHeight = 28 * scale,
-                TextTrimming = TextTrimming.CharacterEllipsis,
-                Margin = new Thickness(0, 4 * scale, 0, 0)
-            };
-            name.SetResourceReference(TextBlock.ForegroundProperty, "ThemePanelText");
-            var sp = new StackPanel
-            {
-                Width = 68 * scale,
-                Margin = new Thickness(3 * scale, 8 * scale, 3 * scale, 8 * scale)
-            };
-            sp.Children.Add(img);
-            sp.Children.Add(name);
-
-            var border = new Border
-            {
-                CornerRadius = new CornerRadius(8 * scale),
-                Background = Brushes.Transparent,
-                Child = sp,
-                Cursor = Cursors.Hand,
-                RenderTransformOrigin = new Point(0.5, 0.5),
-                RenderTransform = new ScaleTransform(1, 1)
-            };
-            var transform = (ScaleTransform)border.RenderTransform;
+            var tile = ItemTile.Create(displayName, isDir, f.Extension, f.FullName, null, () => _disposed);
+            var border = tile.Root;
             bool suppressClickAfterDrag = false;
             // 拖出：按住左键移动超过系统阈值后发起 OLE 拖拽（Move 语义），
             // 落点接受 Move 后由这里删除源（若目标是我们自己的其他面板则已被移动，删除自然失败可忽略）。
-            Point? dragStart = null;
             bool dragTaken = false;
-            void AnimateBack()
-            {
-                transform.BeginAnimation(ScaleTransform.ScaleXProperty,
-                    new DoubleAnimation(1, TimeSpan.FromMilliseconds(150))
-                    {
-                        EasingFunction = new BackEase { EasingMode = EasingMode.EaseOut, Amplitude = 0.08 }
-                    });
-                transform.BeginAnimation(ScaleTransform.ScaleYProperty,
-                    new DoubleAnimation(1, TimeSpan.FromMilliseconds(150))
-                    {
-                        EasingFunction = new BackEase { EasingMode = EasingMode.EaseOut, Amplitude = 0.08 }
-                    });
-            }
-            border.MouseEnter += (s, e) => border.SetResourceReference(Border.BackgroundProperty, "ThemePanelControl");
-            border.MouseLeave += (s, e) =>
-            {
-                border.Background = Brushes.Transparent;
-                AnimateBack();
-            };
-            border.PreviewMouseLeftButtonDown += (s, e) =>
-            {
-                dragStart = e.GetPosition(border);
-                transform.BeginAnimation(ScaleTransform.ScaleXProperty, null);
-                transform.BeginAnimation(ScaleTransform.ScaleYProperty, null);
-                transform.ScaleX = 0.93;
-                transform.ScaleY = 0.93;
-                border.SetResourceReference(Border.BackgroundProperty, "ThemePanelControlHover");
-            };
             border.PreviewMouseMove += (s, e) =>
             {
-                if (dragStart == null || dragTaken || e.LeftButton != MouseButtonState.Pressed) return;
+                if (tile.DragStart == null || dragTaken || e.LeftButton != MouseButtonState.Pressed) return;
                 var pos = e.GetPosition(border);
-                if (Math.Abs(pos.X - dragStart.Value.X) < SystemParameters.MinimumHorizontalDragDistance
-                    && Math.Abs(pos.Y - dragStart.Value.Y) < SystemParameters.MinimumVerticalDragDistance) return;
+                if (Math.Abs(pos.X - tile.DragStart.Value.X) < SystemParameters.MinimumHorizontalDragDistance
+                    && Math.Abs(pos.Y - tile.DragStart.Value.Y) < SystemParameters.MinimumVerticalDragDistance) return;
                 dragTaken = true;
                 suppressClickAfterDrag = true;
                 try
@@ -757,16 +681,16 @@ namespace DesktopBar.UI
                 catch (Exception ex) { App.Log("拖出移动失败: " + ex.Message); }
                 finally
                 {
-                    dragStart = null;
+                    tile.DragStart = null;
                     dragTaken = false;
-                    AnimateBack();
+                    tile.AnimateBack();
                     border.Background = Brushes.Transparent;
                 }
             };
             DispatcherTimer openTimer = null;
             border.MouseLeftButtonUp += (s, e) =>
             {
-                AnimateBack();
+                tile.AnimateBack();
                 border.SetResourceReference(Border.BackgroundProperty, "ThemePanelControl");
                 if (suppressClickAfterDrag)
                 {
@@ -1154,71 +1078,20 @@ namespace DesktopBar.UI
 
         private FrameworkElement MakeRecycleItem(RecycleItem item)
         {
-            double scale = Ui.Scale;
             string ext = FilePath.GetExtension(item.DataPath);
-            var img = new Image
-            {
-                Width = 40 * scale,
-                Height = 40 * scale,
-                Source = IconCache.GetFallback(item.IsDirectory, ext),
-                HorizontalAlignment = HorizontalAlignment.Center,
-                Stretch = Stretch.Uniform,
-                SnapsToDevicePixels = true,
-                UseLayoutRounding = true
-            };
-            IconCache.LoadAsync(item.DataPath, item.IsDirectory, ext, icon =>
-            {
-                if (!_disposed) img.Source = icon;
-            });
-            RenderOptions.SetBitmapScalingMode(img, BitmapScalingMode.HighQuality);
-            var name = new TextBlock
-            {
-                Text = item.Name,
-                TextWrapping = TextWrapping.Wrap,
-                TextAlignment = TextAlignment.Center,
-                FontSize = 11 * scale,
-                Opacity = 0.9,
-                MaxHeight = 28 * scale,
-                TextTrimming = TextTrimming.CharacterEllipsis,
-                Margin = new Thickness(0, 4 * scale, 0, 0)
-            };
-            name.SetResourceReference(TextBlock.ForegroundProperty, "ThemePanelText");
-            var sp = new StackPanel { Width = 68 * scale, Margin = new Thickness(3 * scale, 8 * scale, 3 * scale, 8 * scale) };
-            sp.Children.Add(img);
-            sp.Children.Add(name);
-            var border = new Border
-            {
-                CornerRadius = new CornerRadius(8 * scale),
-                Background = Brushes.Transparent,
-                Child = sp,
-                Cursor = Cursors.Hand,
-                ToolTip = item.OriginalPath + "\n删除于 " + item.DeletedAt.ToString("yyyy-MM-dd HH:mm")
-                    + (item.Size >= 0 ? "\n大小 " + FmtRecycleSize(item.Size) : "")
-                    + "\n双击还原;右键更多操作",
-                RenderTransformOrigin = new Point(0.5, 0.5),
-                RenderTransform = new ScaleTransform(1, 1)
-            };
-            var transform = (ScaleTransform)border.RenderTransform;
+            string tooltip = item.OriginalPath + "\n删除于 " + item.DeletedAt.ToString("yyyy-MM-dd HH:mm")
+                + (item.Size >= 0 ? "\n大小 " + FmtRecycleSize(item.Size) : "")
+                + "\n双击还原;右键更多操作";
+            var tile = ItemTile.Create(item.Name, item.IsDirectory, ext, item.DataPath, tooltip, () => _disposed);
+            var border = tile.Root;
             // 拖出 = 把内容移出回收站：落点接受 Move 后删除 $R 内容与 $I 元数据。
-            Point? dragStart = null;
             bool dragTaken = false;
-            border.MouseEnter += (s, e) => border.SetResourceReference(Border.BackgroundProperty, "ThemePanelControl");
-            border.MouseLeave += (s, e) => { border.Background = Brushes.Transparent; AnimateItemBack(transform); };
-            border.PreviewMouseLeftButtonDown += (s, e) =>
-            {
-                dragStart = e.GetPosition(border);
-                transform.BeginAnimation(ScaleTransform.ScaleXProperty, null);
-                transform.BeginAnimation(ScaleTransform.ScaleYProperty, null);
-                transform.ScaleX = 0.93;
-                transform.ScaleY = 0.93;
-                border.SetResourceReference(Border.BackgroundProperty, "ThemePanelControlHover");
-            };
             border.PreviewMouseMove += (s, e) =>
             {
-                if (dragStart == null || dragTaken || e.LeftButton != MouseButtonState.Pressed) return;
+                if (tile.DragStart == null || dragTaken || e.LeftButton != MouseButtonState.Pressed) return;
                 var pos = e.GetPosition(border);
-                if (Math.Abs(pos.X - dragStart.Value.X) < SystemParameters.MinimumHorizontalDragDistance
-                    && Math.Abs(pos.Y - dragStart.Value.Y) < SystemParameters.MinimumVerticalDragDistance) return;
+                if (Math.Abs(pos.X - tile.DragStart.Value.X) < SystemParameters.MinimumHorizontalDragDistance
+                    && Math.Abs(pos.Y - tile.DragStart.Value.Y) < SystemParameters.MinimumVerticalDragDistance) return;
                 dragTaken = true;
                 // $R 文件名是随机的；文件用硬链接、目录用临时副本，均使用原始名称拖出。
                 string dragPath = null;
@@ -1281,7 +1154,7 @@ namespace DesktopBar.UI
                 }
                 finally
                 {
-                    dragStart = null;
+                    tile.DragStart = null;
                 }
                 // 关键守卫:目标声称接受 Move 且临时项确实已从原处消失(被目标 rename/移走),
                 // 才允许删除 $R/$I。临时项仍在原处说明落点只是"口头接受"没取走数据,
@@ -1352,7 +1225,7 @@ namespace DesktopBar.UI
             };
             border.MouseLeftButtonUp += (s, e) =>
             {
-                AnimateItemBack(transform);
+                tile.AnimateBack();
                 border.SetResourceReference(Border.BackgroundProperty, "ThemePanelControl");
                 if (dragTaken) { dragTaken = false; e.Handled = true; return; }
                 // 还原改为双击触发:单击只是选中/查看,避免误触 68px 小条目就移动文件。
@@ -1471,14 +1344,6 @@ namespace DesktopBar.UI
             base.Dispose();
         }
 
-        private static void AnimateItemBack(ScaleTransform transform)
-        {
-            transform.BeginAnimation(ScaleTransform.ScaleXProperty,
-                new DoubleAnimation(1, TimeSpan.FromMilliseconds(150)) { EasingFunction = new BackEase { EasingMode = EasingMode.EaseOut, Amplitude = 0.08 } });
-            transform.BeginAnimation(ScaleTransform.ScaleYProperty,
-                new DoubleAnimation(1, TimeSpan.FromMilliseconds(150)) { EasingFunction = new BackEase { EasingMode = EasingMode.EaseOut, Amplitude = 0.08 } });
-        }
-
         private static string FmtRecycleSize(long bytes)
         {
             if (bytes < 0) return "";
@@ -1522,6 +1387,104 @@ namespace DesktopBar.UI
                 ConfirmDialog.Notice("清空回收站失败", "Windows 未能完成清空操作。\n错误代码: 0x" + hr.ToString("X8"));
         }
 
+    }
+
+    // 小文件夹与回收站条目共用的小瓦片骨架:图标+名称+圆角底+悬停/按压反馈+拖拽起点记录。
+    // 此前这段约 70 行的构建与交互代码在 FolderModule.MakeItem 与
+    // RecycleBinModule.MakeRecycleItem 里各抄一份,已经出现过只修一边的漂移;
+    // 抽到这里后,两边只保留真正的差异(拖出内容、双击行为、右键菜单、提示文字)。
+    internal sealed class ItemTile
+    {
+        public readonly Border Root;
+        public readonly ScaleTransform Transform;
+        // 按下时记录的拖拽起点,供调用方的 MouseMove 做系统拖拽阈值判定;
+        // 拖拽结束后由调用方置回 null,松键未拖动的路径由下一次按下覆盖。
+        public Point? DragStart;
+
+        private ItemTile(Border root, ScaleTransform transform)
+        {
+            Root = root;
+            Transform = transform;
+        }
+
+        public static ItemTile Create(string displayName, bool isDir, string ext,
+            string iconPath, string tooltip, Func<bool> isDisposed)
+        {
+            double scale = Ui.Scale;
+            var img = new Image
+            {
+                Width = 40 * scale,
+                Height = 40 * scale,
+                Source = IconCache.GetFallback(isDir, ext),
+                HorizontalAlignment = HorizontalAlignment.Center,
+                Stretch = Stretch.Uniform,
+                SnapsToDevicePixels = true,
+                UseLayoutRounding = true
+            };
+            IconCache.LoadAsync(iconPath, isDir, ext, icon =>
+            {
+                // 缓存命中时会在 img 加入可视化树之前同步回调，此时 IsVisible 必为 false，
+                // 不能用它做守卫，否则真实图标会被静默丢弃、条目永远停在占位图标上。
+                if (!isDisposed()) img.Source = icon;
+            });
+            RenderOptions.SetBitmapScalingMode(img, BitmapScalingMode.HighQuality);
+            var name = new TextBlock
+            {
+                Text = displayName,
+                TextWrapping = TextWrapping.Wrap,
+                TextAlignment = TextAlignment.Center,
+                FontSize = 11 * scale,
+                Opacity = 0.9,
+                MaxHeight = 28 * scale,
+                TextTrimming = TextTrimming.CharacterEllipsis,
+                Margin = new Thickness(0, 4 * scale, 0, 0)
+            };
+            name.SetResourceReference(TextBlock.ForegroundProperty, "ThemePanelText");
+            var sp = new StackPanel
+            {
+                Width = 68 * scale,
+                Margin = new Thickness(3 * scale, 8 * scale, 3 * scale, 8 * scale)
+            };
+            sp.Children.Add(img);
+            sp.Children.Add(name);
+            var root = new Border
+            {
+                CornerRadius = new CornerRadius(8 * scale),
+                Background = Brushes.Transparent,
+                Child = sp,
+                Cursor = Cursors.Hand,
+                ToolTip = tooltip,
+                RenderTransformOrigin = new Point(0.5, 0.5),
+                RenderTransform = new ScaleTransform(1, 1)
+            };
+            var tile = new ItemTile(root, (ScaleTransform)root.RenderTransform);
+            root.MouseEnter += (s, e) => root.SetResourceReference(Border.BackgroundProperty, "ThemePanelControl");
+            root.MouseLeave += (s, e) => { root.Background = Brushes.Transparent; tile.AnimateBack(); };
+            root.PreviewMouseLeftButtonDown += (s, e) =>
+            {
+                tile.DragStart = e.GetPosition(root);
+                tile.Transform.BeginAnimation(ScaleTransform.ScaleXProperty, null);
+                tile.Transform.BeginAnimation(ScaleTransform.ScaleYProperty, null);
+                tile.Transform.ScaleX = 0.93;
+                tile.Transform.ScaleY = 0.93;
+                root.SetResourceReference(Border.BackgroundProperty, "ThemePanelControlHover");
+            };
+            return tile;
+        }
+
+        public void AnimateBack()
+        {
+            Transform.BeginAnimation(ScaleTransform.ScaleXProperty,
+                new DoubleAnimation(1, TimeSpan.FromMilliseconds(150))
+                {
+                    EasingFunction = new BackEase { EasingMode = EasingMode.EaseOut, Amplitude = 0.08 }
+                });
+            Transform.BeginAnimation(ScaleTransform.ScaleYProperty,
+                new DoubleAnimation(1, TimeSpan.FromMilliseconds(150))
+                {
+                    EasingFunction = new BackEase { EasingMode = EasingMode.EaseOut, Amplitude = 0.08 }
+                });
+        }
     }
 
     public static class IconCache
