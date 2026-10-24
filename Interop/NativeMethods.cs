@@ -780,14 +780,15 @@ namespace DesktopBar.Interop
 
         // ---------- Authenticode 签名校验(提权执行下载物前的安全闸) ----------
 
-        /// <summary>校验文件 Authenticode 签名可信(系统信任链);校验失败返回 false。
+        /// <summary>查询文件 Authenticode 签名状态字符串(Valid/NotSigned/HashMismatch 等);
+        /// 文件不存在、PowerShell 不可用或超时等"无法判定"的情况返回 null,与明确的坏状态区分。
         /// 经由 PowerShell Get-AuthenticodeSignature(底层同为 WinVerifyTrust):
         /// 实测直接 P/Invoke WinVerifyTrust 在部分宿主进程内会被干扰返回 TRUST_E_NOSIGNATURE,
-        /// 而该查询在相同环境下结果正确;仅在用户点击安装 PawnIO 时执行一次。
+        /// 而该查询在相同环境下结果正确。
         /// 路径由本应用生成(随机名/固定安装器名),不含用户可控引号。</summary>
-        public static bool VerifyAuthenticodeSignature(string filePath)
+        public static string GetAuthenticodeStatus(string filePath)
         {
-            if (string.IsNullOrEmpty(filePath) || !File.Exists(filePath)) return false;
+            if (string.IsNullOrEmpty(filePath) || !File.Exists(filePath)) return null;
             try
             {
                 string escaped = filePath.Replace("'", "''");
@@ -802,16 +803,23 @@ namespace DesktopBar.Interop
                 using var p = System.Diagnostics.Process.Start(psi);
                 string output = p.StandardOutput.ReadToEnd();
                 p.WaitForExit(20000);
-                bool valid = p.ExitCode == 0 && output != null
-                    && output.Trim().Equals("Valid", StringComparison.OrdinalIgnoreCase);
-                if (!valid) App.Log("签名校验未通过: " + output?.Trim());
-                return valid;
+                if (p.ExitCode != 0 || string.IsNullOrWhiteSpace(output)) return null;
+                return output.Trim();
             }
-            catch (Exception ex)
+            catch
             {
-                App.Log("签名校验失败: " + ex.Message);
-                return false;
+                return null;
             }
+        }
+
+        /// <summary>校验文件 Authenticode 签名可信(仅 Valid 视为通过);用于提权执行下载物前的硬闸。
+        /// 仅在用户点击安装 PawnIO 时执行一次(每次查询要起一个 PowerShell 进程)。</summary>
+        public static bool VerifyAuthenticodeSignature(string filePath)
+        {
+            string status = GetAuthenticodeStatus(filePath);
+            bool valid = string.Equals(status, "Valid", StringComparison.OrdinalIgnoreCase);
+            if (!valid) App.Log("签名校验未通过: " + (status ?? "无法判定"));
+            return valid;
         }
     }
 }

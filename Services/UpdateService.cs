@@ -290,6 +290,27 @@ namespace DesktopBar.Services
             return null;
         }
 
+        /// <summary>
+        /// 安装包 Authenticode 分级闸门:当前发布管线没有代码签名步骤,NotSigned 是常态,
+        /// 硬拦会把所有更新变砖,只能记录放行;一旦未来某个包带上了签名,HashMismatch
+        /// (签名后内容被篡改/损坏)就是明确的攻击/损坏信号,必须拦截。
+        /// 其余状态(NotTrusted/UnknownError/查询失败返回 null)在无签名发布体系下无法
+        /// 区分环境问题与攻击,同样只记录;完整性主闸是上面的 SHA-256 清单比对。
+        /// 查询要起一个 PowerShell 进程,放后台线程避免冻结 UI。
+        /// </summary>
+        private static async Task VerifySignatureAsync(string installerPath)
+        {
+            string sig = await Task.Run(() => Interop.NativeMethods.GetAuthenticodeStatus(installerPath));
+            if (sig == null)
+            {
+                App.Log("更新: 无法判定安装包签名状态(记录放行)");
+                return;
+            }
+            App.Log("更新: 安装包签名状态 " + sig);
+            if (string.Equals(sig, "HashMismatch", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("安装包带有签名但内容与签名不符,可能已被篡改");
+        }
+
         // ---------- 高层入口 ----------
 
         /// <summary>
@@ -335,6 +356,7 @@ namespace DesktopBar.Services
                 {
                     status?.Invoke("正在校验安装包…");
                     await VerifyChecksumAsync(path, info);
+                    await VerifySignatureAsync(path);
                 }
                 catch (Exception ex)
                 {
