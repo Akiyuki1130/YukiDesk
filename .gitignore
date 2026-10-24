@@ -15,3 +15,6 @@ _shot_*.png
 NUL
 packaging-log.txt
 publish/
+
+# Ops tooling lock droppings (never part of the source tree)
+.dsh-ops-update-*.lock
