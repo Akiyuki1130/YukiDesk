@@ -280,12 +280,16 @@ namespace DesktopBar.Services
             if (fe == null || fe.ActualWidth < 1 || fe.ActualHeight < 1) return Rect.Empty;
             try
             {
-                var dpi = VisualTreeHelper.GetDpi(anchor);
-                // PointToScreen 返回 DIP;胶囊在屏幕上的物理矩形正好就是位图坐标,
-                // 因为位图横向铺满主屏、纵向从 -Bleed 起算。
+                // PointToScreen 返回的已经是物理屏幕坐标(WPF 源码:DIP 先经
+                // TransformToDevice 换算成设备像素,再 ClientToScreen),与云母位图的
+                // 物理像素坐标系直接同源,不能再乘 DPI——这里早先多乘了一遍
+                // DpiScaleX/Y,>100% 缩放下取样矩形会被等比放大,胶囊取到的明暗段
+                // 整体错位。ShowPanel 定位展开页用的也是"物理像素"口径,两处必须一致。
                 var pt = anchor.PointToScreen(new Point(0, 0));
-                double x = pt.X * dpi.DpiScaleX;
-                double y = pt.Y * dpi.DpiScaleY + Bleed;
+                double x = pt.X;
+                double y = pt.Y + Bleed;
+                // 尺寸仍是元素 DIP 尺寸 × DPI = 物理尺寸,这半边要乘。
+                var dpi = VisualTreeHelper.GetDpi(anchor);
                 return new Rect(x, y, fe.ActualWidth * dpi.DpiScaleX, fe.ActualHeight * dpi.DpiScaleY);
             }
             catch { return Rect.Empty; }
