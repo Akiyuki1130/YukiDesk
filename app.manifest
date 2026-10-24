@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
-  <assemblyIdentity version="1.0.0.0" name="YukiDesk.app"/>
+  <assemblyIdentity version="1.0.8.0" name="YukiDesk.app"/>
   <!-- 不声明 dpiAware:WinForms 构建集成禁止 manifest 携带 DPI 设置(WFAC010),
        且 DPI 感知由 WPF 启动时自行设定,与 v1.0.1–v1.0.7 无 manifest 时行为一致 -->
   <application xmlns="urn:schemas-microsoft-com:asm.v3">
