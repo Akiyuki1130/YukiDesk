@@ -30,7 +30,7 @@ namespace DesktopBar
         private Action _mediaLost;
         private MusicModule _music;
         private SpectrumModule _spectrum;
-        private ModuleBase _power, _recycle, _volume;
+        private ModuleBase _power, _thisPc, _recycle, _volume;
         private PerfModule _perfCpu, _perfGpu, _perfMemory, _perfNetwork;
         private bool _closing;
         private bool _mediaAvailable = true;
@@ -167,10 +167,10 @@ namespace DesktopBar
             _modules.Add(_power);
             left.Children.Add(_power);
 
-            // 此电脑：放在电源和回收站之间
-            var thisPc = new ThisPcModule(S.SettingsBtn);
-            _modules.Add(thisPc);
-            left.Children.Add(thisPc);
+            // 此电脑：放在电源和回收站之间。显隐走 ShowThisPc(其余模块同款开关)。
+            _thisPc = new ThisPcModule(S.SettingsBtn);
+            _modules.Add(_thisPc);
+            left.Children.Add(_thisPc);
 
             // 回收站：放在此电脑和小文件夹之间
             _recycle = new RecycleBinModule(S.SettingsBtn);
@@ -265,6 +265,7 @@ namespace DesktopBar
         {
             if (!CheckAccess()) { Dispatcher.BeginInvoke(new Action(ApplyModuleVisibility)); return; }
             SetModuleVisibility(_power, S.ShowPower);
+            SetModuleVisibility(_thisPc, S.ShowThisPc);
             SetModuleVisibility(_recycle, S.ShowRecycleBin);
             foreach (var fm in _folderModules)
                 SetModuleVisibility(fm, S.ShowFolders);
@@ -322,6 +323,7 @@ namespace DesktopBar
             _modules.Clear();
             _folderModules.Clear();
             _power = null;
+            _thisPc = null;
             _recycle = null;
             _music = null;
             _spectrum = null;

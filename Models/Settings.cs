@@ -94,6 +94,7 @@ namespace DesktopBar.Models
         public bool ReserveDesktopSpace { get; set; } = false;
         public int DesktopSpaceHeight { get; set; } = 46;
         public bool ShowPower { get; set; } = true;
+        public bool ShowThisPc { get; set; } = true;
         public bool ShowFolders { get; set; } = true;
         public bool ShowMusic { get; set; } = true;
         public bool ShowVolume { get; set; } = true;

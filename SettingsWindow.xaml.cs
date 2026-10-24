@@ -999,6 +999,8 @@ namespace DesktopBar
                 "控制顶栏各胶囊的显示与隐藏,切换立即生效、互不影响。", out var body);
             body.Children.Add(ToggleRow("电源按钮", S.ShowPower,
                 v => { S.ShowPower = v; Save(); App.Bar?.ApplyModuleVisibility(); }));
+            body.Children.Add(ToggleRow("此电脑", S.ShowThisPc,
+                v => { S.ShowThisPc = v; Save(); App.Bar?.ApplyModuleVisibility(); }));
             body.Children.Add(ToggleRow("小文件夹", S.ShowFolders,
                 v => { S.ShowFolders = v; Save(); App.Bar?.ApplyModuleVisibility(); }));
             body.Children.Add(ToggleRow("回收站", S.ShowRecycleBin,
