@@ -39,7 +39,7 @@ namespace DesktopBar.Models
         // 云母本质是"壁纸模糊 + 亮度压带 + 主题染色 + 细噪点",只依赖壁纸不依赖背后窗口,
         // 所以可以用已知内容复现:零捕获、零每帧开销、任意胶囊形状(主报告 §9.22.5)。
         // 默认 0 = 纯色,保持现有外观;只有用户显式打开才会烘焙位图。
-        /// <summary>胶囊材质:0=纯色(默认) 1=云母(自绘 Mica)。</summary>
+        /// <summary>胶囊材质:0=纯色(默认) 1=云母(自绘 Mica) 2=亚克力(自绘 Acrylic)。</summary>
         public int PillMaterial { get; set; } = 0;
         /// <summary>云母整体不透明度。</summary>
         public double MicaOpacity { get; set; } = 0.86;
@@ -53,6 +53,23 @@ namespace DesktopBar.Models
         public double MicaTint { get; set; } = 0.18;
         /// <summary>云母细噪点强度。这是云母与"纯模糊"最大的观感区别之一。</summary>
         public double MicaNoise { get; set; } = 0.035;
+
+        // ---- 胶囊材质(自绘亚克力 / Acrylic) ----
+        // 与云母同一条烘焙管线,只是配方不同:亚克力是"磨砂玻璃"——保留更多壁纸
+        // 色彩与细节、噪点更显眼、更透明,还有一层随明暗主题的提亮/压暗混合
+        // (真亚克里的 luminosity 层);云母则是压平到接近单色的石材质感。
+        /// <summary>亚克力不透明度。</summary>
+        public double AcrylicOpacity { get; set; } = 0.78;
+        /// <summary>亚克力模糊半径(DIP,按显示器 DPI 换算成物理像素)。磨砂感比云母更重。</summary>
+        public double AcrylicBlurRadius { get; set; } = 44;
+        /// <summary>亚克力细节对比保留系数。</summary>
+        public double AcrylicContrast { get; set; } = 0.55;
+        /// <summary>亚克力彩度保留系数。亚克力明显比云母更"彩色"。</summary>
+        public double AcrylicSaturation { get; set; } = 0.75;
+        /// <summary>亚克力主题染色强度。</summary>
+        public double AcrylicTint { get; set; } = 0.24;
+        /// <summary>亚克力噪点强度。真亚克力的噪点比云母显眼。</summary>
+        public double AcrylicNoise { get; set; } = 0.05;
 
         // 旧字段保留用于读取旧配置并迁移，不再单独应用。
         public TabStyle Folder { get; set; } = new TabStyle();

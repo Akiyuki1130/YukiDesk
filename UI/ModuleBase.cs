@@ -171,10 +171,11 @@ namespace DesktopBar.UI
             Pill.BorderBrush = s != null && s.BorderEnabled ? Ui.Brush(ThemeService.Border, s.BorderOpacity) : Brushes.Transparent;
             Pill.BorderThickness = s != null && s.BorderEnabled ? new Thickness(Math.Max(0, s.BorderThickness * scale)) : new Thickness(0);
             // Reuse the pill brush so the expanded page has exactly the same color and alpha.
-            // 云母档例外:展开页会伸到顶栏条带之外,没有壁纸可取样,只能用云母平均色平涂
-            // (真实 Mica 弹层因为模糊极重,看起来也接近平涂,观感损失很小)。
+            // 材质档(云母/亚克力)例外:展开页会伸到顶栏条带之外,没有壁纸可取样,
+            // 只能用材质平均色平涂(真实 Mica/Acrylic 弹层因为模糊极重,看起来也接近平涂,
+            // 观感损失很小)。
             Panel.Background = Pill.Background is ImageBrush
-                ? new SolidColorBrush(MicaService.Average) { Opacity = Math.Max(0.05, Math.Min(1, s?.MicaOpacity ?? 0.86)) }
+                ? new SolidColorBrush(MicaService.Average) { Opacity = MicaService.BackdropOpacity }
                 : Pill.Background;
             Panel.BorderBrush = Pill.BorderBrush;
             Panel.BorderThickness = Pill.BorderThickness;
@@ -215,12 +216,12 @@ namespace DesktopBar.UI
         private bool _micaLogged;
 
         /// <summary>
-        /// 按材质设置给胶囊上背景。云母档用一支 <see cref="ImageBrush"/> 从云母位图里
+        /// 按材质设置给胶囊上背景。云母/亚克力档用一支 <see cref="ImageBrush"/> 从烘焙位图里
         /// 截取"胶囊在屏幕上的那一段",所以每个胶囊看到的明暗分布和真实桌面一致。
         /// </summary>
         private void ApplyPillBackground(AppSettings s, double scale)
         {
-            bool mica = s != null && s.PillMaterial == 1 && MicaService.Backdrop != null;
+            bool mica = s != null && s.PillMaterial != 0 && MicaService.Backdrop != null;
             if (!mica)
             {
                 _micaBrush = null;
@@ -229,7 +230,7 @@ namespace DesktopBar.UI
                 return;
             }
 
-            double opacity = Math.Max(0.05, Math.Min(1, s.MicaOpacity));
+            double opacity = MicaService.BackdropOpacity;
             if (_micaBrush == null || !ReferenceEquals(_micaBrush.ImageSource, MicaService.Backdrop))
             {
                 _micaBrush = MicaService.CreateBrush(Rect.Empty, opacity);

@@ -396,43 +396,66 @@ namespace DesktopBar
             BuildMicaCard();
         }
 
+        /// <summary>胶囊材质卡片当前实例;切换材质时整体重建,让滑条显示对应材质的参数。</summary>
+        private Border _materialCard;
+
         /// <summary>
-        /// 胶囊云母材质卡片。云母 = 壁纸重模糊 + 亮度压带 + 主题染色 + 细噪点,
+        /// 胶囊材质卡片。云母 = 壁纸重模糊 + 亮度压带 + 主题染色 + 细噪点;
+        /// 亚克力 = 同一条烘焙管线的另一套配方:更磨砂、保留更多壁纸色彩、更透明。
         /// 一次性烘焙成位图,所以静止时 0 重绘——与液态玻璃每帧采样背景不是一个量级。
         /// 只有"模糊半径/细节对比/彩度/染色/噪点"会触发重烘焙(后台线程约 0.3 秒),
         /// 不透明度走画笔层,改立即生效。
         /// </summary>
         private void BuildMicaCard()
         {
-            var card = Card("胶囊材质 · 云母",
-                "自绘 Mica：采样壁纸 → 重模糊 → 亮度压带 → 主题染色 → 细噪点，烘焙成一张位图。"
-                + "零屏幕捕获、零每帧开销，静止时不重绘；每个胶囊按自己在屏幕上的位置取对应一段。",
-                out var body);
+            if (_materialCard != null) AppearanceHost.Children.Remove(_materialCard);
+            bool acrylic = S.PillMaterial == 2;
+            string name = S.PillMaterial == 0 ? "纯色" : acrylic ? "亚克力" : "云母";
+            string subtitle = acrylic
+                ? "自绘亚克力：采样壁纸 → 磨砂重模糊 → 保留色彩 → 随明暗主题提亮/压暗 → 噪点，烘焙成一张位图。"
+                  + "比云母更通透、更“彩色”，是磨砂玻璃质感；零屏幕捕获、零每帧开销，每个胶囊按自己在屏幕上的位置取对应一段。"
+                : "自绘 Mica：采样壁纸 → 重模糊 → 亮度压带 → 主题染色 → 细噪点，烘焙成一张位图。"
+                  + "零屏幕捕获、零每帧开销，静止时不重绘；每个胶囊按自己在屏幕上的位置取对应一段。";
+            var card = Card("胶囊材质 · " + name, subtitle, out var body);
             body.Children.Add(Row("材质", BuildPillMaterialPicker()));
-            body.Children.Add(Row("不透明度", NumberSlider(5, 100, S.MicaOpacity * 100, "%",
-                v => { S.MicaOpacity = Math.Max(0.05, Math.Round(v) / 100); ApplyMica(); })));
-            body.Children.Add(Row("模糊半径", NumberSlider(4, 80, S.MicaBlurRadius, " px",
-                v => { S.MicaBlurRadius = Math.Round(v); ApplyMica(); })));
-            body.Children.Add(Row("细节对比", NumberSlider(0, 100, S.MicaContrast * 100, "%",
-                v => { S.MicaContrast = Math.Round(v) / 100; ApplyMica(); })));
-            body.Children.Add(Row("彩度", NumberSlider(0, 100, S.MicaSaturation * 100, "%",
-                v => { S.MicaSaturation = Math.Round(v) / 100; ApplyMica(); })));
-            body.Children.Add(Row("主题染色", NumberSlider(0, 100, S.MicaTint * 100, "%",
-                v => { S.MicaTint = Math.Round(v) / 100; ApplyMica(); })));
-            body.Children.Add(Row("细噪点", NumberSlider(0, 20, S.MicaNoise * 100, "%",
-                v => { S.MicaNoise = Math.Round(v) / 100; ApplyMica(); })));
-            body.Children.Add(MakeHint("「模糊半径/细节对比/彩度/主题染色/细噪点」改动会重新烘焙位图（后台线程约 0.3 秒）；"
-                + "「不透明度」改立即生效。壁纸或系统主题变化时会自动重算。", 12));
+            if (S.PillMaterial == 0)
+            {
+                body.Children.Add(MakeHint("当前为纯色：胶囊沿用上方「主题」卡片的外观设置。选择云母或亚克力后，这里会显示对应的材质参数。", 12));
+            }
+            else
+            {
+                double op = acrylic ? S.AcrylicOpacity : S.MicaOpacity;
+                double blur = acrylic ? S.AcrylicBlurRadius : S.MicaBlurRadius;
+                double contrast = acrylic ? S.AcrylicContrast : S.MicaContrast;
+                double sat = acrylic ? S.AcrylicSaturation : S.MicaSaturation;
+                double tint = acrylic ? S.AcrylicTint : S.MicaTint;
+                double noise = acrylic ? S.AcrylicNoise : S.MicaNoise;
+                body.Children.Add(Row("不透明度", NumberSlider(5, 100, op * 100, "%",
+                    v => { if (acrylic) S.AcrylicOpacity = Math.Max(0.05, Math.Round(v) / 100); else S.MicaOpacity = Math.Max(0.05, Math.Round(v) / 100); ApplyMica(); })));
+                body.Children.Add(Row("模糊半径", NumberSlider(4, 80, blur, " px",
+                    v => { if (acrylic) S.AcrylicBlurRadius = Math.Round(v); else S.MicaBlurRadius = Math.Round(v); ApplyMica(); })));
+                body.Children.Add(Row("细节对比", NumberSlider(0, 100, contrast * 100, "%",
+                    v => { var x = Math.Round(v) / 100; if (acrylic) S.AcrylicContrast = x; else S.MicaContrast = x; ApplyMica(); })));
+                body.Children.Add(Row("彩度", NumberSlider(0, 100, sat * 100, "%",
+                    v => { var x = Math.Round(v) / 100; if (acrylic) S.AcrylicSaturation = x; else S.MicaSaturation = x; ApplyMica(); })));
+                body.Children.Add(Row("主题染色", NumberSlider(0, 100, tint * 100, "%",
+                    v => { var x = Math.Round(v) / 100; if (acrylic) S.AcrylicTint = x; else S.MicaTint = x; ApplyMica(); })));
+                body.Children.Add(Row("细噪点", NumberSlider(0, 20, noise * 100, "%",
+                    v => { var x = Math.Round(v) / 100; if (acrylic) S.AcrylicNoise = x; else S.MicaNoise = x; ApplyMica(); })));
+                body.Children.Add(MakeHint("「模糊半径/细节对比/彩度/主题染色/细噪点」改动会重新烘焙位图（后台线程约 0.3 秒）；"
+                    + "「不透明度」改立即生效。壁纸或系统主题变化时会自动重算。", 12));
+            }
+            _materialCard = card;
             AppearanceHost.Children.Add(card);
         }
 
-        /// <summary>胶囊材质二选：纯色（默认，沿用上方主题色）/ 云母（自绘 Mica）。</summary>
+        /// <summary>胶囊材质三选：纯色（默认，沿用上方主题色）/ 云母（自绘 Mica）/ 亚克力（自绘 Acrylic）。</summary>
         private FrameworkElement BuildPillMaterialPicker()
         {
             var panel = new StackPanel { Orientation = Orientation.Horizontal };
             var options = new (string Label, int Mode)[]
             {
-                ("纯色", 0), ("云母", 1)
+                ("纯色", 0), ("云母", 1), ("亚克力", 2)
             };
             foreach (var (label, mode) in options)
             {
@@ -445,20 +468,27 @@ namespace DesktopBar
                     Margin = new Thickness(0, 0, 14, 0)
                 };
                 int captured = mode;
-                rb.Checked += (s, e) => { S.PillMaterial = captured; ApplyMica(); };
+                rb.Checked += (s, e) =>
+                {
+                    S.PillMaterial = captured;
+                    ApplyMica();
+                    // 重建卡片让滑条显示新材质的参数。放到 Background 优先级执行:
+                    // 此刻 Checked 路由事件还在派发中,立刻拆掉正参与派发的可视化树不稳。
+                    Dispatcher.BeginInvoke(new Action(BuildMicaCard), DispatcherPriority.Background);
+                };
                 panel.Children.Add(rb);
             }
             return panel;
         }
 
         /// <summary>
-        /// 云母参数变更：写盘 + 触发重算。首次开启时位图还不存在,
+        /// 材质参数变更：写盘 + 触发重算。首次开启时位图还不存在,
         /// 同步算一次(约 0.3 秒)避免先闪一下纯色;之后都走后台线程。
         /// </summary>
         private void ApplyMica()
         {
             Save();
-            if (S.PillMaterial == 1 && Services.MicaService.Backdrop == null)
+            if (S.PillMaterial != 0 && Services.MicaService.Backdrop == null)
                 Services.MicaService.BakeOnce();
             else
                 Services.MicaService.Invalidate();

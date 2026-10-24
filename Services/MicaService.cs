@@ -12,7 +12,9 @@ using DesktopBar.UI;   // Ui.Scale
 namespace DesktopBar.Services
 {
     /// <summary>
-    /// 自绘云母(Mica)材质烘焙器。
+    /// 自绘胶囊材质(云母 Mica / 亚克力 Acrylic)烘焙器。
+    /// 两种材质走同一条烘焙管线,只是配方不同:云母压平成接近单色的石材质感,
+    /// 亚克力保留更多色彩、更磨砂、更透明,并多一层随明暗主题的提亮/压暗混合。
     ///
     /// 为什么能自绘:云母的本质不是"模糊背后的窗口",而是
     /// 「采样桌面壁纸 → 重模糊 → 亮度/色调映射 → 叠细噪点 → 跟随明暗主题」。
@@ -77,6 +79,24 @@ namespace DesktopBar.Services
 
         /// <summary>是否有任何材质在使用云母。都没用时完全不烘焙,零开销。</summary>
         public static bool Needed => (App.Settings?.PillMaterial ?? 0) != 0;
+
+        /// <summary>当前生效材质:0=纯色 1=云母 2=亚克力。</summary>
+        public static int Material => App.Settings?.PillMaterial ?? 0;
+
+        /// <summary>
+        /// 当前材质的不透明度。云母/亚克力各有独立设置项;
+        /// 胶囊画笔与展开页平涂都从这取,保证两个入口只有一个真相源。
+        /// </summary>
+        public static double BackdropOpacity
+        {
+            get
+            {
+                var s = App.Settings;
+                if (s == null) return 0.86;
+                double v = s.PillMaterial == 2 ? s.AcrylicOpacity : s.MicaOpacity;
+                return Math.Max(0.05, Math.Min(1, v));
+            }
+        }
 
         /// <summary>重算完成时在 UI 线程触发。</summary>
         public static event Action Changed;
@@ -316,10 +336,15 @@ namespace DesktopBar.Services
                 }
                 catch { }
                 // 签名要覆盖所有会影响像素的输入;纯不透明度不算(它在画笔层生效)。
+                // 材质档也必须进签名:云母↔亚克力切换要按新配方重烘焙位图,
+                // 否则签名不变 → 只 RaiseChanged 不重算,亚克力会一直显示云母的旧图。
                 return string.Join("|",
+                    s?.PillMaterial ?? 0,
                     path, style, tile, stamp,
                     s?.MicaBlurRadius ?? 28, s?.MicaContrast ?? 0.30, s?.MicaSaturation ?? 0.35,
                     s?.MicaTint ?? 0.18, s?.MicaNoise ?? 0.035,
+                    s?.AcrylicBlurRadius ?? 44, s?.AcrylicContrast ?? 0.55, s?.AcrylicSaturation ?? 0.75,
+                    s?.AcrylicTint ?? 0.24, s?.AcrylicNoise ?? 0.05,
                     ThemeService.Background, ThemeService.Text,
                     NativeMethods.ScreenWidth(), Ui.Scale,
                     DpiScaleX(), DpiScaleY());
@@ -403,10 +428,12 @@ namespace DesktopBar.Services
             // 注意:GetSystemMetrics 返回的就是【物理像素】,不能再乘 DPI 缩放。
             // 换成 SystemParameters.PrimaryScreenWidth 的话那个是 DIP(1/96 英寸),才要乘 dsx——
             // 两者混用会把位图宽度放大 1.5 倍(实测 3840 而非 2560),Viewbox 会整体错位。
+            bool acrylic = s.PillMaterial == 2;
+            double blurRadius = acrylic ? s.AcrylicBlurRadius : s.MicaBlurRadius;
             double dsy = DpiScaleY();
             double physW = NativeMethods.ScreenWidth();
             double barPhysH = 46.0 * Ui.Scale * dsy;
-            double blurPhys = Math.Max(1, s.MicaBlurRadius * dsy);
+            double blurPhys = Math.Max(1, blurRadius * dsy);
             double bleed = Math.Ceiling(blurPhys) + 8;
             int bw = (int)Math.Ceiling(physW);
             int bh = (int)Math.Ceiling(barPhysH) + (int)bleed * 2;
@@ -457,12 +484,18 @@ namespace DesktopBar.Services
             var tint = ParseColor(ThemeService.Background);
             double tintLuma = Luma(tint);
             double target = Math.Max(TargetMin, Math.Min(TargetMax, tintLuma));
-            double contrast = Math.Max(0, Math.Min(1, s.MicaContrast));
+            double contrast = Math.Max(0, Math.Min(1, acrylic ? s.AcrylicContrast : s.MicaContrast));
             // 真实 Mica 接近单色:先按保留下来的彩度把壁纸色相压淡,再做亮度压带,
             // 否则彩色壁纸会烘焙出鲜艳的纯色块(实测默认 Win11 壁纸蓝通道飙到 253)。
-            double satKeep = Math.Max(0, Math.Min(1, s.MicaSaturation));
-            double tintA = Math.Max(0, Math.Min(1, s.MicaTint));
-            double noiseAmp = Math.Max(0, Math.Min(0.2, s.MicaNoise)) * 255.0;
+            // 亚克力相反,它就是要保留壁纸色彩,所以默认彩度高得多。
+            double satKeep = Math.Max(0, Math.Min(1, acrylic ? s.AcrylicSaturation : s.MicaSaturation));
+            double tintA = Math.Max(0, Math.Min(1, acrylic ? s.AcrylicTint : s.MicaTint));
+            double noiseAmp = Math.Max(0, Math.Min(0.2, acrylic ? s.AcrylicNoise : s.MicaNoise)) * 255.0;
+            // 亚克里的 luminosity 层:浅色主题整体混白、深色主题混黑,得到磨砂玻璃的
+            // "奶白/烟熏"底色。云母不做这步(它要压平成接近单色的石材质感),
+            // 这是两种材质观感差异的分水岭之一。
+            double veilA = acrylic ? 0.08 : 0;
+            double veilC = tintLuma >= 0.5 ? 255.0 : 0.0;
 
             // 只统计顶栏实际覆盖的那几行,平均值才对得上眼睛看到的东西。
             // 注意位图行号要比屏幕物理 y 多一个 bleed(位图从 -bleed 起算),
@@ -484,9 +517,9 @@ namespace DesktopBar.Services
             // 诊断:色调映射前,位图左/中/右三段的均值。用来判断"采样+模糊"这段对不对。
             App.Log(string.Format("云母映射前: 左={0} 中={1} 右={2}",
                 ThirdMean(strip, bw, bh, 0), ThirdMean(strip, bw, bh, 1), ThirdMean(strip, bw, bh, 2)));
-            // 诊断用:这些量直接决定云母的明暗,出问题时必须能一眼看出来。
-            App.Log(string.Format("云母烘焙: target={0:F4} avg={1:F4} contrast={2:F2} tint=#{3:X2}{4:X2}{5:X2} y0={6} y1={7} bleed={8} bw={9} bh={10}",
-                target, avg, contrast, tint.R, tint.G, tint.B, y0, y1, bleed, bw, bh));
+            // 诊断用:这些量直接决定材质的明暗,出问题时必须能一眼看出来。
+            App.Log(string.Format("材质烘焙({0}): target={1:F4} avg={2:F4} contrast={3:F2} tint=#{4:X2}{5:X2}{6:X2} y0={7} y1={8} bleed={9} bw={10} bh={11}",
+                acrylic ? "acrylic" : "mica", target, avg, contrast, tint.R, tint.G, tint.B, y0, y1, bleed, bw, bh));
 
             var rnd = new Random(NoiseSeed);
             double accR = 0, accG = 0, accB = 0;
@@ -515,6 +548,13 @@ namespace DesktopBar.Services
                     r += (tint.R - r) * tintA;
                     g += (tint.G - g) * tintA;
                     b += (tint.B - b) * tintA;
+                    // 亚克力 luminosity 层(见上)
+                    if (veilA > 0)
+                    {
+                        r += (veilC - r) * veilA;
+                        g += (veilC - g) * veilA;
+                        b += (veilC - b) * veilA;
+                    }
                     // 细噪点(云母与"纯模糊"最大的观感区别之一)
                     if (noiseAmp > 0)
                     {

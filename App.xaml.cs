@@ -254,8 +254,10 @@ namespace DesktopBar
                 if (args[i] == "--micadump") outPath = args[i + 1];
             if (string.IsNullOrWhiteSpace(outPath)) outPath = Path.Combine(Path.GetTempPath(), "yukidesk-mica.png");
 
-            // 自检要覆盖"没开云母"的路径:显式打开一次,免得测的是回退分支。
-            if (Settings.PillMaterial == 0) Settings.PillMaterial = 1;
+            // 自检要覆盖"没开材质"的路径:显式打开一次,免得测的是回退分支。
+            // --acrylic:烘焙亚克力配方而不是云母,验证材质档切换后重算(签名含材质)。
+            if (Array.IndexOf(args, "--acrylic") >= 0) Settings.PillMaterial = 2;
+            else if (Settings.PillMaterial == 0) Settings.PillMaterial = 1;
             Console.WriteLine("[diag] " + Services.MicaService.Diag());
             Services.ThemeService.Start();
 
