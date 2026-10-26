@@ -132,7 +132,7 @@ namespace DesktopBar.Services
             s.AcrylicSaturation = Clamp(s.AcrylicSaturation, 0, 1, 0.75);
             s.AcrylicTint = Clamp(s.AcrylicTint, 0, 1, 0.24);
             s.AcrylicNoise = Clamp(s.AcrylicNoise, 0, 0.2, 0.05);
-            s.GlassOpacity = Clamp(s.GlassOpacity, 0.05, 1, 0.90);
+            s.GlassOpacity = Clamp(s.GlassOpacity, 0.05, 1, 1.00);
             s.GlassBlurRadius = Clamp(s.GlassBlurRadius, 4, 60, 24);
             s.GlassTint = NormalizeColor(s.GlassTint, "#14141C");
             s.GlassTintOpacity = Clamp(s.GlassTintOpacity, 0, 1, 0.18);

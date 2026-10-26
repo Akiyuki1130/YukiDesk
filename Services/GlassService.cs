@@ -62,16 +62,16 @@ namespace DesktopBar.Services
         {
             double v;
             if (double.TryParse(Environment.GetEnvironmentVariable("YUKI_PANEL_BAKE_GAIN"), out v) && v > 0) return v;
-            return 1.4;   // 面板面积大,折射/rim 需要放大才与胶囊同观感
+            return 1.0;   // 与胶囊完全同参数(带宽/位移/rim/色散),面板和胶囊才是同一种材质
         }
 
         private static bool _panelGlassLogged;
         // 诊断:A/B 面板液态烘焙。YUKI_PANEL_NOBAKE=1 关掉烘焙(只剩模糊),YUKI_PANEL_BAKE_GAIN 缩放强度。
         private static readonly bool _panelNoBake = Environment.GetEnvironmentVariable("YUKI_PANEL_NOBAKE") == "1";
         private static readonly double _panelBakeGain = ReadBakeGain();
-        // 面板比胶囊大得多:同样带宽/强度在大面上几乎看不见,所以按面板尺寸放大带宽与强度,
-        // 让"斜边折角"在两处占屏比例接近,观感才一致。
-        private static readonly double _panelBand = ReadEnvDouble("YUKI_PANEL_BAND", 14.0);
+        // 折射带宽度:与胶囊的 HLSL 完全一致(6 半分辨率像素),材质才是同一种;
+        // 面板面积大,带太宽会变成一圈"光雾",太窄又没有玻璃厚度。
+        private static readonly double _panelBand = ReadEnvDouble("YUKI_PANEL_BAND", 6.0);
         // 斜面明暗(方向光高光/背光压暗):胶囊与面板共用一个强度,保证是同一种材质。
         private static readonly double LiquidSheen = ReadEnvDouble("YUKI_LIQUID_SHEEN", 1.0);
         private static readonly double _panelSheen = ReadEnvDouble("YUKI_PANEL_SHEEN", LiquidSheen);

@@ -432,6 +432,8 @@ namespace DesktopBar
             {
                 body.Children.Add(Row("不透明度", NumberSlider(5, 100, S.GlassOpacity * 100, "%",
                     v => { S.GlassOpacity = Math.Max(0.05, Math.Round(v) / 100); App.Save(); Services.GlassService.ApplyLive(); })));
+                body.Children.Add(MakeHint("不透明度 100%：玻璃层完全盖住背后的画面（推荐，模糊/折射/色散最清楚）。"
+                    + "调低会让背后清晰的画面直接透上来，观感变淡、模糊感随之消失。", 12));
                 body.Children.Add(Row("模糊半径", NumberSlider(4, 60, S.GlassBlurRadius, " px",
                     v => { S.GlassBlurRadius = Math.Round(v); App.Save(); Services.GlassService.ApplyLive(); })));
                 body.Children.Add(Row("染色颜色", NewColorEditor(S.GlassTint,

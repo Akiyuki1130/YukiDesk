@@ -77,7 +77,7 @@ namespace DesktopBar.Models
         // Apple/小米式真·毛玻璃。自己的窗口用 WDA_EXCLUDEFROMCAPTURE 排除自拍;
         // 静止桌面经降采样差分门控,0 写屏。
         /// <summary>玻璃整体不透明度(玻璃层 Image 的 Opacity)。</summary>
-        public double GlassOpacity { get; set; } = 0.90;
+        public double GlassOpacity { get; set; } = 1.00;
         /// <summary>玻璃高斯模糊半径(DIP,BlurEffect.Radius 按显示器 DPI 换算)。越大越糊、逐帧成本越高。</summary>
         public double GlassBlurRadius { get; set; } = 24;
         /// <summary>玻璃染色颜色(叠在模糊层之上的边框层)。</summary>
