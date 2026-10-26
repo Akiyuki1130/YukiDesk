@@ -337,12 +337,18 @@ namespace DesktopBar.UI
             PanelWindow.Left = left;
             PanelWindow.Top = targetTop;
             Panel.Visibility = Visibility.Visible;
-            PanelWindow.Visibility = Visibility.Visible;
-            // 玻璃/液态玻璃材质:展开页同样毛玻璃——窗口定位已完成(动画只是 RenderTransform),
-            // 服务内部等布局定稿后一次性捕获面板背后区域并模糊,回 UI 换成对齐的 ImageBrush;
-            // 捕获就绪前维持 ApplyTheme 给的主题色兜底。首开 600ms 内 WDA 未生效会自动延迟。
+            // 玻璃/液态玻璃材质:展开页同样毛玻璃。关键顺序——必须"先出模糊、再显形":
+            // 在窗口可见之前就把面板背后区域抓下来糊好并设为背景,再 Show。
+            // 以前是 Show 之后异步抓图回填,面板会先以主题色出现、几十毫秒后才换成模糊贴图,
+            // 肉眼就是"打开时闪一下才变模糊"。此刻面板不可见,抓图也不会拍到面板自己。
+            // (同步抓图约数毫秒,一次性成本,换来全程模糊)
             if (App.Settings != null && (App.Settings.PillMaterial == 3 || App.Settings.PillMaterial == 4))
-                GlassService.RefreshPanelGlass(PanelWindow, Panel);
+            {
+                GlassService.RefreshPanelGlass(Panel, left, targetTop, width, height);
+                if (!(Panel.Background is ImageBrush))
+                    App.Log("面板玻璃:预捕获未生效,面板以主题色打开 " + GetType().Name);
+            }
+            PanelWindow.Visibility = Visibility.Visible;
 
             _panelTransform = new TranslateTransform(0, (above ? 8 : -8) * Ui.Scale);
             _panelScale = new ScaleTransform(0.52, 0.68);

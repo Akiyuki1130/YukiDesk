@@ -51,7 +51,7 @@ namespace DesktopBar.Services
         private static readonly object Gate = new object();
         private static readonly HashSet<IntPtr> _excluded = new HashSet<IntPtr>();
         private static readonly Dictionary<IntPtr, long> _wdaReady = new Dictionary<IntPtr, long>();
-        private static readonly HashSet<IntPtr> _panelBusy = new HashSet<IntPtr>();
+        private static bool _panelGlassLogged;
         private static volatile GlassSpec _spec;
 
         private static bool _started, _stopped, _enabled, _active = true, _stopThread;
@@ -347,7 +347,6 @@ namespace DesktopBar.Services
             {
                 _excluded.Remove(hwnd);
                 _wdaReady.Remove(hwnd);
-                _panelBusy.Remove(hwnd);
             }
             if (_enabled) NativeMethods.RestoreCapture(hwnd);
         }
@@ -441,135 +440,101 @@ namespace DesktopBar.Services
         // ---------- 展开页玻璃(一次性捕获) ----------
 
         /// <summary>
-        /// 面板打开后调用:后台一次性捕获面板背后区域 → 半分辨率盒式模糊 → 烘焙染色 →
-        /// 回 UI 生成 ImageBrush(按面板物理矩形对齐,Viewbox 口径与云母画笔一致)替换面板背景。
-        /// 面板是置顶独立窗口,背后就是真实屏幕内容;自身已 WDA 排除,首开 600ms 内自动延迟采样。
+        /// 面板打开「之前」调用(此时面板窗口还完全不可见):当场捕获面板背后区域 → 半分辨率盒式模糊 →
+        /// 烘焙染色 → 生成对齐面板物理矩形的 ImageBrush 并直接设为面板背景。
+        /// 必须在 Show 之前完成:否则面板会先以主题色出现、几十毫秒后才被换成模糊贴图,
+        /// 肉眼就是「打开时闪一下才变模糊」。此时面板未显示,抓图不会拍到自己;顶栏由 WDA 排除。
         /// </summary>
-        internal static void RefreshPanelGlass(Window window, Border panel)
+        internal static void RefreshPanelGlass(Border panel, double dipX, double dipY, double dipW, double dipH)
         {
             if (_stopped) return;
-            var ui = Application.Current?.Dispatcher;
-            if (ui == null) return;
-            ui.BeginInvoke(new Action(() =>
-            {
-                try { CapturePanelNow(window, panel); }
-                catch { }
-            }), DispatcherPriority.Loaded);
+            try { CapturePanelNow(panel, dipX, dipY, dipW, dipH); }
+            catch { }
         }
 
-        private static void CapturePanelNow(Window window, Border panel)
+        private static void CapturePanelNow(Border panel, double dipX, double dipY, double dipW, double dipH)
         {
             var s = App.Settings;
-            if (s == null || (s.PillMaterial != 3 && s.PillMaterial != 4) || window == null || panel == null) return;
-            if (!window.IsVisible || panel.ActualWidth < 1 || panel.ActualHeight < 1) return;
-            var hwnd = new System.Windows.Interop.WindowInteropHelper(window).Handle;
-            if (hwnd == IntPtr.Zero) return;
-            lock (Gate) if (_panelBusy.Contains(hwnd)) return;
-            lock (Gate) _panelBusy.Add(hwnd);
+            if (s == null || (s.PillMaterial != 3 && s.PillMaterial != 4) || panel == null) return;
+            if (dipW < 1 || dipH < 1) return;
+            var dpi = VisualTreeHelper.GetDpi(panel);
+            // 位置一律由调用方传入 DIP 矩形:此时面板窗口尚未显示、也没有 RenderTransform 动画,
+            // 用 PointToScreen/ActualWidth 反而不可靠(未 Arrange)。
+            double originX = dipX, originY = dipY;
+            if (double.IsNaN(originX) || double.IsNaN(originY))
+            {
+                var fallback = panel.PointToScreen(new Point(0, 0));
+                originX = fallback.X / dpi.DpiScaleX;
+                originY = fallback.Y / dpi.DpiScaleY;
+            }
+            int px = (int)Math.Floor(originX * dpi.DpiScaleX), py = (int)Math.Floor(originY * dpi.DpiScaleY);
+            int pw = (int)Math.Ceiling(dipW * dpi.DpiScaleX);
+            int ph = (int)Math.Ceiling(dipH * dpi.DpiScaleY);
+            if (pw < 8 || ph < 8) return;
 
+            double dsy = NativeMethods.SystemDpiScale();
+            int blurHalf = BoxHalfFor(s.GlassBlurRadius * dsy);
+            int bleed = Math.Min(220, blurHalf * 2 + 12);        // 半分辨率半径 → 全分辨率出血×2
+            int x = Math.Max(0, px - bleed), y = Math.Max(0, py - bleed);
+            int rx = Math.Min(NativeMethods.ScreenWidth(), px + pw + bleed);
+            int by = Math.Min(NativeMethods.ScreenHeight(), py + ph + bleed);
+            int cw = (rx - x) & ~1, ch = (by - y) & ~1;          // 偶数化,方便对半降采样
+            if (cw < 8 || ch < 8) return;
+
+            byte tr = 20, tg = 20, tb = 28;
             try
             {
-                var dpi = VisualTreeHelper.GetDpi(panel);
-                // 面板窗口位置必须从 Window.Left/Top(DIP)换算,不能用 panel.PointToScreen:
-                // ShowPanel 在设置 Window.Left/Top 之后才挂 RenderTransform 并做 248ms 缩放动画,
-                // 而本函数是 Loaded 优先级延迟执行,这时动画正在跑,PointToScreen 返回的是被
-                // ScaleTransform(0.52/0.68) 压缩并位移过的矩形 → 抓到的区域错位、贴图整体偏移。
-                double originX = window.Left, originY = window.Top;
-                if (double.IsNaN(originX) || double.IsNaN(originY))
-                {
-                    var fallback = panel.PointToScreen(new Point(0, 0));
-                    originX = fallback.X / dpi.DpiScaleX;
-                    originY = fallback.Y / dpi.DpiScaleY;
-                }
-                int px = (int)Math.Floor(originX * dpi.DpiScaleX), py = (int)Math.Floor(originY * dpi.DpiScaleY);
-                int pw = (int)Math.Ceiling(panel.ActualWidth * dpi.DpiScaleX);
-                int ph = (int)Math.Ceiling(panel.ActualHeight * dpi.DpiScaleY);
-                if (pw < 8 || ph < 8) { lock (Gate) _panelBusy.Remove(hwnd); return; }
+                var c = (Color)ColorConverter.ConvertFromString(s.GlassTint);
+                tr = c.R; tg = c.G; tb = c.B;
+            }
+            catch { }
+            double tintA = Math.Max(0, Math.Min(1, s.GlassTintOpacity));
+            double glassOp = Math.Max(0.05, Math.Min(1, s.GlassOpacity));
 
-                double dsy = NativeMethods.SystemDpiScale();
-                int blurHalf = BoxHalfFor(s.GlassBlurRadius * dsy);
-                int bleed = Math.Min(220, blurHalf * 2 + 12);       // 半分辨率半径 → 全分辨率出血×2
-                int x = Math.Max(0, px - bleed), y = Math.Max(0, py - bleed);
-                int rx = Math.Min(NativeMethods.ScreenWidth(), px + pw + bleed);
-                int by = Math.Min(NativeMethods.ScreenHeight(), py + ph + bleed);
-                int cw = (rx - x) & ~1, ch = (by - y) & ~1;          // 偶数化,方便对半降采样
-                if (cw < 8 || ch < 8) { lock (Gate) _panelBusy.Remove(hwnd); return; }
-
-                long ready;
-                lock (Gate) _wdaReady.TryGetValue(hwnd, out ready);
-                long delay = Math.Max(0, ready - Environment.TickCount64);
-                byte tr = 20, tg = 20, tb = 28;
+            long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+            byte[] blurred = null; int hw = 0, hh = 0;
+            if (NativeMethods.CreateStripCapture(cw, ch, out var screenDc, out var memoryDc, out var dib, out var bits))
+            {
                 try
                 {
-                    var c = (Color)ColorConverter.ConvertFromString(s.GlassTint);
-                    tr = c.R; tg = c.G; tb = c.B;
-                }
-                catch { }
-                double tintA = Math.Max(0, Math.Min(1, s.GlassTintOpacity));
-                double glassOp = Math.Max(0.05, Math.Min(1, s.GlassOpacity));
-
-                System.Threading.Tasks.Task.Run(() =>
-                {
-                    bool ok = false;
-                    byte[] blurred = null; int hw = 0, hh = 0;
-                    try
+                    if (NativeMethods.BlitStrip(memoryDc, cw, ch, screenDc, x, y))
                     {
-                        if (delay > 0) Thread.Sleep((int)delay + 40);
-                        if (NativeMethods.CreateStripCapture(cw, ch, out var screenDc, out var memoryDc, out var dib, out var bits))
-                        {
-                            try
-                            {
-                                if (NativeMethods.BlitStrip(memoryDc, cw, ch, screenDc, x, y))
-                                {
-                                    var full = new byte[cw * ch * 4];
-                                    Marshal.Copy(bits, full, 0, full.Length);
-                                    hw = cw / 2; hh = ch / 2;
-                                    var half = new byte[hw * hh * 4];
-                                    Downsample2x(full, cw, ch, half, hw, hh);
-                                    blurred = new byte[half.Length];
-                                    Array.Copy(half, blurred, half.Length);
-                                    BoxBlur3(blurred, half, hw, hh, blurHalf);
-                                    BakeTint(blurred, tr, tg, tb, tintA);
-                                    ok = true;
-                                }
-                            }
-                            finally { NativeMethods.DestroyStripCapture(ref screenDc, ref memoryDc, ref dib); }
-                        }
+                        var full = new byte[cw * ch * 4];
+                        Marshal.Copy(bits, full, 0, full.Length);
+                        hw = cw / 2; hh = ch / 2;
+                        var half = new byte[hw * hh * 4];
+                        Downsample2x(full, cw, ch, half, hw, hh);
+                        blurred = new byte[half.Length];
+                        Array.Copy(half, blurred, half.Length);
+                        BoxBlur3(blurred, half, hw, hh, blurHalf);
+                        BakeTint(blurred, tr, tg, tb, tintA);
                     }
-                    catch { }
-                    var ui = Application.Current?.Dispatcher;
-                    if (ui == null) return;
-                    ui.BeginInvoke(new Action(() =>
-                    {
-                        try
-                        {
-                            lock (Gate) _panelBusy.Remove(hwnd);
-                            if (!ok || blurred == null) return;
-                            var st = App.Settings;
-                            if (st == null || (st.PillMaterial != 3 && st.PillMaterial != 4) || !window.IsVisible) return;
-                            var wb2 = new WriteableBitmap(hw, hh, 96, 96, PixelFormats.Bgr32, null);
-                            wb2.WritePixels(new Int32Rect(0, 0, hw, hh), blurred, hw * 4, 0);
-                            wb2.Freeze();
-                            // Viewbox = 面板物理矩形在半分辨率捕获图里的位置(全除 2),与云母画笔同口径。
-                            var brush = new ImageBrush
-                            {
-                                ImageSource = wb2,
-                                ViewboxUnits = BrushMappingMode.Absolute,
-                                Viewbox = new Rect((px - x) / 2.0, (py - y) / 2.0, pw / 2.0, ph / 2.0),
-                                ViewportUnits = BrushMappingMode.RelativeToBoundingBox,
-                                Viewport = new Rect(0, 0, 1, 1),
-                                Stretch = Stretch.Fill,
-                                Opacity = glassOp
-                            };
-                            panel.Background = brush;
-                        }
-                        catch { }
-                    }));
-                });
+                }
+                finally { NativeMethods.DestroyStripCapture(ref screenDc, ref memoryDc, ref dib); }
             }
-            catch
+            if (blurred == null) return;
+            var wb2 = new WriteableBitmap(hw, hh, 96, 96, PixelFormats.Bgr32, null);
+            wb2.WritePixels(new Int32Rect(0, 0, hw, hh), blurred, hw * 4, 0);
+            wb2.Freeze();
+            // Viewbox = 面板物理矩形在半分辨率捕获图里的位置(全除 2),与云母画笔同口径。
+            var brush = new ImageBrush
             {
-                lock (Gate) _panelBusy.Remove(hwnd);
+                ImageSource = wb2,
+                ViewboxUnits = BrushMappingMode.Absolute,
+                Viewbox = new Rect((px - x) / 2.0, (py - y) / 2.0, pw / 2.0, ph / 2.0),
+                ViewportUnits = BrushMappingMode.RelativeToBoundingBox,
+                Viewport = new Rect(0, 0, 1, 1),
+                Stretch = Stretch.Fill,
+                Opacity = glassOp
+            };
+            brush.Freeze();
+            panel.Background = brush;
+            if (!_panelGlassLogged)
+            {
+                _panelGlassLogged = true;
+                double ms = (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+                App.Log(string.Format("面板玻璃:预捕获 {0}x{1}(物理) 半分辨率 {2}x{3} 耗时={4:F1}ms",
+                    pw, ph, hw, hh, ms));
             }
         }
 
