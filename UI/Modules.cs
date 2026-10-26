@@ -87,7 +87,6 @@ namespace DesktopBar.UI
         {
             Pill.Width = 38 * Ui.Scale;
             Pill.Padding = new Thickness(0);
-            Pill.ToolTip = "此电脑 — 单击打开，右键更多";
             Pill.Child = CenterIcon(MakeThisPcGlyph(20.5));
             Pill.MouseLeftButtonUp += (s, e) => NativeMethods.ShellExecuteOpen(ThisPcShellPath);
             Pill.MouseRightButtonUp += (s, e) =>
@@ -979,7 +978,7 @@ namespace DesktopBar.UI
         {
             Pill.Width = 38 * Ui.Scale;
             Pill.Padding = new Thickness(0);
-            Pill.ToolTip = "回收站 — 单击展开，双击在资源管理器打开，右键清空";            Pill.Child = CenterIcon(MakeTrashGlyph(20.5));
+            Pill.Child = CenterIcon(MakeTrashGlyph(20.5));
             Pill.MouseLeftButtonUp += (s, e) => ShowPanel();
             Pill.MouseRightButtonUp += (s, e) => { ShowClearMenu(); e.Handled = true; };
             // 双击胶囊:直接打开回收站视图(SHOpenFolderAndSelectItems 会打开"父文件夹"即桌面,
@@ -1759,7 +1758,6 @@ namespace DesktopBar.UI
             Pill.Width = pillW;
             Pill.Padding = new Thickness(0);
             Pill.Child = _surface;
-            Pill.ToolTip = "实时音频频谱";
 
             ThemeService.Changed += OnBarThemeChanged;
             IsVisibleChanged += (s2, e2) => SetSpectrumActive(IsVisible);
@@ -1983,7 +1981,7 @@ namespace DesktopBar.UI
         private readonly PerfMetric _metric;
         private readonly TextBlock _value;
         private readonly Dictionary<string, TextBlock> _rows = new Dictionary<string, TextBlock>();
-        private string _lastPillText, _lastTip;
+        private string _lastPillText;
         private TextBlock _panelTitle;
         private bool _active;
         private bool _disposed;
@@ -2015,7 +2013,6 @@ namespace DesktopBar.UI
             Pill.Padding = new Thickness(0);
             // 固定宽度:数值在 "0%" 与 "100%" 间变化时不让胶囊抖动。
             Pill.Width = (metric == PerfMetric.Network ? 88 : 58) * s;
-            Pill.ToolTip = Caption;
 
             BuildHoverPanel();
             IsVisibleChanged += (s2, e2) => SetActive(IsVisible);
@@ -2030,13 +2027,6 @@ namespace DesktopBar.UI
             if (_lastPillText == text) return;
             _lastPillText = text;
             _value.Text = text;
-        }
-
-        private void SetTip(string text)
-        {
-            if (_lastTip == text) return;
-            _lastTip = text;
-            Pill.ToolTip = text;
         }
 
         protected override void OnPanelShown()
@@ -2158,9 +2148,6 @@ namespace DesktopBar.UI
             {
                 case PerfMetric.Cpu:
                     SetPillText(FmtPercent(sample.CpuPercent));
-                    SetTip(Caption + (sample.CpuPercent >= 0
-                        ? " — " + Math.Round(sample.CpuPercent) + "%"
-                        : ""));
                     SetRow("占用", FmtPercent(sample.CpuPercent));
                     SetRow("温度", FmtTemp(sample.CpuTempC));
                     SetRow("频率", FmtFreq(sample.CpuFreqMhz));
@@ -2168,9 +2155,6 @@ namespace DesktopBar.UI
                 case PerfMetric.Gpu:
                     var gpu = PickGpu(sample.Gpus);
                     SetPillText(gpu == null ? "--" : FmtPercent(gpu.UtilPercent));
-                    SetTip(gpu == null
-                        ? Caption
-                        : gpu.Name + (gpu.UtilPercent >= 0 ? " — " + Math.Round(gpu.UtilPercent) + "%" : ""));
                     SetRow("型号", gpu == null ? "--" : gpu.Name);
                     SetRow("占用", gpu == null ? "--" : FmtPercent(gpu.UtilPercent));
                     SetRow("温度", FmtTemp(gpu == null ? -1 : gpu.TempC));
@@ -2180,14 +2164,11 @@ namespace DesktopBar.UI
                     if (sample.MemTotalBytes <= 0)
                     {
                         SetPillText("--");
-                        SetTip(Caption);
                     }
                     else
                     {
                         double percent = 100.0 * sample.MemUsedBytes / sample.MemTotalBytes;
                         SetPillText(FmtPercent(percent));
-                        SetTip("内存 已用 " + FmtGb(sample.MemUsedBytes) + " / "
-                            + FmtGb(sample.MemTotalBytes) + " (" + Math.Round(percent) + "%)");
                     }
                     SetRow("占用", sample.MemTotalBytes <= 0
                         ? "--"
@@ -2200,13 +2181,10 @@ namespace DesktopBar.UI
                     if (sample.NetUpBps < 0 && sample.NetDownBps < 0)
                     {
                         SetPillText("--");
-                        SetTip(Caption);
                     }
                     else
                     {
                         SetPillText("↓" + FmtSpeed(sample.NetDownBps) + " ↑" + FmtSpeed(sample.NetUpBps));
-                        SetTip("网络 下行 " + FmtSpeedLong(sample.NetDownBps) + "/s,上行 "
-                            + FmtSpeedLong(sample.NetUpBps) + "/s");
                     }
                     SetRow("下行", sample.NetDownBps < 0 ? "--" : FmtSpeedLong(sample.NetDownBps) + "/s");
                     SetRow("上行", sample.NetUpBps < 0 ? "--" : FmtSpeedLong(sample.NetUpBps) + "/s");

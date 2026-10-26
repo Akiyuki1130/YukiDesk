@@ -54,6 +54,26 @@
             <Setter Property="Margin" Value="0,0,0,14"/>
         </Style>
 
+        <!-- 悬浮提示:WPF 默认那套方角浅色框太出戏,统一成深色圆角玻璃感。
+             故意不加 x:Key:隐式样式对全应用(顶栏面板、设置窗口、对话框)生效。 -->
+        <Style TargetType="ToolTip">
+            <Setter Property="Foreground" Value="#F2F2F6"/>
+            <Setter Property="FontSize" Value="12"/>
+            <Setter Property="Padding" Value="10,6"/>
+            <Setter Property="HasDropShadow" Value="False"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ToolTip">
+                        <Border Background="#F01B1C22" BorderBrush="#33FFFFFF" BorderThickness="1"
+                                CornerRadius="7" Padding="{TemplateBinding Padding}">
+                            <ContentPresenter TextElement.Foreground="{TemplateBinding Foreground}"
+                                              TextElement.FontSize="{TemplateBinding FontSize}"/>
+                        </Border>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
         <!-- 文本输入框 -->
         <Style x:Key="DarkBox" TargetType="TextBox">
             <Setter Property="Foreground" Value="{DynamicResource SettingsTextBrush}"/>
