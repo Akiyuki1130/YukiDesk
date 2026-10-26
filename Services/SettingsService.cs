@@ -116,8 +116,10 @@ namespace DesktopBar.Services
             s.HoverCloseDelayMs = Math.Clamp(s.HoverCloseDelayMs, 80, 2000);
             s.AnimationDurationMs = Math.Clamp(s.AnimationDurationMs, 60, 1200);
             if (s.SettingsThemeMode < 0 || s.SettingsThemeMode > 2) s.SettingsThemeMode = 0;
-            // 胶囊材质档位:0=纯色 1=云母 2=亚克力。未知值(含旧配置里根本没有的字段)一律回纯色。
-            if (s.PillMaterial < 0 || s.PillMaterial > 2) s.PillMaterial = 0;
+            // 胶囊材质档位:0=纯色 3=实时玻璃 4=液态玻璃。云母(1)/亚克力(2)已从设置 UI 下架,
+            // 存量配置迁移到玻璃;后端烘焙代码保留,老版本回滚后读 3/4 会因 >2 钳制回落纯色(优雅降级)。
+            if (s.PillMaterial == 1 || s.PillMaterial == 2) s.PillMaterial = 3;
+            if (s.PillMaterial < 0 || s.PillMaterial > 4) s.PillMaterial = 0;
             s.MicaOpacity = Clamp(s.MicaOpacity, 0.05, 1, 0.86);
             s.MicaBlurRadius = Clamp(s.MicaBlurRadius, 4, 80, 28);
             s.MicaContrast = Clamp(s.MicaContrast, 0, 1, 0.30);
@@ -130,6 +132,14 @@ namespace DesktopBar.Services
             s.AcrylicSaturation = Clamp(s.AcrylicSaturation, 0, 1, 0.75);
             s.AcrylicTint = Clamp(s.AcrylicTint, 0, 1, 0.24);
             s.AcrylicNoise = Clamp(s.AcrylicNoise, 0, 0.2, 0.05);
+            s.GlassOpacity = Clamp(s.GlassOpacity, 0.05, 1, 0.90);
+            s.GlassBlurRadius = Clamp(s.GlassBlurRadius, 4, 60, 24);
+            s.GlassTint = NormalizeColor(s.GlassTint, "#14141C");
+            s.GlassTintOpacity = Clamp(s.GlassTintOpacity, 0, 1, 0.18);
+            s.GlassMaxFps = Math.Clamp(s.GlassMaxFps, 5, 60);
+            s.GlassRefraction = Clamp(s.GlassRefraction, 0, 1, 0.45);
+            s.GlassRim = Clamp(s.GlassRim, 0, 1, 0.5);
+            s.GlassChroma = Clamp(s.GlassChroma, 0, 1, 0.35);
             return s;
         }
 

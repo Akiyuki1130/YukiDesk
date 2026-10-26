@@ -77,8 +77,12 @@ namespace DesktopBar.Services
         /// <summary>位图上缘之外的物理像素数(模糊出血)。</summary>
         public static double Bleed { get { lock (Gate) return _bleed; } }
 
-        /// <summary>是否有任何材质在使用云母。都没用时完全不烘焙,零开销。</summary>
-        public static bool Needed => (App.Settings?.PillMaterial ?? 0) != 0;
+        /// <summary>是否有任何材质在使用云母。都没用时完全不烘焙,零开销。
+        /// 玻璃(3)不用云母位图——条带来自实时捕获,不该在这里空烤一遍。</summary>
+        public static bool Needed
+        {
+            get { var m = App.Settings?.PillMaterial ?? 0; return m == 1 || m == 2; }
+        }
 
         /// <summary>当前生效材质:0=纯色 1=云母 2=亚克力。</summary>
         public static int Material => App.Settings?.PillMaterial ?? 0;

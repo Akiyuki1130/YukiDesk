@@ -16,5 +16,8 @@ NUL
 packaging-log.txt
 publish/
 
+# Local glass evidence dumps (YUKI_GLASS_DUMP / --glassshot output, probe projects)
+.glassshot/
+
 # Ops tooling lock droppings (never part of the source tree)
 .dsh-ops-update-*.lock

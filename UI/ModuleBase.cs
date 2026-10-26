@@ -85,6 +85,12 @@ namespace DesktopBar.UI
 
         protected virtual bool HoverOpensPanel => true;
         protected virtual bool HasPanel => true;
+
+        // ---- 取证(--glassshot)只读访问器:面板可视化自检需要知道"哪些模块会开面板" ----
+        internal bool DiagnosticHasPanel => HasPanel;
+        internal string DiagnosticName => GetType().Name;
+        internal Window DiagnosticPanelWindow => PanelWindow;
+        internal Border DiagnosticPanel => Panel;
         /// <summary>展开页水平居中于选项卡(默认左对齐选项卡左缘)。</summary>
         protected virtual bool CenterPanelOnPill => false;
         protected virtual void OnPanelShown() { }
@@ -107,7 +113,13 @@ namespace DesktopBar.UI
                 Visibility = Visibility.Hidden
             };
             w.SourceInitialized += (s, e) =>
-                NativeMethods.ApplyNoActivateToolStyle(new System.Windows.Interop.WindowInteropHelper(w).Handle);
+            {
+                var h = new System.Windows.Interop.WindowInteropHelper(w).Handle;
+                NativeMethods.ApplyNoActivateToolStyle(h);
+                // 面板横跨顶栏条带,玻璃启用时必须排除出屏幕捕获,否则会污染捕获画面。
+                // 窗口懒创建:SourceInitialized 在首次 ShowPanel 时才触发,正合适。
+                GlassService.RegisterWindow(h);
+            };
             w.MouseEnter += (s, e) => _closeTimer.Stop();
             w.MouseLeave += (s, e) => { if (Open) StartCloseTimer(); };
             w.SizeChanged += (s, e) => ApplyRoundRegion(w);
@@ -173,10 +185,12 @@ namespace DesktopBar.UI
             // Reuse the pill brush so the expanded page has exactly the same color and alpha.
             // 材质档(云母/亚克力)例外:展开页会伸到顶栏条带之外,没有壁纸可取样,
             // 只能用材质平均色平涂(真实 Mica/Acrylic 弹层因为模糊极重,看起来也接近平涂,
-            // 观感损失很小)。
+            // 观感损失很小)。玻璃档同理:展开页是独立窗口,底下没有玻璃层,退主题色。
             Panel.Background = Pill.Background is ImageBrush
                 ? new SolidColorBrush(MicaService.Average) { Opacity = MicaService.BackdropOpacity }
-                : Pill.Background;
+                : (s != null && (s.PillMaterial == 3 || s.PillMaterial == 4)
+                    ? Ui.Brush(ThemeService.Background, s.ThemeOpacity)
+                    : Pill.Background);
             Panel.BorderBrush = Pill.BorderBrush;
             Panel.BorderThickness = Pill.BorderThickness;
             PanelWindow.Background = Brushes.Transparent;
@@ -217,11 +231,22 @@ namespace DesktopBar.UI
 
         /// <summary>
         /// 按材质设置给胶囊上背景。云母/亚克力档用一支 <see cref="ImageBrush"/> 从烘焙位图里
-        /// 截取"胶囊在屏幕上的那一段",所以每个胶囊看到的明暗分布和真实桌面一致。
+        /// 截取"胶囊在屏幕上的那一段",所以每个胶囊看到的明暗分布和真实桌面一致;
+        /// 玻璃档(3)胶囊自身不画背景——玻璃画在主窗最底层的玻璃层上,胶囊透明透出即可。
         /// </summary>
         private void ApplyPillBackground(AppSettings s, double scale)
         {
-            bool mica = s != null && s.PillMaterial != 0 && MicaService.Backdrop != null;
+            if (s != null && (s.PillMaterial == 3 || s.PillMaterial == 4))
+            {
+                // 实时玻璃:背景在主窗玻璃层。这里必须用 Transparent 而不是 null:
+                // 胶囊的悬停(MouseEnter/Leave → 展开页)依赖胶囊自身是一块可命中面,
+                // null 会让胶囊空白区域不参与命中,悬停开面板就坏了;Transparent 视觉相同。
+                _micaBrush = null;
+                _micaViewbox = Rect.Empty;
+                Pill.Background = Brushes.Transparent;
+                return;
+            }
+            bool mica = s != null && (s.PillMaterial == 1 || s.PillMaterial == 2) && MicaService.Backdrop != null;
             if (!mica)
             {
                 _micaBrush = null;
@@ -313,6 +338,11 @@ namespace DesktopBar.UI
             PanelWindow.Top = targetTop;
             Panel.Visibility = Visibility.Visible;
             PanelWindow.Visibility = Visibility.Visible;
+            // 玻璃/液态玻璃材质:展开页同样毛玻璃——窗口定位已完成(动画只是 RenderTransform),
+            // 服务内部等布局定稿后一次性捕获面板背后区域并模糊,回 UI 换成对齐的 ImageBrush;
+            // 捕获就绪前维持 ApplyTheme 给的主题色兜底。首开 600ms 内 WDA 未生效会自动延迟。
+            if (App.Settings != null && (App.Settings.PillMaterial == 3 || App.Settings.PillMaterial == 4))
+                GlassService.RefreshPanelGlass(PanelWindow, Panel);
 
             _panelTransform = new TranslateTransform(0, (above ? 8 : -8) * Ui.Scale);
             _panelScale = new ScaleTransform(0.52, 0.68);
@@ -398,6 +428,12 @@ namespace DesktopBar.UI
             ThemeService.Changed -= OnThemeChanged;
             MicaService.Changed -= OnThemeChanged;
             HidePanelImmediate();
+            try
+            {
+                var h = new System.Windows.Interop.WindowInteropHelper(PanelWindow).Handle;
+                if (h != IntPtr.Zero) GlassService.ForgetWindow(h);
+            }
+            catch { }
             try { PanelWindow.Close(); } catch { }
         }
 

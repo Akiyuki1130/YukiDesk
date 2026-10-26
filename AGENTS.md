@@ -38,10 +38,11 @@ installer.iss              Inno Setup 6 脚本：x64/arm64 × full/slim
 packaging.cmd              一键打包（ASCII-only + CRLF，见 .gitattributes）
 ChineseSimplified.isl      vendored 的 Inno Setup 简体中文语言包
 Models/Settings.cs         AppSettings（唯一可持久化的 POCO）+ 遗留 TabStyle
-Services/                  15 个服务类，全部 process-global 静态单例，**无 DI 容器**
-Interop/NativeMethods.cs  全部 Win32 P/Invoke（窗口/Z 序/Shell/AppBar/电源/图标/签名/媒体键）
+Services/                  16 个服务类，全部 process-global 静态单例，**无 DI 容器**
+Interop/NativeMethods.cs  全部 Win32 P/Invoke（窗口/Z 序/Shell/AppBar/电源/图标/签名/媒体键/GDI 捕获/WDA/D3DCompile）
 UI/ModuleBase.cs           模块基类：药丸选项卡 + 独立悬停弹出面板框架
 UI/Modules.cs              10 个具体模块 + IconCache + ItemTile + 自绘渲染面（2235 行，见 §5）
+UI/LiquidGlassEffect.cs    液态玻璃 ShaderEffect：HLSL 由 C# 拼接（胶囊几何烘焙成字面量），d3dcompiler_47 运行时编译 + 按源码 SHA-256 落盘缓存
 UI/*.cs                    ColorEditor / ConfirmDialog / OperationProgressDialog / Prompt / FlyoutMenu / ShellOpen / Ui
 docs/                      README 引用的 6 张预览截图
 Assets/YukiDesk.ico        exe 图标 + 安装器 SetupIconFile
@@ -96,7 +97,8 @@ Assets/YukiDesk.ico        exe 图标 + 安装器 SetupIconFile
 | `FileClipboard` | Explorer 兼容的 `CF_HDROP` + `Preferred DropEffect`（复制=5/剪切=2） | WPF `Clipboard` |
 | `RecycleBin` | 直接解析 `$Recycle.Bin\<SID>\$I` 元数据 | 纯托管 |
 | `ThemeService` | 主题色解析、壁纸明暗自动适配、系统偏好监听 | `SystemEvents` |
-| `MicaService` | 胶囊自绘材质烘焙（`PillMaterial`：1=云母 2=亚克力，同管线两套配方；采样壁纸→盒式重模糊→压带/保色→染色→噪点→一张冻结位图，后台 STA 烘焙线程） | 注册表壁纸配置 |
+| `MicaService` | 胶囊自绘材质烘焙（`PillMaterial`：1=云母 2=亚克力，**均已从设置 UI 下架**，仅遗留配置会落到烘焙；采样壁纸→盒式重模糊→压带/保色→染色→噪点→一张冻结位图，后台 STA 烘焙线程） | 注册表壁纸配置 |
+| `GlassService` | 实时背景玻璃（`PillMaterial`：3=玻璃 4=液态玻璃）：专用线程 BitBlt 顶栏背后条带 → 半分辨率 + 滑动和三趟盒式模糊（O(n)）→ 降采样差分门控（静止 0 写屏）→ 遮挡保护（全屏窗口盖住时 0 采样）→ UI 线程泵 WritePixels；自家窗口全部 WDA_EXCLUDEFROMCAPTURE 排除自拍；展开页一次性捕获 + ImageBrush 对齐；液态玻璃档在 Image 上挂 `LiquidGlassEffect` | `GetDC`/`BitBlt`、`SetWindowDisplayAffinity`、`WindowFromPoint` |
 | `SettingsService` | 原子写 + 备份 + 损坏隔离 + 迁移/钳制 | `System.Text.Json` |
 | `UpdateService` | GitHub Releases 检查/下载/安装（可选 SHA-256 校验） | `HttpClient` |
 | `PawnIoTctl` / `TemperatureSlave` | 读 AMD 原生 Tctl 温度 / 提权从属进程 | `DeviceIoControl`、`MemoryMappedFile` |
@@ -108,7 +110,8 @@ Assets/YukiDesk.ico        exe 图标 + 安装器 SetupIconFile
 
 - **桌面层钉底**：不是 `WorkerW` 挂载（`计划书.md` 里的旧方案已废弃）。实际做法是 `SetWindowPos` 钉在桌面装饰层之上、普通窗口之下，`WS_EX_NOACTIVATE` 保证不抢焦点；**每 3 秒保底重钉**，钉底前会撤掉外部软件误加的置顶标志，遍历时跳过 DWM cloak 的窗口。顶栏被别的窗口盖住是**设计语义**，不是 bug。
 - **悬停面板是独立置顶窗口**，不在主窗口内；所以隐藏顶栏前必须 `ClosePanels()`，否则会留下可交互的孤儿窗口。
-- **点击穿透**：主窗口 `Background=null` 时鼠标事件穿透到桌面图标；顶栏背景条一旦设置不透明度才会拦截该区域。
+- **点击穿透**：主窗口 `Background=null` 时鼠标事件穿透到桌面图标；顶栏背景条一旦设置不透明度才会拦截该区域。玻璃档（3/4）下胶囊并集之外 alpha=0（`MainWindow.UpdateGlassClip` 的 GeometryGroup Clip），穿透契约保持；**该函数必须做 Rect 集合比较防抖**——每次给 Clip 赋新 GeometryGroup 都会触发布局失效，不比较会和 LayoutUpdated 形成无限失效循环打满 UI 线程（实测 118%）。
+- **实时玻璃（PillMaterial 3/4）**：模糊全部在捕获线程 CPU 完成（半分辨率盒式三趟），WPF 侧不放 BlurEffect（满宽 BlurEffect 曾被打满一个核，虽有部分原因是上面的失效循环，CPU 模糊仍更可控）；主窗+面板 WDA_EXCLUDEFROMCAPTURE 后**任何外部截图/录屏都看不到顶栏**（取证用 `YUKI_GLASS_DUMP=<目录>` 环境变量，进程内转储发布帧+主窗 RTB）；顶栏被盖住时捕获自动暂停，这是设计不是卡死。
 - **主题**：`ModuleBase.ApplyTheme` 与 `ThemeService.Refresh` **都会重写** `Application.Current.Resources["ThemePanel*"]`，模块一多就有两个写入方；设置窗口/对话框另用一套冻结的 `Settings*` 键，不跟随运行时主题切换。
 - **线程模型**：Shell 图标提取在专用 STA 线程队列（`IconCache`），FDT/解码/文件 IO 全在后台线程，UI 线程只做布局与绘制。退出时必须等在途文件操作收尾，否则会留下半份文件。
 - **设置持久化**：`%AppData%\YukiDesk\settings.json`（Roaming），`settings.backup.json` + 随机 `.tmp-<guid>` + `File.Replace` 原子写；旧路径 `%AppData%\DesktopBar\settings.json` 会迁移。`SchemaVersion` 当前为 2。损坏时隔离为 `*.corrupt-<时间戳>` 并**拒绝**用默认值覆写。

@@ -85,6 +85,7 @@ namespace DesktopBar.Interop
         private static extern int DwmGetWindowAttribute(IntPtr h, int attr, out int val, int size);
 
         private const uint GW_HWNDPREV = 3;
+        private const uint GW_HWNDNEXT = 2;
         private const int WS_EX_TOOLWINDOW_ = 0x80;
         private const int WS_EX_NOREDIRECTIONBITMAP = 0x00200000;
 
@@ -138,6 +139,9 @@ namespace DesktopBar.Interop
                         h = GetWindow(h, GW_HWNDPREV);
                     }
                 }
+                // 关键性能闸门:SetWindowPos 打在分层窗口上会触发整窗重新呈现(实测每次约 50ms),
+                // 3 秒一次就是一条常驻的 1% 单核开销。位置本来就对时直接跳过,只做只读的 Z 序检查。
+                if (IsSittingAbove(hwnd, above)) return;
                 // SetWindowPos 语义:第一个参数(被移动窗口)会被插到第二个参数的正下方。
                 // 因此要把"最上层的装饰窗口"移到顶栏正下方,顶栏才能贴着桌面层、盖过壁纸/图标/挂件。
                 bool moved = SetWindowPos(hwnd, above, 0, 0, 0, 0, FLAGS);
@@ -145,6 +149,43 @@ namespace DesktopBar.Interop
                     App.Log("钉底失败: SetWindowPos 返回 false error=" + Marshal.GetLastWin32Error());
             }
             catch (Exception ex) { App.Log("钉底失败: " + ex.Message); }
+        }
+
+        /// <summary>
+        /// 顶栏是否已经"贴在桌面层之上":朝 Z 序底部方向走(GW_HWNDNEXT),
+        /// 中间只允许出现"不可见 / 被 DWM cloak / 桌面装饰"窗口,最终碰到桌面宿主即视为已就位。
+        /// 反方向也检查一小段(装饰窗口被插到顶栏上方的情形)。普通应用窗口在顶栏"上方"是设计语义,不参与判断。
+        /// </summary>
+        private static bool IsSittingAbove(IntPtr hwnd, IntPtr above)
+        {
+            if (hwnd == IntPtr.Zero || above == IntPtr.Zero) return false;
+            IntPtr h = GetWindow(hwnd, GW_HWNDNEXT);
+            int guard = 0;
+            while (h != IntPtr.Zero && guard++ < 64)
+            {
+                if (h == above) return true;
+                if (IsTransparentInZOrder(h)) { h = GetWindow(h, GW_HWNDNEXT); continue; }
+                break;   // 中间夹了普通窗口:顶栏被垫高了,需要重钉
+            }
+            h = GetWindow(hwnd, GW_HWNDPREV);
+            guard = 0;
+            while (h != IntPtr.Zero && guard++ < 8)
+            {
+                if (h == above) return true;
+                if (IsTransparentInZOrder(h)) { h = GetWindow(h, GW_HWNDPREV); continue; }
+                break;
+            }
+            return false;
+        }
+
+        /// <summary>该窗口能否在 Z 序检查中被忽略(不可见 / 被 cloak / 桌面装饰层)。</summary>
+        private static bool IsTransparentInZOrder(IntPtr h)
+        {
+            if (!IsWindowVisible(h)) return true;
+            int cloak;
+            DwmGetWindowAttribute(h, 14, out cloak, 4);
+            if (cloak != 0) return true;
+            return IsDesktopDecoration(h);
         }
 
         /// <summary>窗口是否带 WS_EX_TOPMOST 标志。</summary>
@@ -531,6 +572,206 @@ namespace DesktopBar.Interop
             catch { return 1.0; }
         }
 
+        // ---------- 实时玻璃:GDI 条带捕获 / WDA 排除 / 遮挡探测 ----------
+        // 配方来自液态玻璃根因报告(§9.12.1)与 glasslayer 探针:
+        // GetDC(NULL) + CreateDIBSection(top-down) + BitBlt(SRCCOPY) 只抓顶栏那一条;
+        // 自己的窗口必须先设 WDA_EXCLUDEFROMCAPTURE 排除,否则玻璃会把顶栏自己拍进去(正反馈)。
+        // BitBlt 不写 alpha → 上层承载必须用 Bgr32,不能用 Bgra32(会把未定义字节当透明度)。
+
+        internal const uint WDA_NONE = 0x00000000;
+        internal const uint WDA_EXCLUDEFROMCAPTURE = 0x00000011;
+        private const uint SRCCOPY = 0x00CC0020;
+        private const uint GA_ROOT = 2;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct POINT { public int X; public int Y; }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct BITMAPINFOHEADER
+        {
+            public uint biSize;
+            public int biWidth;
+            public int biHeight;
+            public ushort biPlanes;
+            public ushort biBitCount;
+            public uint biCompression;
+            public uint biSizeImage;
+            public int biXPelsPerMeter;
+            public int biYPelsPerMeter;
+            public uint biClrUsed;
+            public uint biClrImportant;
+        }
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool SetWindowDisplayAffinity(IntPtr hwnd, uint affinity);
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool GetWindowDisplayAffinity(IntPtr hwnd, out uint affinity);
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetDC(IntPtr hwnd);
+        [DllImport("user32.dll")]
+        private static extern int ReleaseDC(IntPtr hwnd, IntPtr hdc);
+        [DllImport("gdi32.dll")]
+        private static extern IntPtr CreateCompatibleDC(IntPtr hdc);
+        [DllImport("gdi32.dll")]
+        private static extern bool DeleteDC(IntPtr hdc);
+        [DllImport("gdi32.dll", SetLastError = true)]
+        private static extern IntPtr CreateDIBSection(IntPtr hdc, ref BITMAPINFOHEADER bmi, uint usage, out IntPtr bits, IntPtr hSection, uint offset);
+        [DllImport("gdi32.dll")]
+        private static extern IntPtr SelectObject(IntPtr hdc, IntPtr h);
+        // DeleteObject 复用本文件 30 行的既有声明(圆角区域/图标代码在用),不要重复定义。
+        [DllImport("gdi32.dll", SetLastError = true)]
+        private static extern bool BitBlt(IntPtr hdcDest, int x, int y, int w, int h, IntPtr hdcSrc, int xSrc, int ySrc, uint rop);
+        [DllImport("user32.dll")]
+        private static extern IntPtr WindowFromPoint(POINT pt);
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern int GetClassName(IntPtr hwnd, StringBuilder sb, int maxCount);
+
+        /// <summary>把窗口从屏幕捕获中排除(WDA_EXCLUDEFROMCAPTURE)。需要 Win10 2004+,失败返回 false 由调用方降级。</summary>
+        internal static bool ExcludeFromCapture(IntPtr hwnd)
+        {
+            try { return hwnd != IntPtr.Zero && SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE); }
+            catch { return false; }
+        }
+
+        /// <summary>恢复窗口参与屏幕捕获(玻璃关闭时还原,保证截图里顶栏可见)。</summary>
+        internal static bool RestoreCapture(IntPtr hwnd)
+        {
+            try { return hwnd != IntPtr.Zero && SetWindowDisplayAffinity(hwnd, WDA_NONE); }
+            catch { return false; }
+        }
+
+        /// <summary>某点命中的根窗口(物理像素坐标);给玻璃做"顶栏是否被盖住"的遮挡探测。</summary>
+        internal static IntPtr RootWindowAt(int x, int y)
+        {
+            try
+            {
+                var h = WindowFromPoint(new POINT { X = x, Y = y });
+                if (h == IntPtr.Zero) return IntPtr.Zero;
+                var root = GetAncestor(h, GA_ROOT);
+                return root == IntPtr.Zero ? h : root;
+            }
+            catch { return IntPtr.Zero; }
+        }
+
+        /// <summary>窗口类名(遮挡探测判定桌面层窗口用)。</summary>
+        internal static string WindowClassOf(IntPtr hwnd)
+        {
+            try
+            {
+                var sb = new StringBuilder(256);
+                return GetClassName(hwnd, sb, 256) > 0 ? sb.ToString() : "";
+            }
+            catch { return ""; }
+        }
+
+        /// <summary>
+        /// 创建 top-down Bgr32 的 DIB 捕获条带。返回内存 DC 与位图指针;
+        /// biHeight 传负值保证行序与 WriteableBitmap.WritePixels 一致,这个不能改。
+        /// </summary>
+        internal static bool CreateStripCapture(int width, int height,
+            out IntPtr screenDc, out IntPtr memoryDc, out IntPtr dib, out IntPtr bits)
+        {
+            screenDc = memoryDc = dib = bits = IntPtr.Zero;
+            try
+            {
+                screenDc = GetDC(IntPtr.Zero);
+                if (screenDc == IntPtr.Zero) return false;
+                memoryDc = CreateCompatibleDC(screenDc);
+                if (memoryDc == IntPtr.Zero) return false;
+                var bmi = new BITMAPINFOHEADER
+                {
+                    biSize = 40u,
+                    biWidth = width,
+                    biHeight = -height,
+                    biPlanes = 1,
+                    biBitCount = 32,
+                    biCompression = 0
+                };
+                dib = CreateDIBSection(screenDc, ref bmi, 0, out bits, IntPtr.Zero, 0);
+                if (dib == IntPtr.Zero || bits == IntPtr.Zero) return false;
+                SelectObject(memoryDc, dib);
+                return true;
+            }
+            catch { return false; }
+        }
+
+        internal static void DestroyStripCapture(ref IntPtr screenDc, ref IntPtr memoryDc, ref IntPtr dib)
+        {
+            try { if (dib != IntPtr.Zero) DeleteObject(dib); } catch { }
+            try { if (memoryDc != IntPtr.Zero) DeleteDC(memoryDc); } catch { }
+            try { if (screenDc != IntPtr.Zero) ReleaseDC(IntPtr.Zero, screenDc); } catch { }
+            screenDc = memoryDc = dib = IntPtr.Zero;
+        }
+
+        /// <summary>BitBlt 屏幕任意矩形到内存 DC(条带/面板共用)。不加 CAPTUREBLT(会带来光标闪烁)。</summary>
+        internal static bool BlitStrip(IntPtr memoryDc, int width, int height, IntPtr screenDc, int srcX, int srcY)
+        {
+            try { return BitBlt(memoryDc, 0, 0, width, height, screenDc, srcX, srcY, SRCCOPY); }
+            catch { return false; }
+        }
+
+        // ---------- 液态玻璃:运行时编译 HLSL(ps_3_0) ----------
+        // 不想引入 fxc 构建依赖也不引 NuGet,就用系统自带 d3dcompiler_47 在首次使用时编译,
+        // 字节码由调用方落盘缓存(以源码哈希命名,lgsrc 库踩过的坑:缓存名必须跟内容绑定)。
+
+        [ComImport, Guid("8BA5FB08-5195-40e2-AC58-0D989C3A0102"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        internal interface ID3DBlob
+        {
+            // 必须 PreserveSig:ID3DBlob 的这两个方法在原生侧没有 HRESULT 返回,
+            // 不标 PreserveSig 时 CLR 会按 "HRESULT + retval" 解释签名,
+            // 结果是返回值(指针/长度)全变成垃圾——踩过:指针恒为 0,数据全丢。
+            [PreserveSig] IntPtr GetBufferPointer();
+            [PreserveSig] UIntPtr GetBufferSize();
+        }
+
+        [DllImport("d3dcompiler_47.dll")]
+        private static extern int D3DCompile(byte[] srcData, int srcDataSize, string sourceName,
+            IntPtr defines, IntPtr include, string entryPoint, string target, uint flags1, uint flags2,
+            out ID3DBlob code, out ID3DBlob errorMsgs);
+
+        /// <summary>编译一段 HLSL 到 ps_3_0(target 可换 ps_2_0 做降级实验)。失败抛异常(带编译器错误文本)。</summary>
+        internal static byte[] CompilePs(string hlsl, string target = "ps_3_0")
+        {
+            var bytes = System.Text.Encoding.UTF8.GetBytes(hlsl);
+            ID3DBlob code = null, errs = null;
+            try
+            {
+                int hr = D3DCompile(bytes, bytes.Length, "liquid.hlsl", IntPtr.Zero, IntPtr.Zero,
+                    "main", target, 0, 0, out code, out errs);
+                if (hr < 0 || code == null)
+                {
+                    string msg = "hr=0x" + hr.ToString("X");
+                    try
+                    {
+                        if (errs != null)
+                        {
+                            var p = errs.GetBufferPointer();
+                            var n = (long)errs.GetBufferSize().ToUInt64();
+                            if (p != IntPtr.Zero && n > 0)
+                            {
+                                var b = new byte[n];
+                                Marshal.Copy(p, b, 0, (int)n);
+                                msg += " " + System.Text.Encoding.UTF8.GetString(b);
+                            }
+                        }
+                    }
+                    catch { }
+                    throw new InvalidOperationException("HLSL 编译失败: " + msg);
+                }
+                var len = (int)code.GetBufferSize().ToUInt64();
+                var result = new byte[len];
+                Marshal.Copy(code.GetBufferPointer(), result, 0, len);
+                return result;
+            }
+            finally
+            {
+                try { if (code != null) Marshal.ReleaseComObject(code); } catch { }
+                try { if (errs != null) Marshal.ReleaseComObject(errs); } catch { }
+            }
+        }
+
         private const uint SPI_GETWORKAREA = 0x0030;
         private const uint SPI_SETWORKAREA = 0x002F;
         private const uint SPIF_SENDCHANGE = 0x02;
@@ -820,6 +1061,16 @@ namespace DesktopBar.Interop
             bool valid = string.Equals(status, "Valid", StringComparison.OrdinalIgnoreCase);
             if (!valid) App.Log("签名校验未通过: " + (status ?? "无法判定"));
             return valid;
+        }
+
+        [DllImport("kernel32.dll")]
+        private static extern uint GetCurrentThreadId();
+
+        /// <summary>当前线程的 Win32 线程 id(与 Process.Threads[i].Id 同一空间,性能诊断里用来对号入座)。</summary>
+        public static int CurrentThreadId()
+        {
+            try { return (int)GetCurrentThreadId(); }
+            catch { return 0; }
         }
     }
 }

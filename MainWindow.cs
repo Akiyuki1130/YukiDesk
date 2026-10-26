@@ -22,6 +22,8 @@ namespace DesktopBar
 
         private static AppSettings S => App.Settings;
 
+        internal List<ModuleBase> DiagnosticModules => _modules;
+
         private readonly List<ModuleBase> _modules = new List<ModuleBase>();
         private readonly List<ModuleBase> _folderModules = new List<ModuleBase>();
         private readonly DispatcherTimer _pinTimer;
@@ -38,6 +40,8 @@ namespace DesktopBar
 
         public MainWindow()
         {
+            Bar = this;   // 全局单例:MicaService/GlassService/自检都靠它拿"当前顶栏",
+                          // 这里漏赋值过一次,导致液态玻璃几何换算永远拿到 null 而静默不生效。
             AllowsTransparency = true;
             WindowStyle = WindowStyle.None;
             ResizeMode = ResizeMode.NoResize;
@@ -57,6 +61,9 @@ namespace DesktopBar
                 var handle = new WindowInteropHelper(this).Handle;
                 NativeMethods.ApplyNoActivateToolStyle(handle);
                 NativeMethods.EnsureShown(handle);
+                // 玻璃材质需要把主窗排除出屏幕捕获,否则会把顶栏自己拍进去(正反馈)。
+                // 未启用玻璃时服务内部只登记不设置,材质切到玻璃时统一生效。
+                GlassService.RegisterWindow(handle);
                 App.Log("YukiDesk 主窗口句柄=" + handle + " 尺寸=" + ActualWidth + "x" + ActualHeight);
             };
 
@@ -75,7 +82,8 @@ namespace DesktopBar
                 {
                     if (_closing || Visibility != Visibility.Visible) return;
                     PinToDesktopLayer();
-                    _pinTimer.Start();
+                    // 诊断开关:YUKI_NO_REPIN=1 关掉 3 秒保底重钉,用来量化重钉本身的开销。
+                    if (Environment.GetEnvironmentVariable("YUKI_NO_REPIN") != "1") _pinTimer.Start();
                 }));
             };
             IsVisibleChanged += (s, e) =>
@@ -136,12 +144,21 @@ namespace DesktopBar
 
             var root = new Grid();
 
-            // 顶栏背景条:默认完全透明(null → 不拦截点击)
+            // 实时玻璃层放在最底(背景条之下):Image+BlurEffect 承载捕获条带,
+            // Clip=胶囊并集保证胶囊外 alpha=0、点击照常穿透桌面。元素由服务缓存,
+            // 全量重建时复用同一块 WriteableBitmap,避免重建瞬间玻璃空一帧。
+            var glassHost = GlassService.EnsureHost();
+            if (glassHost != null) root.Children.Add(glassHost);
+
+            // 顶栏背景条:默认完全透明(null → 不拦截点击)。玻璃/液态玻璃档强制透明——
+            // 玻璃染色层已承担压暗职责,再叠背景条会双重压暗。
             var barBg = new Border
             {
                 Height = 46 * Ui.Scale,
                 VerticalAlignment = VerticalAlignment.Top,
-                Background = S.BarBgOpacity > 0.005 ? Ui.Brush(S.BarBgColor, S.BarBgOpacity) : null
+                Background = ((S.PillMaterial == 3 || S.PillMaterial == 4) || S.BarBgOpacity <= 0.005)
+                    ? null
+                    : Ui.Brush(S.BarBgColor, S.BarBgOpacity)
             };
             root.Children.Add(barBg);
 
@@ -238,15 +255,81 @@ namespace DesktopBar
             Content = root;
             App.Log("YukiDesk 主栏布局已构建");
             WireMedia();
+            if (glassHost != null)
+            {
+                // 胶囊并集裁剪随布局变化重算(模块显隐/文件夹增删/时钟重排都走这里)。
+                // UpdateGlassClip 内部做 Rect 集合比较防抖,LayoutUpdated 高频触发也只做 O(n) 比较。
+                root.LayoutUpdated += (s2, e2) => UpdateGlassClip();
+            }
             Dispatcher.BeginInvoke(DispatcherPriority.Loaded, new Action(() =>
             {
                 if (_closing || layoutVersion != _layoutVersion) return;
+                UpdateGlassClip();
                 var hwnd = new WindowInteropHelper(this).Handle;
                 if (S.ReserveDesktopSpace)
                     DesktopSpaceService.Apply(S, hwnd);
                 else
                     DesktopSpaceService.Apply(S);
             }));
+        }
+
+        private List<Rect> _lastGlassRects;
+
+        /// <summary>
+        /// 重算玻璃层裁剪几何 = 所有可见胶囊圆角矩形的并集(DIP,窗口坐标系)。
+        /// 并集之外的玻璃像素保持 alpha=0,维持"胶囊外点击穿透到桌面"的契约。
+        /// 必须做 Rect 集合比较防抖:LayoutUpdated 一帧可触发多次,而每次给 Clip 赋
+        /// 新 GeometryGroup 都会再触发布局失效——不比较就会形成无限失效循环,
+        /// 把 UI 线程打满一个核(实测 118%,旧版纯云母只有 3%)。
+        /// </summary>
+        private void UpdateGlassClip()
+        {
+            if (_closing) return;
+            if (S.PillMaterial != 3 && S.PillMaterial != 4) return;
+            var root = Content as Grid;
+            if (root == null) return;
+            var rects = new List<Rect>();
+            try
+            {
+                foreach (var m in _modules)
+                {
+                    if (m == null || m.Visibility != Visibility.Visible || m.ActualWidth < 1) continue;
+                    var pill = m.Pill;
+                    if (pill == null || pill.ActualWidth < 1) continue;
+                    Rect r = pill.TransformToAncestor(root)
+                        .TransformBounds(new Rect(0, 0, pill.ActualWidth, pill.ActualHeight));
+                    rects.Add(r);
+                }
+            }
+            catch { }
+            if (SameRects(rects, _lastGlassRects)) return;   // 布局没动:直接返回,不给 Clip 赋新值
+            _lastGlassRects = rects;
+            GeometryGroup group = null;
+            try
+            {
+                group = new GeometryGroup { FillRule = FillRule.Nonzero };
+                foreach (var r in rects)
+                    // 19*scale 与 ModuleBase 胶囊 CornerRadius 同源,保持圆角一致。
+                    group.Children.Add(new RectangleGeometry(r, 19 * Ui.Scale, 19 * Ui.Scale));
+                GlassService.SetClip(group, rects);
+            }
+            catch
+            {
+                try { GlassService.SetClip(null, null); } catch { }
+            }
+        }
+
+        /// <summary>Rect 集合逐项比较(0.25 DIP 容差,抵消布局亚像素抖动)。</summary>
+        private static bool SameRects(List<Rect> a, List<Rect> b)
+        {
+            if (a == null || b == null || a.Count != b.Count) return false;
+            for (int i = 0; i < a.Count; i++)
+            {
+                if (Math.Abs(a[i].X - b[i].X) > 0.25 || Math.Abs(a[i].Y - b[i].Y) > 0.25 ||
+                    Math.Abs(a[i].Width - b[i].Width) > 0.25 || Math.Abs(a[i].Height - b[i].Height) > 0.25)
+                    return false;
+            }
+            return true;
         }
 
         private PerfModule AddPerfModule(StackPanel right, PerfMetric metric)
@@ -296,6 +379,7 @@ namespace DesktopBar
             ClosePanels();
             _pinTimer.Stop();
             Hide();
+            GlassService.SetActive(false);
         }
 
         public new void Show()
@@ -306,6 +390,7 @@ namespace DesktopBar
                 PinToDesktopLayer();
                 _pinTimer.Start();
             }
+            GlassService.SetActive(true);
         }
 
         private static void SetModuleVisibility(ModuleBase module, bool visible)

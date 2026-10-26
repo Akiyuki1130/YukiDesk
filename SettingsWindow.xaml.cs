@@ -400,18 +400,24 @@ namespace DesktopBar
         private Border _materialCard;
 
         /// <summary>
-        /// 胶囊材质卡片。云母 = 壁纸重模糊 + 亮度压带 + 主题染色 + 细噪点;
-        /// 亚克力 = 同一条烘焙管线的另一套配方:更磨砂、保留更多壁纸色彩、更透明。
-        /// 一次性烘焙成位图,所以静止时 0 重绘——与液态玻璃每帧采样背景不是一个量级。
-        /// 只有"模糊半径/细节对比/彩度/染色/噪点"会触发重烘焙(后台线程约 0.3 秒),
-        /// 不透明度走画笔层,改立即生效。
+        /// 胶囊材质卡片。玻璃(3) = 实时捕获顶栏背后屏幕 + 高斯模糊,Apple/小米式真·毛玻璃;
+        /// 云母/亚克力 = 壁纸烘焙管线(已从界面下架,存量配置自动迁移到玻璃,后端保留可回滚)。
+        /// 玻璃的参数改动只调 GlassService.ApplyLive,不触发顶栏全量重建。
         /// </summary>
         private void BuildMicaCard()
         {
             if (_materialCard != null) AppearanceHost.Children.Remove(_materialCard);
+            bool liquid = S.PillMaterial == 4;
+            bool glass = S.PillMaterial == 3 || liquid;
             bool acrylic = S.PillMaterial == 2;
-            string name = S.PillMaterial == 0 ? "纯色" : acrylic ? "亚克力" : "云母";
-            string subtitle = acrylic
+            string name = S.PillMaterial == 0 ? "纯色" : liquid ? "液态玻璃" : glass ? "玻璃" : acrylic ? "亚克力" : "云母";
+            string subtitle = liquid
+                ? "液态玻璃：实时捕获背后屏幕 → 高斯模糊 → 着色器叠加折射/色散/边缘光（iOS 26 式凸透镜边缘收缩）。"
+                  + "胶囊轮廓有真实折射感；参数见下方,静止桌面自动降到近零开销。"
+                : glass
+                ? "实时背景玻璃：捕获顶栏背后的真实屏幕（窗口+图标+壁纸）→ 高斯模糊 → 染色，铺进胶囊。"
+                  + "静止桌面自动降到近零开销；云母/亚克力已下架（旧配置自动迁移到玻璃）。"
+                : acrylic
                 ? "自绘亚克力：采样壁纸 → 磨砂重模糊 → 保留色彩 → 随明暗主题提亮/压暗 → 噪点，烘焙成一张位图。"
                   + "比云母更通透、更“彩色”，是磨砂玻璃质感；零屏幕捕获、零每帧开销，每个胶囊按自己在屏幕上的位置取对应一段。"
                 : "自绘 Mica：采样壁纸 → 重模糊 → 亮度压带 → 主题染色 → 细噪点，烘焙成一张位图。"
@@ -420,7 +426,31 @@ namespace DesktopBar
             body.Children.Add(Row("材质", BuildPillMaterialPicker()));
             if (S.PillMaterial == 0)
             {
-                body.Children.Add(MakeHint("当前为纯色：胶囊沿用上方「主题」卡片的外观设置。选择云母或亚克力后，这里会显示对应的材质参数。", 12));
+                body.Children.Add(MakeHint("当前为纯色：胶囊沿用上方「主题」卡片的外观设置。选择玻璃后，这里会显示玻璃的材质参数。", 12));
+            }
+            else if (glass)
+            {
+                body.Children.Add(Row("不透明度", NumberSlider(5, 100, S.GlassOpacity * 100, "%",
+                    v => { S.GlassOpacity = Math.Max(0.05, Math.Round(v) / 100); App.Save(); Services.GlassService.ApplyLive(); })));
+                body.Children.Add(Row("模糊半径", NumberSlider(4, 60, S.GlassBlurRadius, " px",
+                    v => { S.GlassBlurRadius = Math.Round(v); App.Save(); Services.GlassService.ApplyLive(); })));
+                body.Children.Add(Row("染色颜色", NewColorEditor(S.GlassTint,
+                    h => { S.GlassTint = h; App.Save(); Services.GlassService.ApplyLive(); })));
+                body.Children.Add(Row("染色浓度", NumberSlider(0, 100, S.GlassTintOpacity * 100, "%",
+                    v => { S.GlassTintOpacity = Math.Round(v) / 100; App.Save(); Services.GlassService.ApplyLive(); })));
+                body.Children.Add(Row("帧率上限", NumberSlider(5, 60, S.GlassMaxFps, " fps",
+                    v => { S.GlassMaxFps = (int)Math.Round(v); App.Save(); Services.GlassService.ApplyLive(); })));
+                if (liquid)
+                {
+                    body.Children.Add(Row("折射强度", NumberSlider(0, 100, S.GlassRefraction * 100, "%",
+                        v => { S.GlassRefraction = Math.Round(v) / 100; App.Save(); Services.GlassService.ApplyLive(); })));
+                    body.Children.Add(Row("边缘光", NumberSlider(0, 100, S.GlassRim * 100, "%",
+                        v => { S.GlassRim = Math.Round(v) / 100; App.Save(); Services.GlassService.ApplyLive(); })));
+                    body.Children.Add(Row("色散", NumberSlider(0, 100, S.GlassChroma * 100, "%",
+                        v => { S.GlassChroma = Math.Round(v) / 100; App.Save(); Services.GlassService.ApplyLive(); })));
+                }
+                body.Children.Add(MakeHint("玻璃会实时捕获顶栏背后的屏幕。注意：捕获期间用截图/录屏/OBS 看不到顶栏本身"
+                    + "（系统级排除，防止玻璃把自己拍进去）；顶栏被全屏窗口盖住时自动暂停捕获。", 12));
             }
             else
             {
@@ -449,13 +479,13 @@ namespace DesktopBar
             AppearanceHost.Children.Add(card);
         }
 
-        /// <summary>胶囊材质三选：纯色（默认，沿用上方主题色）/ 云母（自绘 Mica）/ 亚克力（自绘 Acrylic）。</summary>
+        /// <summary>胶囊材质选择：纯色（默认）/ 玻璃（实时背景高斯）/ 液态玻璃（折射+色散+边缘光）。云母/亚克力已下架。</summary>
         private FrameworkElement BuildPillMaterialPicker()
         {
             var panel = new StackPanel { Orientation = Orientation.Horizontal };
             var options = new (string Label, int Mode)[]
             {
-                ("纯色", 0), ("云母", 1), ("亚克力", 2)
+                ("纯色", 0), ("玻璃", 3), ("液态玻璃", 4)
             };
             foreach (var (label, mode) in options)
             {
@@ -482,11 +512,17 @@ namespace DesktopBar
         }
 
         /// <summary>
-        /// 材质参数变更：写盘 + 触发重算。首次开启时位图还不存在,
-        /// 同步算一次(约 0.3 秒)避免先闪一下纯色;之后都走后台线程。
+        /// 材质参数变更：写盘 + 触发重算。玻璃档走顶栏全量重建(Save→ApplySettings→BuildLayout
+        /// 里挂/摘玻璃层),云母首次开启时位图还不存在,同步算一次避免先闪纯色。
         /// </summary>
         private void ApplyMica()
         {
+            if (S.PillMaterial == 3 || S.PillMaterial == 4)
+            {
+                Save();
+                Services.GlassService.ApplyLive();
+                return;
+            }
             Save();
             if (S.PillMaterial != 0 && Services.MicaService.Backdrop == null)
                 Services.MicaService.BakeOnce();

@@ -134,10 +134,27 @@ namespace DesktopBar.UI
             var parts = new List<string> { now.ToString(App.Settings.ShowSeconds ? "HH:mm:ss" : "HH:mm") };
             if (App.Settings.ShowDate) parts.Add(now.ToString("M月d日"));
             if (App.Settings.ShowWeekday) parts.Add("周" + "日一二三四五六"[(int)now.DayOfWeek]);
-            _pillText.Text = string.Join("  ", parts); _pTime.Text = now.ToString("HH:mm:ss"); _pWeek.Text = WeekNames[(int)now.DayOfWeek]; _pDate.Text = now.ToString("yyyy年M月d日"); _pLunar.Text = Lunar.ToLunarString(now);
+            string pill = string.Join("  ", parts);
+            // 只在文字真的变了才赋值:分层窗口每次被弄脏都会整条重呈,同值赋值是纯浪费。
+            if (_pillText.Text != pill) _pillText.Text = pill;
+            // 面板没打开时不刷面板那 5 个 TextBlock(打开时 OnPanelShown 会补一次)。
+            if (Panel == null || !Panel.IsVisible) return;
+            string time = now.ToString("HH:mm:ss"), week = WeekNames[(int)now.DayOfWeek], date = now.ToString("yyyy年M月d日"), lunar = Lunar.ToLunarString(now);
+            if (_pTime.Text != time) _pTime.Text = time;
+            if (_pWeek.Text != week) _pWeek.Text = week;
+            if (_pDate.Text != date) _pDate.Text = date;
+            if (_pLunar.Text != lunar) _pLunar.Text = lunar;
             string fest = Festivals.GetTodayLabel(now);
-            _pFest.Text = fest.Length > 0 ? "今 " + fest : "";
-            _pFest.Visibility = fest.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
+            string festText = fest.Length > 0 ? "今 " + fest : "";
+            if (_pFest.Text != festText) _pFest.Text = festText;
+            var vis = fest.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
+            if (_pFest.Visibility != vis) _pFest.Visibility = vis;
+        }
+
+        protected override void OnPanelShown()
+        {
+            base.OnPanelShown();
+            Refresh();
         }
         public override void Dispose() { _timer.Stop(); base.Dispose(); }
     }
@@ -1801,8 +1818,12 @@ namespace DesktopBar.UI
         {
             if (!(args is RenderingEventArgs renderingArgs)) return;
             TimeSpan now = renderingArgs.RenderingTime;
+            // 空闲波纹是纯装饰的慢波(170ms 行进一根),没必要 60fps 重绘:
+            // 分层窗口每被弄脏一次就要整条重呈,实测 60fps 空闲波会在静音桌面上常驻吃掉约 10% 单核。
+            // 空闲期降到 20fps 观感几乎无差(每根柱子仍有 8+ 帧插值),开销降到约 1/3。
+            double frameMs = _idleAnim ? 50.0 : 16.0;
             if (_lastRenderTime != TimeSpan.MinValue
-                && now - _lastRenderTime < TimeSpan.FromMilliseconds(16)) return;
+                && now - _lastRenderTime < TimeSpan.FromMilliseconds(frameMs)) return;
 
             double elapsedMs = _lastRenderTime == TimeSpan.MinValue
                 ? 33
@@ -1962,6 +1983,7 @@ namespace DesktopBar.UI
         private readonly PerfMetric _metric;
         private readonly TextBlock _value;
         private readonly Dictionary<string, TextBlock> _rows = new Dictionary<string, TextBlock>();
+        private string _lastPillText, _lastTip;
         private TextBlock _panelTitle;
         private bool _active;
         private bool _disposed;
@@ -1999,6 +2021,29 @@ namespace DesktopBar.UI
             IsVisibleChanged += (s2, e2) => SetActive(IsVisible);
             Loaded += (s2, e2) => SetActive(IsVisible);
             Unloaded += (s2, e2) => SetActive(false);
+        }
+
+        private void SetPillText(string text)
+        {
+            // 文字没变就不要再赋值:分层窗口每次被弄脏都要整条重呈,同值赋值在 WPF 里虽多数会被 DP 相等性拦掉,
+            // 但 ToolTip 这种会重建控件的属性必须自己挡。
+            if (_lastPillText == text) return;
+            _lastPillText = text;
+            _value.Text = text;
+        }
+
+        private void SetTip(string text)
+        {
+            if (_lastTip == text) return;
+            _lastTip = text;
+            Pill.ToolTip = text;
+        }
+
+        protected override void OnPanelShown()
+        {
+            base.OnPanelShown();
+            var latest = PerfService.Instance.Latest;
+            if (latest != null) Apply(latest);
         }
 
         private string Caption => _metric switch
@@ -2112,20 +2157,20 @@ namespace DesktopBar.UI
             switch (_metric)
             {
                 case PerfMetric.Cpu:
-                    _value.Text = FmtPercent(sample.CpuPercent);
-                    Pill.ToolTip = Caption + (sample.CpuPercent >= 0
+                    SetPillText(FmtPercent(sample.CpuPercent));
+                    SetTip(Caption + (sample.CpuPercent >= 0
                         ? " — " + Math.Round(sample.CpuPercent) + "%"
-                        : "");
+                        : ""));
                     SetRow("占用", FmtPercent(sample.CpuPercent));
                     SetRow("温度", FmtTemp(sample.CpuTempC));
                     SetRow("频率", FmtFreq(sample.CpuFreqMhz));
                     break;
                 case PerfMetric.Gpu:
                     var gpu = PickGpu(sample.Gpus);
-                    _value.Text = gpu == null ? "--" : FmtPercent(gpu.UtilPercent);
-                    Pill.ToolTip = gpu == null
+                    SetPillText(gpu == null ? "--" : FmtPercent(gpu.UtilPercent));
+                    SetTip(gpu == null
                         ? Caption
-                        : gpu.Name + (gpu.UtilPercent >= 0 ? " — " + Math.Round(gpu.UtilPercent) + "%" : "");
+                        : gpu.Name + (gpu.UtilPercent >= 0 ? " — " + Math.Round(gpu.UtilPercent) + "%" : ""));
                     SetRow("型号", gpu == null ? "--" : gpu.Name);
                     SetRow("占用", gpu == null ? "--" : FmtPercent(gpu.UtilPercent));
                     SetRow("温度", FmtTemp(gpu == null ? -1 : gpu.TempC));
@@ -2134,15 +2179,15 @@ namespace DesktopBar.UI
                 case PerfMetric.Memory:
                     if (sample.MemTotalBytes <= 0)
                     {
-                        _value.Text = "--";
-                        Pill.ToolTip = Caption;
+                        SetPillText("--");
+                        SetTip(Caption);
                     }
                     else
                     {
                         double percent = 100.0 * sample.MemUsedBytes / sample.MemTotalBytes;
-                        _value.Text = FmtPercent(percent);
-                        Pill.ToolTip = "内存 已用 " + FmtGb(sample.MemUsedBytes) + " / "
-                            + FmtGb(sample.MemTotalBytes) + " (" + Math.Round(percent) + "%)";
+                        SetPillText(FmtPercent(percent));
+                        SetTip("内存 已用 " + FmtGb(sample.MemUsedBytes) + " / "
+                            + FmtGb(sample.MemTotalBytes) + " (" + Math.Round(percent) + "%)");
                     }
                     SetRow("占用", sample.MemTotalBytes <= 0
                         ? "--"
@@ -2154,14 +2199,14 @@ namespace DesktopBar.UI
                 default:
                     if (sample.NetUpBps < 0 && sample.NetDownBps < 0)
                     {
-                        _value.Text = "--";
-                        Pill.ToolTip = Caption;
+                        SetPillText("--");
+                        SetTip(Caption);
                     }
                     else
                     {
-                        _value.Text = "↓" + FmtSpeed(sample.NetDownBps) + " ↑" + FmtSpeed(sample.NetUpBps);
-                        Pill.ToolTip = "网络 下行 " + FmtSpeedLong(sample.NetDownBps) + "/s,上行 "
-                            + FmtSpeedLong(sample.NetUpBps) + "/s";
+                        SetPillText("↓" + FmtSpeed(sample.NetDownBps) + " ↑" + FmtSpeed(sample.NetUpBps));
+                        SetTip("网络 下行 " + FmtSpeedLong(sample.NetDownBps) + "/s,上行 "
+                            + FmtSpeedLong(sample.NetUpBps) + "/s");
                     }
                     SetRow("下行", sample.NetDownBps < 0 ? "--" : FmtSpeedLong(sample.NetDownBps) + "/s");
                     SetRow("上行", sample.NetUpBps < 0 ? "--" : FmtSpeedLong(sample.NetUpBps) + "/s");
@@ -2171,7 +2216,10 @@ namespace DesktopBar.UI
 
         private void SetRow(string label, string text)
         {
-            if (_rows.TryGetValue(label, out var tb)) tb.Text = text;
+            // 面板没打开时那棵树不参与合成,逐秒写它只是白花 DP 与文本排版开销;
+            // 打开时 OnPanelShown 会整体刷一遍,不会显示旧值。
+            if (Panel == null || !Panel.IsVisible) return;
+            if (_rows.TryGetValue(label, out var tb) && tb.Text != text) tb.Text = text;
         }
 
         private static string FmtTemp(double c)

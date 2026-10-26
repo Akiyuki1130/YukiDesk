@@ -39,7 +39,7 @@ namespace DesktopBar.Models
         // 云母本质是"壁纸模糊 + 亮度压带 + 主题染色 + 细噪点",只依赖壁纸不依赖背后窗口,
         // 所以可以用已知内容复现:零捕获、零每帧开销、任意胶囊形状(主报告 §9.22.5)。
         // 默认 0 = 纯色,保持现有外观;只有用户显式打开才会烘焙位图。
-        /// <summary>胶囊材质:0=纯色(默认) 1=云母(自绘 Mica) 2=亚克力(自绘 Acrylic)。</summary>
+        /// <summary>胶囊材质:0=纯色(默认) 1=云母(遗留,已下架) 2=亚克力(遗留,已下架) 3=实时背景玻璃 4=液态玻璃。</summary>
         public int PillMaterial { get; set; } = 0;
         /// <summary>云母整体不透明度。</summary>
         public double MicaOpacity { get; set; } = 0.86;
@@ -70,6 +70,30 @@ namespace DesktopBar.Models
         public double AcrylicTint { get; set; } = 0.24;
         /// <summary>亚克力噪点强度。真亚克力的噪点比云母显眼。</summary>
         public double AcrylicNoise { get; set; } = 0.05;
+
+        // ---- 胶囊材质(实时背景玻璃 / Glass, PillMaterial=3) ----
+        // 与云母"只采样壁纸一次性烘焙"不同,玻璃每帧捕获顶栏背后的真实屏幕内容
+        // (窗口+桌面图标+壁纸),高斯模糊后按胶囊并集铺在主窗口最底层——
+        // Apple/小米式真·毛玻璃。自己的窗口用 WDA_EXCLUDEFROMCAPTURE 排除自拍;
+        // 静止桌面经降采样差分门控,0 写屏。
+        /// <summary>玻璃整体不透明度(玻璃层 Image 的 Opacity)。</summary>
+        public double GlassOpacity { get; set; } = 0.90;
+        /// <summary>玻璃高斯模糊半径(DIP,BlurEffect.Radius 按显示器 DPI 换算)。越大越糊、逐帧成本越高。</summary>
+        public double GlassBlurRadius { get; set; } = 24;
+        /// <summary>玻璃染色颜色(叠在模糊层之上的边框层)。</summary>
+        public string GlassTint { get; set; } = "#14141C";
+        /// <summary>玻璃染色不透明度。</summary>
+        public double GlassTintOpacity { get; set; } = 0.18;
+        /// <summary>捕获帧率上限(5..60;静止画面经差分门控后实际写屏远低于此值)。</summary>
+        public int GlassMaxFps { get; set; } = 30;
+
+        // ---- 液态玻璃(PillMaterial=4)专属:着色器参数 ----
+        /// <summary>折射强度(0..1,胶囊轮廓边缘的位移采样,凸透镜收缩感)。</summary>
+        public double GlassRefraction { get; set; } = 0.45;
+        /// <summary>边缘光强度(0..1,轮廓内侧一圈亮边)。</summary>
+        public double GlassRim { get; set; } = 0.5;
+        /// <summary>色散强度(0..1,边缘 RGB 错位,玻璃棱镜感)。</summary>
+        public double GlassChroma { get; set; } = 0.35;
 
         // 旧字段保留用于读取旧配置并迁移，不再单独应用。
         public TabStyle Folder { get; set; } = new TabStyle();

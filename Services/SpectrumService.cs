@@ -125,6 +125,7 @@ namespace DesktopBar.Services
 
         private void RunLoop(CancellationTokenSource runCancellation)
         {
+            GlassDiagnostics.TagThread("频谱采集");
             var token = runCancellation.Token;
             try
             {

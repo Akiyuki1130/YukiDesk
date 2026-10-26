@@ -57,6 +57,188 @@ namespace DesktopBar
             catch { }
         }
 
+        // ---------- 无界面自检:液态玻璃着色器 ----------
+        // 只验证 "HLSL 能不能在 ps_3_0 下编过 + WPF 能不能收下字节码", 不建窗口不捕获。
+        // 用法: YukiDesk.exe --glasstest
+        private static void RunGlassTest()
+        {
+            App.Log("=== 液态玻璃自检 开始 ===");
+            try
+            {
+                // 半分辨率像素下的胶囊(按实测 DIP*0.75 近似;这里只关心指令数,几何精确性无所谓)
+                double[] dips = { 34.2, 165.5, 52.2, 77.4, 79.2, 112.5, 108.0, 34.2, 34.2, 52.2, 77.4, 108.0, 34.2 };
+                var rects = new float[dips.Length][];
+                double x = 9.0;
+                for (int i = 0; i < dips.Length; i++)
+                {
+                    rects[i] = new float[]
+                    {
+                        (float)((x + dips[i] / 2.0) * 0.75),
+                        (float)((3.6 + 17.1) * 0.75),
+                        (float)(dips[i] / 2.0 * 0.75),
+                        (float)(17.1 * 0.75)
+                    };
+                    x += dips[i] + 6.0;
+                }
+                for (int n = 1; n <= rects.Length; n++)
+                {
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    var fx = UI.LiquidGlassEffect.Create(rects, n, 12.0, 1280, 54);
+                    sw.Stop();
+                    App.Log(string.Format("  [glasstest] n={0} -> {1} ({2} ms)", n, fx == null ? "失败" : "成功", sw.ElapsedMilliseconds));
+                    if (fx == null) break;
+                }
+            }
+            catch (Exception ex) { App.Log("  [glasstest] 自检异常: " + ex); }
+            App.Log("=== 液态玻璃自检 结束 ===");
+        }
+
+        // ---------- 无界面自检:WPF ShaderEffect 的采样输入到底是什么 ----------
+        // 把一张合成的高饱和位图(左半边纯红、右半边纯绿、顶部一行纯白)塞进 Image,
+        // 挂上液态玻璃着色器,用 RenderTargetBitmap 离屏渲染后读回像素。
+        // 目的:完全绕开主窗口/捕获链路,单独判定"WPF 交给采样器的是不是这张位图"。
+        // 用法: YukiDesk.exe --glasssampler [输出目录]
+        private static void RunGlassSamplerTest(string[] args)
+        {
+            App.Log("=== 着色器采样自检 开始 ===");
+            string dir = Path.Combine(Path.GetTempPath(), "yukidesk-glasssampler");
+            for (int i = 0; i < args.Length - 1; i++) if (args[i] == "--glasssampler") dir = args[i + 1];
+            try { Directory.CreateDirectory(dir); } catch { }
+            try
+            {
+                // 合成位图:左红右绿,第 0~8 行纯白。Bgra32,alpha=255(不透明)。
+                int sw = 256, sh = 60;
+                var src = new System.Windows.Media.Imaging.WriteableBitmap(sw, sh, 96, 96, PixelFormats.Bgra32, null);
+                var px = new byte[sw * sh * 4];
+                for (int y = 0; y < sh; y++)
+                {
+                    for (int x = 0; x < sw; x++)
+                    {
+                        int i = (y * sw + x) * 4;
+                        if (y < 8) { px[i] = 255; px[i + 1] = 255; px[i + 2] = 255; px[i + 3] = 255; }
+                        else if (x < sw / 2) { px[i] = 0; px[i + 1] = 0; px[i + 2] = 255; px[i + 3] = 255; }
+                        else { px[i] = 0; px[i + 1] = 255; px[i + 2] = 0; px[i + 3] = 255; }
+                    }
+                }
+                src.WritePixels(new Int32Rect(0, 0, sw, sh), px, sw * 4, 0);
+                src.Freeze();
+
+                // 一个覆盖整个面的"胶囊"(半宽/半高=整面),保证 sd 内场覆盖全图,位移不为 0 的地方也能看出来。
+                var rects = new float[][] { new float[] { sw * 0.5f, sh * 0.5f, sw * 0.5f, sh * 0.5f } };
+                var fx = UI.LiquidGlassEffect.Create(rects, 1, 15.0, sw, sh);
+                App.Log("  [glasssampler] 着色器创建 = " + (fx == null ? "失败" : "成功"));
+                if (fx == null) { App.Log("=== 着色器采样自检 结束 ==="); return; }
+                fx.Input = new System.Windows.Media.ImageBrush(src) { Stretch = System.Windows.Media.Stretch.Fill };
+                fx.Refr = 0.0; fx.Rim = 0.0; fx.Chroma = 0.0;   // 先把位移/棱光/色散全关掉,只测"采样值"
+
+                // 决定性对照:把采样 Brush 换成"纯品红",与元素内容(红/绿/白图案)明显不同。
+                // 若输出还是图案 → Brush 根本没被绑定(采样到的是隐式输入);
+                // 若输出品红 → Brush 绑定成功,问题在别处(比如 WriteableBitmap 当 Brush)。
+                {
+                    int mw = 8, mh = 8;
+                    var mp = new byte[mw * mh * 4];
+                    for (int i = 0; i < mp.Length; i += 4) { mp[i] = 255; mp[i + 1] = 0; mp[i + 2] = 255; mp[i + 3] = 255; }
+                    var mag = System.Windows.Media.Imaging.BitmapSource.Create(mw, mh, 96, 96, PixelFormats.Bgra32, null, mp, mw * 4);
+                    mag.Freeze();
+                    fx.Input = new System.Windows.Media.ImageBrush(mag) { Stretch = System.Windows.Media.Stretch.Fill };
+                    var img2 = new System.Windows.Controls.Image { Source = src, Width = sw, Height = sh, Stretch = System.Windows.Media.Stretch.Fill, Effect = fx };
+                    var host2 = new System.Windows.Controls.Grid
+                    {
+                        Width = sw, Height = sh,
+                        Background = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(0, 128, 0))
+                    };
+                    host2.Children.Add(img2);
+                    host2.Measure(new System.Windows.Size(sw, sh));
+                    host2.Arrange(new System.Windows.Rect(0, 0, sw, sh));
+                    host2.UpdateLayout();
+                    var rtbX = new System.Windows.Media.Imaging.RenderTargetBitmap(sw, sh, 96, 96, PixelFormats.Pbgra32);
+                    rtbX.Render(host2);
+                    var xp = new byte[sw * sh * 4];
+                    rtbX.CopyPixels(xp, sw * 4, 0);
+                    SavePng(rtbX, Path.Combine(dir, "sampler-magentabrush.png"));
+                    App.Log("  [glasssampler] 采样Brush=品红 左半=" + Mean4(xp, sw, 0, 20, sw / 2, sh - 20)
+                            + " 右半=" + Mean4(xp, sw, sw / 2, 20, sw / 2, sh - 20));
+                }
+                var img = new System.Windows.Controls.Image { Source = src, Width = sw, Height = sh, Stretch = System.Windows.Media.Stretch.Fill };
+                img.Effect = fx;
+                var host = new System.Windows.Controls.Grid
+                {
+                    Width = sw, Height = sh,
+                    // 品红底:着色器输出"黑"与"元素根本没画"在这两种情况下才区分得开(黑底会把两者混为一谈)。
+                    Background = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(255, 0, 255))
+                };
+                host.Children.Add(img);
+                host.Measure(new System.Windows.Size(sw, sh));
+                host.Arrange(new System.Windows.Rect(0, 0, sw, sh));
+                host.UpdateLayout();
+
+                var rtb = new System.Windows.Media.Imaging.RenderTargetBitmap(sw, sh, 96, 96, PixelFormats.Pbgra32);
+                rtb.Render(host);
+                var outPx = new byte[sw * sh * 4];
+                rtb.CopyPixels(outPx, sw * 4, 0);
+                SavePng(rtb, Path.Combine(dir, "sampler-effect.png"));
+                // 对照组:同一张图不挂着色器,证明"位图本身是亮的"。
+                img.Effect = null;
+                host.UpdateLayout();
+                var rtb2 = new System.Windows.Media.Imaging.RenderTargetBitmap(sw, sh, 96, 96, PixelFormats.Pbgra32);
+                rtb2.Render(host);
+                var rawPx = new byte[sw * sh * 4];
+                rtb2.CopyPixels(rawPx, sw * 4, 0);
+                SavePng(rtb2, Path.Combine(dir, "sampler-plain.png"));
+
+                // 对照组 2:内置 BlurEffect。若内置效果也"画不出来",说明是 RTB/软件渲染不支持效果,
+                // 而不是我们的着色器有问题。
+                try
+                {
+                    img.Effect = new System.Windows.Media.Effects.BlurEffect { Radius = 8 };
+                    host.UpdateLayout();
+                    var rtb3 = new System.Windows.Media.Imaging.RenderTargetBitmap(sw, sh, 96, 96, PixelFormats.Pbgra32);
+                    rtb3.Render(host);
+                    var blurPx = new byte[sw * sh * 4];
+                    rtb3.CopyPixels(blurPx, sw * 4, 0);
+                    SavePng(rtb3, Path.Combine(dir, "sampler-blur.png"));
+                    App.Log("  [glasssampler] 内置 BlurEffect 左半=" + Mean4(blurPx, sw, 0, 20, sw / 2, sh - 20)
+                            + " 顶行=" + Mean4(blurPx, sw, 0, 0, sw, 8));
+                }
+                catch (Exception ex2) { App.Log("  [glasssampler] 内置效果异常: " + ex2.Message); }
+                App.Log("  [glasssampler] 区域均值 B,G,R,A   左半 着色=" + Mean4(outPx, sw, 0, 20, sw / 2, sh - 20)
+                        + " 原图=" + Mean4(rawPx, sw, 0, 20, sw / 2, sh - 20));
+                App.Log("  [glasssampler]                  右半 着色=" + Mean4(outPx, sw, sw / 2, 20, sw / 2, sh - 20)
+                        + " 原图=" + Mean4(rawPx, sw, sw / 2, 20, sw / 2, sh - 20));
+                App.Log("  [glasssampler]                  顶行 着色=" + Mean4(outPx, sw, 0, 0, sw, 8)
+                        + " 原图=" + Mean4(rawPx, sw, 0, 0, sw, 8));
+                App.Log("  [glasssampler] 环境变量 YUKI_GLASS_SHADER_DEBUG="
+                        + (Environment.GetEnvironmentVariable("YUKI_GLASS_SHADER_DEBUG") ?? "(未设=0)"));
+            }
+            catch (Exception ex) { App.Log("  [glasssampler] 自检异常: " + ex); }
+            App.Log("=== 着色器采样自检 结束 ===");
+        }
+
+        private static string Mean4(byte[] px, int stride, int x0, int y0, int w, int h)
+        {
+            double b = 0, g = 0, r = 0, a = 0; long n = 0;
+            for (int y = y0; y < y0 + h; y++)
+                for (int x = x0; x < x0 + w; x++)
+                {
+                    int i = (y * stride + x) * 4;
+                    b += px[i]; g += px[i + 1]; r += px[i + 2]; a += px[i + 3]; n++;
+                }
+            if (n == 0) return "n/a";
+            return string.Format("[{0:F0},{1:F0},{2:F0},{3:F0}]", b / n, g / n, r / n, a / n);
+        }
+
+        private static void SavePng(System.Windows.Media.Imaging.BitmapSource bmp, string path)
+        {
+            try
+            {
+                var enc = new System.Windows.Media.Imaging.PngBitmapEncoder();
+                enc.Frames.Add(System.Windows.Media.Imaging.BitmapFrame.Create(bmp));
+                using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
+                enc.Save(fs);
+            }
+            catch { }
+        }
+
         protected override void OnStartup(StartupEventArgs e)
         {
             base.OnStartup(e);
@@ -75,6 +257,22 @@ namespace DesktopBar
             {
                 ShutdownMode = ShutdownMode.OnExplicitShutdown;
                 Services.TemperatureSlave.Run(() => Dispatcher.BeginInvoke(new Action(Shutdown)));
+                return;
+            }
+            // 无界面自检:只跑液态玻璃着色器编译,2 秒内给出编译错误原文,不开任何窗口。
+            // 用法: YukiDesk.exe --glasstest
+            if (e.Args != null && Array.IndexOf(e.Args, "--glasstest") >= 0)
+            {
+                RunGlassTest();
+                Shutdown();
+                return;
+            }
+            // 无界面自检:离屏渲染一张合成位图 + 液态玻璃着色器,判定 WPF 采样输入是否正确。
+            // 用法: YukiDesk.exe --glasssampler [输出目录]
+            if (e.Args != null && Array.IndexOf(e.Args, "--glasssampler") >= 0)
+            {
+                RunGlassSamplerTest(e.Args);
+                Shutdown();
                 return;
             }
             _mutex = new Mutex(true, "YukiDesk_SingleInstance_Mutex", out bool created);
@@ -106,6 +304,8 @@ namespace DesktopBar
             Log("YukiDesk 主题服务已启动");
             Services.MicaService.Start();
             Log("YukiDesk 云母服务已启动");
+            Services.GlassService.Start();
+            Log("YukiDesk 玻璃服务已启动");
 
             // 自检:主窗口+托盘就绪之后再把设置窗口真的建出来并展示 6 秒,然后关掉。
             // "打开设置就崩"这类回归只能这么复现——所有卡片要在 Loaded 之后
@@ -150,6 +350,21 @@ namespace DesktopBar
             Log("YukiDesk 托盘已创建");
             // GitHub 更新检查(设置-关于里可开关):首次延迟触发,避免拖慢启动。
             UpdateService.StartAutoCheck();
+            // 玻璃可视化取证:用法 YukiDesk.exe --glassshot <输出目录>
+            // 自家窗口全部 WDA_EXCLUDEFROMCAPTURE,外部截图根本拍不到顶栏,只能进程内自证。
+            // 取证完成后进程自行退出(ShutdownMode 会切成 OnExplicitShutdown)。
+            if (Array.IndexOf(e.Args ?? Array.Empty<string>(), "--glassshot") >= 0)
+            {
+                Log("[glassshot] 进入可视化取证模式");
+                Services.GlassDiagnostics.Start(e.Args);
+            }
+            // 玻璃性能自检:用法 YukiDesk.exe --glassperf [秒数]
+            // 正常跑顶栏(不改壁纸、不抓图、不暂停捕获),按区间统计 CPU 占用/捕获帧/BitBlt 耗时,结束后自行退出。
+            if (Array.IndexOf(e.Args ?? Array.Empty<string>(), "--glassperf") >= 0)
+            {
+                Log("[glassperf] 进入性能自检模式");
+                Services.GlassDiagnostics.StartPerf(e.Args);
+            }
             // 登录温度任务存在但从属不在运行(例如本会话手动重启过应用)时主动拉起一次;
             // 只在任务路径与当前 exe 一致时执行,查询较重,放后台线程。
             // --settings 自检时跳过:设置窗口自己的 _tempStatusTimer 也在周期跑同一个
@@ -230,6 +445,8 @@ namespace DesktopBar
             try { Services.UpdateService.StopAutoCheck(); } catch { }
             try { Services.ThemeService.Stop(); } catch { }
             try { Services.MicaService.Stop(); } catch { }
+            // 玻璃捕获线程引用主窗几何与位图,必须在主窗 Close 之前停(下一位就是 Restore/Close)。
+            try { Services.GlassService.Stop(); } catch { }
             try { DesktopSpaceService.Restore(); } catch { }
             try { if (_tray != null) { _tray.Visible = false; _tray.Dispose(); } } catch { }
             try { _trayIcon?.Dispose(); } catch { }

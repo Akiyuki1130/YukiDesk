@@ -108,6 +108,7 @@ namespace DesktopBar.Services
 
         private void RunLoop(CancellationTokenSource runCancellation)
         {
+            GlassDiagnostics.TagThread("Perf采样");
             var token = runCancellation.Token;
             try
             {
