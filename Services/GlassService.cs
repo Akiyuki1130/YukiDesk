@@ -737,8 +737,9 @@ namespace DesktopBar.Services
                     // 0 = 不限制(与顶栏同一套语义):按 DWM 合成节拍抓,端到端只延迟一帧
                     int fps = s == null ? 30 : Math.Max(0, Math.Min(300, s.GlassMaxFps));
                     int budget = fps <= 0 ? 0 : 1000 / Math.Max(1, fps);
-                    if (_panelStaticRun > 40) budget = Math.Max(budget, 250);
-                    else if (_panelStaticRun > 12) budget = Math.Max(budget, 100);
+                    // 面板玻璃同理:静止退避只影响"背后开始动时多久跟上",退太深同样是抽一下卡顿。
+                    if (_panelStaticRun > 40) budget = Math.Max(budget, 120);
+                    else if (_panelStaticRun > 12) budget = Math.Max(budget, 60);
                     int spent = (int)((System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1000L / System.Diagnostics.Stopwatch.Frequency);
                     if (budget <= 0)
                     {
@@ -1113,6 +1114,7 @@ namespace DesktopBar.Services
             if (!_enabled || _stopped) return;
             if (_testSrc) return;   // 合成图案模式:不让捕获帧覆盖图案
             Interlocked.Increment(ref StatPumps);
+            bool wroteFrame = false;
             // 取证按 tick 计数:静止桌面可能只有 1 帧发布,按发布数会永远等不到转储。
             if (_dumpFrames >= 0 && _dumpFrames < 40 && ++_dumpFrames == 40)
             {
@@ -1150,15 +1152,21 @@ namespace DesktopBar.Services
                         Interlocked.Increment(ref StatSharpWrites);
                     }
                     _consumed = f;
+                    wroteFrame = true;
                 }
-                long ct = Interlocked.Read(ref _pubCaptureTick);
+                // 延迟样本只在"真的写了新帧"之后结算,并且丢弃 >500ms 的陈旧样本
+                // (静止很久后的第一帧会把整段静止时间也计入,那不是延迟)。
+                long ct = wroteFrame ? Interlocked.Read(ref _pubCaptureTick) : 0;
                 if (ct != 0)
                 {
                     double ms = (System.Diagnostics.Stopwatch.GetTimestamp() - ct) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-                    _latLastMs = ms;
-                    _latSumMs += ms;
-                    if (ms > _latMaxMs) _latMaxMs = ms;
-                    _latCount++;
+                    if (ms <= 500.0)
+                    {
+                        _latLastMs = ms;
+                        _latSumMs += ms;
+                        if (ms > _latMaxMs) _latMaxMs = ms;
+                        _latCount++;
+                    }
                 }
             }
             catch { }
@@ -1379,6 +1387,10 @@ namespace DesktopBar.Services
                             // 脏矩形不碰顶栏条带:这一帧与玻璃无关,连读回都省。
                             _dxgi.ReleaseFrame();
                             Interlocked.Increment(ref StatDxgiSkip);
+                            // 本机 DWM 是持续 300Hz 合成的,不睡觉就会每秒空转 300 次(实测常驻 3%+);
+                            // 退避到 33ms 后静止开销≈0,而"背后开始动"最多 33ms 就被发现。
+                            long idleSkip = Environment.TickCount64 - _lastPubTick;
+                            if (idleSkip > 400) Thread.Sleep(idleSkip > 1200 ? 33 : 8);
                             continue;
                         }
                         Interlocked.Increment(ref StatFrames);
@@ -1474,12 +1486,15 @@ namespace DesktopBar.Services
                     if (_dxgi != null)
                     {
                         // GPU 捕获自带节拍(AcquireNextFrame 卡在合成上),但本机 DWM 是持续 300Hz 合成的,
-                        // 长时间没有东西要显示时每帧唤醒(脏矩形查询+同步)也要约 15% 单核。
-                        // 所以"无事发生"时照样退避:休眠期间屏幕变化最多晚 30~120ms 才被发现(与旧 GDI 档位一致)。
+                        // 长时间没有东西要显示时每帧唤醒(脏矩形查询+同步)也要约 15% 单核,所以"无事发生"时要退避。
+                        // 但退避档位不能太深:静止时一次迭代只做「取帧+脏矩形判断」、不拷贝不模糊,
+                        // 代价不到 0.1ms,而采样间隔就是「玻璃多久看一眼背后」= 变化被发现前的最大延迟。
+                        // 实测 250ms 档(4fps)在"静止一会儿→内容突然开始动"时会被看成抽一下卡顿,
+                        // 所以深静止档收到 33ms(30fps)、中间档 8ms(120fps):静态开销几乎不变,起步延迟降 7 倍。
                         long idleMsD = Environment.TickCount64 - _lastPubTick;
                         if (idleMsD > 400)
                         {
-                            Thread.Sleep(idleMsD > 1200 ? 250 : 30);
+                            Thread.Sleep(idleMsD > 1200 ? 33 : 8);
                             continue;
                         }
                         long spentTicks = System.Diagnostics.Stopwatch.GetTimestamp() - busyStart;
@@ -1495,13 +1510,14 @@ namespace DesktopBar.Services
                         // 紧接着抓屏(约 5ms)→ 发布 → UI 线程写位图,仍赶得上这一轮渲染提交,
                         // 所以端到端只延迟一帧(以前固定 Sleep 会和合成节拍错相,经常晚一帧)。
                         // 背后完全静止时仍降频:60Hz 常驻 BitBlt 会白烧约 15% 单核。
-                        if (idleMs > 1200) Thread.Sleep(60);
-                        else if (idleMs > 400) Thread.Sleep(30);
+                        if (idleMs > 1200) Thread.Sleep(33);
+                        else if (idleMs > 400) Thread.Sleep(8);
                         else if (!NativeMethods.WaitComposition()) Thread.Sleep(16);
                         continue;
                     }
-                    if (idleMs > 1200) delay = 250;
-                    else if (idleMs > 400) delay = 120;
+                    // 固定帧率档:静止也不用退到 250ms——那等于"静止 1 秒后任何变化都要 0.25 秒才反映"。
+                    if (idleMs > 1200) delay = Math.Max(delay, 33);
+                    else if (idleMs > 400) delay = Math.Max(delay, 8);
                     Thread.Sleep(delay);
                 }
             }
