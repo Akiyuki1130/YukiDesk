@@ -38,6 +38,18 @@ namespace DesktopBar.UI
         protected bool Open;
         private static ModuleBase _active;
 
+        // ---- 展开页实时玻璃 ----
+        // 展开页窗口的内容是「玻璃层 + 面板」两层:玻璃层是挂着 LiquidGlassEffect 的 Rectangle,
+        // 与顶栏胶囊共用同一份 HLSL / 同一组设置项(模糊+折射+色散+rim+斜面明暗),质感必然一致。
+        // 抓图线程在展开页显示期间按「当前屏幕上看到的那块矩形」持续采样(缩放/位移动画期间也跟着变),
+        // 所以玻璃内容始终钉在桌面上,不会像贴纸一样被拉长。
+        private readonly Rectangle _panelGlass;
+        private readonly Grid _panelSurface;
+        private double _panelLeft, _panelTop, _panelWidth, _panelHeight;   // 未变换时的完整矩形(DIP)
+        private bool _panelTracking;
+        private double _trackMinScale = 1.0, _trackMaxScale = 1.0;   // 跟踪期观测到的缩放范围(诊断用)
+        private int _trackPushes;                                   // 跟踪期向采样线程推了几次矩形
+
         protected ModuleBase(TabStyle style)
         {
             _style = style ?? new TabStyle();
@@ -61,6 +73,21 @@ namespace DesktopBar.UI
                 CornerRadius = new CornerRadius(16 * scale),
                 Padding = new Thickness(12 * scale)
             };
+            // 玻璃层垫在面板底下,铺满整个展开页。命中测试交给面板(Rectangle 不吃鼠标),
+            // 形状(圆角/边缘柔化)由着色器按距离场输出 alpha,窗口的 SetWindowRgn 只是额外一层裁剪。
+            _panelGlass = new Rectangle
+            {
+                Fill = Brushes.Black,
+                IsHitTestVisible = false,
+                RadiusX = 16 * scale,
+                RadiusY = 16 * scale
+            };
+            _panelSurface = new Grid();
+            _panelSurface.Children.Add(_panelGlass);
+            _panelSurface.Children.Add(Panel);
+            // 展开页内容异步加载完成(文件夹列表/回收站条目)时窗口会被 SizeToContent 撑大,
+            // 这里必须重推采样矩形,否则玻璃还在按打开瞬间那块小区域采样,和面板错位。
+            _panelSurface.SizeChanged += (s2, e2) => RefreshLivePanelRect();
             CreatePanelWindow();
 
             _closeTimer = new DispatcherTimer();
@@ -91,6 +118,13 @@ namespace DesktopBar.UI
         internal string DiagnosticName => GetType().Name;
         internal Window DiagnosticPanelWindow => PanelWindow;
         internal Border DiagnosticPanel => Panel;
+        internal Rectangle DiagnosticPanelGlass => _panelGlass;
+        internal bool DiagnosticPanelAnimated => _panelSurface.HasAnimatedProperties;
+        internal string DiagnosticPanelTransform => string.Format(
+            "ScaleX={0:F3} ScaleY={1:F3} TY={2:F2} W={3:F1} H={4:F1} 跟踪={5} 推送={6} 缩放范围={7:F2}~{8:F2}",
+            _panelScale == null ? -1 : _panelScale.ScaleX, _panelScale == null ? -1 : _panelScale.ScaleY,
+            _panelTransform == null ? 0 : _panelTransform.Y,
+            _panelSurface.ActualWidth, _panelSurface.ActualHeight, _panelTracking, _trackPushes, _trackMinScale, _trackMaxScale);
         /// <summary>展开页水平居中于选项卡(默认左对齐选项卡左缘)。</summary>
         protected virtual bool CenterPanelOnPill => false;
         protected virtual void OnPanelShown() { }
@@ -109,7 +143,7 @@ namespace DesktopBar.UI
                 ShowActivated = false,
                 Focusable = false,
                 Topmost = true,
-                Content = Panel,
+                Content = _panelSurface,
                 Visibility = Visibility.Hidden
             };
             w.SourceInitialized += (s, e) =>
@@ -123,6 +157,7 @@ namespace DesktopBar.UI
             w.MouseEnter += (s, e) => _closeTimer.Stop();
             w.MouseLeave += (s, e) => { if (Open) StartCloseTimer(); };
             w.SizeChanged += (s, e) => ApplyRoundRegion(w);
+            w.LocationChanged += (s, e) => RefreshLivePanelRect();
             w.ContentRendered += (s, e) => ApplyRoundRegion(w);
             Panel.MouseEnter += (s, e) => _closeTimer.Stop();
             Panel.MouseLeave += (s, e) => { if (Open) StartCloseTimer(); };
@@ -186,10 +221,13 @@ namespace DesktopBar.UI
             // 材质档(云母/亚克力)例外:展开页会伸到顶栏条带之外,没有壁纸可取样,
             // 只能用材质平均色平涂(真实 Mica/Acrylic 弹层因为模糊极重,看起来也接近平涂,
             // 观感损失很小)。玻璃档同理:展开页是独立窗口,底下没有玻璃层,退主题色。
-            Panel.Background = Pill.Background is ImageBrush
-                ? new SolidColorBrush(MicaService.Average) { Opacity = MicaService.BackdropOpacity }
-                : (s != null && (s.PillMaterial == 3 || s.PillMaterial == 4)
-                    ? Ui.Brush(ThemeService.Background, s.ThemeOpacity)
+            // 玻璃/液态玻璃档:展开页的玻璃由底下的玻璃层(带着色器的 Rectangle)画,
+            // 面板自身必须完全透明,否则会把玻璃层整个盖住(以前面板只有一块背景贴图,
+            // 所以这里退主题色;现在改实时玻璃层,面板只负责承载文字/控件)。
+            Panel.Background = s != null && (s.PillMaterial == 3 || s.PillMaterial == 4)
+                ? Brushes.Transparent
+                : (Pill.Background is ImageBrush
+                    ? new SolidColorBrush(MicaService.Average) { Opacity = MicaService.BackdropOpacity }
                     : Pill.Background);
             Panel.BorderBrush = Pill.BorderBrush;
             Panel.BorderThickness = Pill.BorderThickness;
@@ -307,7 +345,7 @@ namespace DesktopBar.UI
             _closing = false;
             _animationVersion++;
             _closeTimer.Stop();
-            Panel.BeginAnimation(OpacityProperty, null);
+            _panelSurface.BeginAnimation(OpacityProperty, null);
             _panelTransform?.BeginAnimation(TranslateTransform.YProperty, null);
             _panelScale?.BeginAnimation(ScaleTransform.ScaleXProperty, null);
             _panelScale?.BeginAnimation(ScaleTransform.ScaleYProperty, null);
@@ -337,16 +375,22 @@ namespace DesktopBar.UI
             PanelWindow.Left = left;
             PanelWindow.Top = targetTop;
             Panel.Visibility = Visibility.Visible;
-            // 玻璃/液态玻璃材质:展开页同样毛玻璃。关键顺序——必须"先出模糊、再显形":
-            // 在窗口可见之前就把面板背后区域抓下来糊好并设为背景,再 Show。
-            // 以前是 Show 之后异步抓图回填,面板会先以主题色出现、几十毫秒后才换成模糊贴图,
-            // 肉眼就是"打开时闪一下才变模糊"。此刻面板不可见,抓图也不会拍到面板自己。
-            // (同步抓图约数毫秒,一次性成本,换来全程模糊)
+            _panelLeft = left;
+            _panelTop = targetTop;
+            _panelWidth = width;
+            _panelHeight = height;
+            // 玻璃/液态玻璃材质:展开页里垫一层实时玻璃。关键顺序——必须"先出玻璃、再显形":
+            // 此时窗口还完全不可见,抓图不会拍到面板自己,而且显形前第一帧玻璃就已经在位,
+            // 不会出现"打开时先露出主题色、几十毫秒后才变玻璃"的闪一下。
+            // 抓图/模糊/着色器都在同一套管线里和顶栏胶囊共用,材质不可能再不一致。
             if (App.Settings != null && (App.Settings.PillMaterial == 3 || App.Settings.PillMaterial == 4))
             {
-                GlassService.RefreshPanelGlass(Panel, left, targetTop, width, height);
-                if (!(Panel.Background is ImageBrush))
-                    App.Log("面板玻璃:预捕获未生效,面板以主题色打开 " + GetType().Name);
+                GlassService.StartLivePanel(Panel, _panelGlass, left, targetTop, width, height);
+                StartPanelTracking();
+            }
+            else
+            {
+                GlassService.StopLivePanel(Panel);
             }
             PanelWindow.Visibility = Visibility.Visible;
 
@@ -355,17 +399,120 @@ namespace DesktopBar.UI
             _panelTransforms = new TransformGroup();
             _panelTransforms.Children.Add(_panelScale);
             _panelTransforms.Children.Add(_panelTransform);
-            Panel.RenderTransform = _panelTransforms;
+            // 变换挂在容器(_panelSurface)而不是面板本身:玻璃层与面板一起缩放位移,
+            // 玻璃纹理由抓图线程按"变换后的可见矩形"重采,所以缩放期间看到的仍是真实桌面内容。
+            _panelSurface.RenderTransform = _panelTransforms;
             // Scale from the capsule edge so the panel feels like the tab unfolding in place.
             double originX = Math.Max(0.12, Math.Min(0.88, ((p.X + Pill.ActualWidth * 0.5) - left) / width));
-            Panel.RenderTransformOrigin = new Point(originX, above ? 1 : 0);
-            Panel.Opacity = 0;
+            _panelSurface.RenderTransformOrigin = new Point(originX, above ? 1 : 0);
+            _panelSurface.Opacity = 0;
             var duration = TimeSpan.FromMilliseconds(Math.Max(120, App.Settings?.AnimationDurationMs ?? 180));
             var ease = new BackEase { EasingMode = EasingMode.EaseOut, Amplitude = 0.12 };
             _panelTransform.BeginAnimation(TranslateTransform.YProperty, new DoubleAnimation(0, duration) { EasingFunction = ease });
             _panelScale.BeginAnimation(ScaleTransform.ScaleXProperty, new DoubleAnimation(1, duration) { EasingFunction = ease });
             _panelScale.BeginAnimation(ScaleTransform.ScaleYProperty, new DoubleAnimation(1, duration) { EasingFunction = ease });
-            Panel.BeginAnimation(OpacityProperty, new DoubleAnimation(1, duration) { EasingFunction = ease });
+            var fade = new DoubleAnimation(1, duration) { EasingFunction = ease };
+            int openVersion = _animationVersion;
+            fade.Completed += (s, e) =>
+            {
+                if (openVersion != _animationVersion || !Open) return;
+                ClearPanelAnimations();
+            };
+            _panelSurface.BeginAnimation(OpacityProperty, fade);
+        }
+
+        /// <summary>
+        /// 动画结束后把时钟摘掉:已完成的动画(默认 HoldEnd)仍留在属性上,WPF 每帧都会去问一次
+        /// 动画时钟的值,展开页一直开着就等于让整窗持续重呈(实测常驻多耗 4% 单核)。
+        /// 摘时钟前必须先把基值写成动画的终值,否则一摘就跳回起始的 0.52 缩放。
+        /// </summary>
+        private void ClearPanelAnimations()
+        {
+            if (_panelScale != null)
+            {
+                _panelScale.BeginAnimation(ScaleTransform.ScaleXProperty, null);
+                _panelScale.BeginAnimation(ScaleTransform.ScaleYProperty, null);
+                _panelScale.ScaleX = 1;
+                _panelScale.ScaleY = 1;
+            }
+            if (_panelTransform != null)
+            {
+                _panelTransform.BeginAnimation(TranslateTransform.YProperty, null);
+                _panelTransform.Y = 0;
+            }
+            _panelSurface.BeginAnimation(OpacityProperty, null);
+            _panelSurface.Opacity = 1;
+        }
+
+        private void StartPanelTracking()
+        {
+            if (_panelTracking) return;
+            _panelTracking = true;
+            _trackMinScale = 1.0;
+            _trackMaxScale = 1.0;
+            _trackPushes = 0;
+            CompositionTarget.Rendering += OnPanelRendering;
+        }
+
+        private void StopPanelTracking()
+        {
+            if (!_panelTracking) return;
+            _panelTracking = false;
+            CompositionTarget.Rendering -= OnPanelRendering;
+            // 一次性诊断:动画期间到底有没有"每帧按当前窗格大小"重采(缩放范围说明动画中采到了中间尺寸)。
+            if (Environment.GetEnvironmentVariable("YUKI_PANEL_TRACK_LOG") == "1")
+                App.Log(string.Format("面板动画跟踪:{0} 推送={1} 缩放范围={2:F2}~{3:F2}",
+                    GetType().Name, _trackPushes, _trackMinScale, _trackMaxScale));
+        }
+
+        /// <summary>
+        /// 打开/收起动画期间每帧把「肉眼当前看到的那块矩形」报给玻璃采样线程。
+        /// 动画是 RenderTransform 缩放+位移,不是布局变化,窗口矩形与 ActualWidth 都不变,
+        /// 所以只能从变换反算可见包围盒:p' = O + (p-O)*S + T(O 为相对原点的局部坐标)。
+        /// 不做这件事的话,动画里玻璃内容会像贴纸一样被拉伸/压缩,而且采样区域和真实可见区域错位。
+        /// </summary>
+        private void OnPanelRendering(object sender, EventArgs e)
+        {
+            if (_disposed || !_panelTracking) { StopPanelTracking(); return; }
+            if (!Open && !_closing) { StopPanelTracking(); return; }
+            RefreshLivePanelRect();
+            // 动画收尾(缩放回到 1、位移归零)后就不再逐帧跟了:之后只有尺寸/位置变化才重采,
+            // 由 _panelSurface.SizeChanged / 窗口 LocationChanged 触发,静止时零唤醒。
+            if (Open && _panelScale != null && _panelTransform != null
+                && Math.Abs(_panelScale.ScaleX - 1) < 0.002 && Math.Abs(_panelScale.ScaleY - 1) < 0.002
+                && Math.Abs(_panelTransform.Y) < 0.5)
+                StopPanelTracking();
+        }
+
+        /// <summary>
+        /// 把「当前可见矩形」推给玻璃采样线程。宽高取 ActualWidth/ActualHeight 而不是 ShowPanel 时量到的
+        /// DesiredSize:展开页内容有异步加载(文件夹列表、回收站条目),打开瞬间量到的尺寸可能只有内边距,
+        /// 之后 SizeToContent 会把窗口撑大,不重推就会一直拿错区域的背景。
+        /// </summary>
+        private void RefreshLivePanelRect()
+        {
+            if (_disposed || (!Open && !_closing)) return;
+            double fullW = _panelSurface.ActualWidth > 1 ? _panelSurface.ActualWidth : _panelWidth;
+            double fullH = _panelSurface.ActualHeight > 1 ? _panelSurface.ActualHeight : _panelHeight;
+            if (fullW < 2 || fullH < 2) return;
+            double fullLeft = double.IsNaN(PanelWindow.Left) ? _panelLeft : PanelWindow.Left;
+            double fullTop = double.IsNaN(PanelWindow.Top) ? _panelTop : PanelWindow.Top;
+            _panelLeft = fullLeft;
+            _panelTop = fullTop;
+            _panelWidth = fullW;
+            _panelHeight = fullH;
+            double sx = _panelScale == null ? 1.0 : _panelScale.ScaleX;
+            double sy = _panelScale == null ? 1.0 : _panelScale.ScaleY;
+            double ty = _panelTransform == null ? 0.0 : _panelTransform.Y;
+            if (!(sx > 0.01) || !(sy > 0.01)) return;
+            double sMin = Math.Min(sx, sy);
+            if (sMin < _trackMinScale) _trackMinScale = sMin;
+            if (sMin > _trackMaxScale) _trackMaxScale = sMin;
+            _trackPushes++;
+            double ox = _panelSurface.RenderTransformOrigin.X * fullW;
+            double oy = _panelSurface.RenderTransformOrigin.Y * fullH;
+            GlassService.UpdateLivePanelRect(Panel, fullLeft + ox * (1 - sx), fullTop + oy * (1 - sy) + ty,
+                fullW * sx, fullH * sy, Math.Min(sx, sy));
         }
 
         public void HidePanel() => HidePanelAnimated();
@@ -383,13 +530,15 @@ namespace DesktopBar.UI
             _panelScale.BeginAnimation(ScaleTransform.ScaleXProperty, new DoubleAnimation(0.58, duration) { EasingFunction = ease });
             _panelScale.BeginAnimation(ScaleTransform.ScaleYProperty, new DoubleAnimation(0.72, duration) { EasingFunction = ease });
             int animationVersion = ++_animationVersion;
+            // 收起动画期间继续跟踪可见矩形,玻璃随缩小过程重采(最后 HidePanelImmediate 停掉)
+            StartPanelTracking();
             var fade = new DoubleAnimation(0, duration) { EasingFunction = ease };
             fade.Completed += (s, e) =>
             {
                 if (animationVersion == _animationVersion && _closing)
                     HidePanelImmediate();
             };
-            Panel.BeginAnimation(OpacityProperty, fade);
+            _panelSurface.BeginAnimation(OpacityProperty, fade);
         }
 
         /// <summary>宿主隐藏、模块禁用或退出时立即收起独立展开窗口。</summary>
@@ -410,14 +559,17 @@ namespace DesktopBar.UI
                 try { _openMenu.IsOpen = false; } catch { }
                 _openMenu = null;
             }
-            Panel.BeginAnimation(OpacityProperty, null);
+            _panelSurface.BeginAnimation(OpacityProperty, null);
             if (_panelTransform != null) _panelTransform.BeginAnimation(TranslateTransform.YProperty, null);
             if (_panelScale != null)
             {
                 _panelScale.BeginAnimation(ScaleTransform.ScaleXProperty, null);
                 _panelScale.BeginAnimation(ScaleTransform.ScaleYProperty, null);
             }
-            Panel.RenderTransform = null;
+            _panelSurface.RenderTransform = null;
+            _panelSurface.Opacity = 1;
+            StopPanelTracking();
+            GlassService.StopLivePanel(Panel);
             PanelWindow.Visibility = Visibility.Hidden;
             Panel.Visibility = Visibility.Collapsed;
             if (ReferenceEquals(_active, this)) _active = null;

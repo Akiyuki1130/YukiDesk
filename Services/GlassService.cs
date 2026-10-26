@@ -7,6 +7,7 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using System.Windows.Shapes;
 using System.Windows.Threading;
 using DesktopBar.Interop;
 using DesktopBar.UI;
@@ -58,23 +59,8 @@ namespace DesktopBar.Services
             return fallback;
         }
 
-        private static double ReadBakeGain()
-        {
-            double v;
-            if (double.TryParse(Environment.GetEnvironmentVariable("YUKI_PANEL_BAKE_GAIN"), out v) && v > 0) return v;
-            return 1.0;   // 与胶囊完全同参数(带宽/位移/rim/色散),面板和胶囊才是同一种材质
-        }
-
-        private static bool _panelGlassLogged;
-        // 诊断:A/B 面板液态烘焙。YUKI_PANEL_NOBAKE=1 关掉烘焙(只剩模糊),YUKI_PANEL_BAKE_GAIN 缩放强度。
-        private static readonly bool _panelNoBake = Environment.GetEnvironmentVariable("YUKI_PANEL_NOBAKE") == "1";
-        private static readonly double _panelBakeGain = ReadBakeGain();
-        // 折射带宽度:与胶囊的 HLSL 完全一致(6 半分辨率像素),材质才是同一种;
-        // 面板面积大,带太宽会变成一圈"光雾",太窄又没有玻璃厚度。
-        private static readonly double _panelBand = ReadEnvDouble("YUKI_PANEL_BAND", 6.0);
-        // 斜面明暗(方向光高光/背光压暗):胶囊与面板共用一个强度,保证是同一种材质。
+        // 斜面明暗(方向光高光/背光压暗):胶囊与展开页共用一个强度,保证是同一种材质。
         private static readonly double LiquidSheen = ReadEnvDouble("YUKI_LIQUID_SHEEN", 1.0);
-        private static readonly double _panelSheen = ReadEnvDouble("YUKI_PANEL_SHEEN", LiquidSheen);
         private static volatile GlassSpec _spec;
 
         private static bool _started, _stopped, _enabled, _active = true, _stopThread;
@@ -91,6 +77,7 @@ namespace DesktopBar.Services
         internal static long StatPumps;         // UI 泵 tick 次数(30fps 定时器)
         internal static long StatWrites;        // 实际 WritePixels 到模糊位图的次数
         internal static long StatSharpWrites;   // 实际 WritePixels 到未模糊位图的次数(仅液态玻璃)
+        internal static long StatPanelFrames;   // 展开页实时玻璃真正发布的帧数(静态时为 0)
         // 分阶段耗时(Stopwatch 刻度):定位"4~5ms 一帧到底花在哪"
         internal static long StatBlitTicks, StatDownTicks, StatDiffTicks, StatBlurTicks;
         internal static bool HasFrame { get { return _latest != null; } }
@@ -173,7 +160,7 @@ namespace DesktopBar.Services
             var spec = _spec;
             double busyMs = StatBusyTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
             return string.Format(
-                "材质={0} 启用={1} 采样规格={2}x{3}(半分辨率 {4}x{5}) 捕获帧={6} 发布={7} BitBlt={8} 累计忙={9:F1}ms 液态着色器={10} 帧率上限={11} 泵tick={12} 写帧={13} 写锐帧={14}",
+                "材质={0} 启用={1} 采样规格={2}x{3}(半分辨率 {4}x{5}) 捕获帧={6} 发布={7} BitBlt={8} 累计忙={9:F1}ms 液态着色器={10} 帧率上限={11} 泵tick={12} 写帧={13} 写锐帧={14} 面板帧={15}",
                 s == null ? -1 : s.PillMaterial, _enabled,
                 spec == null ? 0 : spec.Width, spec == null ? 0 : spec.Height,
                 _latestW, _latestH,
@@ -181,7 +168,8 @@ namespace DesktopBar.Services
                 Interlocked.Read(ref StatBlits), busyMs,
                 _liquid == null ? "无(降级普通玻璃)" : "已启用",
                 spec == null ? 0 : Math.Round(1000.0 / Math.Max(1, spec.FpsMs)),
-                Interlocked.Read(ref StatPumps), Interlocked.Read(ref StatWrites), Interlocked.Read(ref StatSharpWrites));
+                Interlocked.Read(ref StatPumps), Interlocked.Read(ref StatWrites), Interlocked.Read(ref StatSharpWrites),
+                  Interlocked.Read(ref StatPanelFrames));
         }
 
         /// <summary>取证:把当前发布的玻璃输入帧(半分辨率模糊结果)另存为 PNG。</summary>
@@ -267,6 +255,33 @@ namespace DesktopBar.Services
             if (liquid) UpdateLiquidConstants();
             // 间隙玻璃强度变了要重算裁剪/遮罩(它由主窗的 LayoutUpdated 派生,这里主动踢一次)
             try { MainWindow.Bar?.RefreshGlassClip(); } catch { }
+            // 展开页正开着时滑杆要立刻生效:丢掉差分门控的上一帧,让捕获线程马上重出一帧。
+            // 材质切离玻璃档(3/4)则直接停掉实时采样,由 ModuleBase.ApplyTheme 恢复主题色背景。
+            if (_panelLive)
+            {
+                if (s.PillMaterial == 3 || s.PillMaterial == 4)
+                {
+                    _panelPrevSharp = null;
+                    try { _panelWake?.Set(); } catch { }
+                }
+                else
+                {
+                    _panelLive = false;
+                    _panelPrevSharp = null;
+                    // 材质切离玻璃档:玻璃层必须自己清空(它是黑色填充+着色器),
+                    // 否则展开页会被这块黑底盖住,看不到 ApplyTheme 恢复的主题色。
+                    try
+                    {
+                        if (_panelSurface != null)
+                        {
+                            _panelSurface.Effect = null;
+                            _panelSurface.Fill = Brushes.Transparent;
+                        }
+                    }
+                    catch { }
+                    try { _panelWake?.Set(); } catch { }
+                }
+            }
         }
 
         /// <summary>把胶囊矩形(DIP)换算成半分辨率捕获图像素坐标;几何变化时重编译着色器(几何烘焙进字面量)。</summary>
@@ -460,49 +475,193 @@ namespace DesktopBar.Services
             return (byte)(a < 0 ? 0 : (a > 255 ? 255 : a));
         }
 
-        // ---------- 展开页玻璃(一次性捕获) ----------
+        // ---------- 展开页玻璃(实时) ----------
+        //
+        // 与顶栏胶囊完全同一条材质管线:展开页的玻璃就是一个挂着 LiquidGlassEffect 的 Rectangle,
+        // 折射/色散/rim/斜面明暗全由同一份 HLSL、同一组设置项算 —— 以前是 CPU 端把着色器数学手抄一遍
+        // 烘焙进位图,两边参数一有出入,肉眼就是「面板和胶囊不是一个质感」。
+        // 实时:抓图线程在展开页显示期间按「当前屏幕上看到的那块矩形」持续采样(缩放/位移动画期间也跟),
+        // 所以玻璃内容始终钉在桌面上,不会跟着面板一起被拉伸(那样看起来像贴纸而不是窗玻璃)。
+        // 静态画面靠差分门控压成 0 帧发布(UI 侧不重呈、不烧 CPU)。
+
+        private static Border _panelTarget;                 // 当前挂实时玻璃的展开页
+        private static Rectangle _panelSurface;             // 玻璃层(带 Effect),铺满整个展开页
+        private static LiquidGlassEffect _panelEffect;
+        private static WriteableBitmap _panelBodyWb, _panelSharpWb;
+        private static ImageBrush _panelBodyBrush, _panelSharpBrush;
+        private static readonly ManualResetEventSlim _panelWake = new ManualResetEventSlim(false);
+        private static Thread _panelThread;
+        private static volatile bool _panelLive;
+        private static volatile bool _panelThreadStop;
+        private static volatile int[] _panelRect;            // 目标屏幕矩形(物理像素) x,y,w,h
+        private static double _panelScale = 1.0;             // 动画缩放系数(只影响圆角半径;模糊按真实屏幕强度算)
+        private static int[] _panelLastRect;
+        private static byte[] _panelPrevSharp;
+        private static byte[] _panelPendingBody, _panelPendingSharp;
+        private static int _panelPendingW, _panelPendingH, _panelPendingSeq, _panelConsumedSeq;
+        private static double _panelPendingRadius;
+        private static int _panelPumpQueued;
+        private static int _panelStaticRun;        // 连续没出帧的采样次数(用于静止降频)
+        private static bool _panelGlassDiag;
 
         /// <summary>
-        /// 面板打开「之前」调用(此时面板窗口还完全不可见):当场捕获面板背后区域 → 半分辨率盒式模糊 →
-        /// 烘焙染色 → 生成对齐面板物理矩形的 ImageBrush 并直接设为面板背景。
-        /// 必须在 Show 之前完成:否则面板会先以主题色出现、几十毫秒后才被换成模糊贴图,
-        /// 肉眼就是「打开时闪一下才变模糊」。此时面板未显示,抓图不会拍到自己;顶栏由 WDA 排除。
+        /// 展开页打开「之前」调用(此时窗口还完全不可见):立刻同步抓一帧并挂上玻璃层。
+        /// 关键顺序——必须「先出玻璃、再显形」:以前是 Show 之后异步抓图回填,面板会先以主题色出现、
+        /// 几十毫秒后才变成模糊贴图,肉眼就是「打开时闪一下才变模糊」。此刻面板不可见,抓图不会拍到面板自己。
         /// </summary>
-        internal static void RefreshPanelGlass(Border panel, double dipX, double dipY, double dipW, double dipH)
+        internal static void StartLivePanel(Border panel, Rectangle surface, double dipX, double dipY, double dipW, double dipH)
         {
-            if (_stopped) return;
-            try { CapturePanelNow(panel, dipX, dipY, dipW, dipH); }
-            catch { }
+            if (_stopped || panel == null || surface == null) return;
+            var s = App.Settings;
+            if (s == null || (s.PillMaterial != 3 && s.PillMaterial != 4))
+            {
+                StopLivePanel(panel);
+                return;
+            }
+            _panelTarget = panel;
+            _panelSurface = surface;
+            _panelScale = 1.0;
+            _panelPrevSharp = null;
+            _panelLastRect = null;
+            _panelRect = DipRectToPixels(panel, dipX, dipY, dipW, dipH);
+            _panelStaticRun = 0;
+            _panelLive = true;
+            if (_panelRect != null)
+            {
+                try { PublishPanelFrame(_panelRect[0], _panelRect[1], _panelRect[2], _panelRect[3], 1.0); }
+                catch { }
+                // 首帧就地泵一次:展开页显形之前玻璃就必须在位,不能等 BeginInvoke
+                PanelPumpTick();
+            }
+            if (_panelThread == null)
+            {
+                _panelThreadStop = false;
+                _panelThread = new Thread(PanelLoop) { IsBackground = true, Name = "YukiDesk.PanelGlass" };
+                _panelThread.Start();
+            }
+            _panelWake.Set();
         }
 
-        private static void CapturePanelNow(Border panel, double dipX, double dipY, double dipW, double dipH)
+        /// <summary>
+        /// 动画期间每帧由 UI 线程调用(CompositionTarget.Rendering):把「当前肉眼看到的那块」矩形告诉抓图线程。
+        /// 面板的打开/收起动画是 RenderTransform 缩放+位移,不是布局变化,窗口矩形与 ActualWidth 都不变,
+        /// 所以只能从变换矩阵反算当前可见包围盒。
+        /// </summary>
+        internal static void UpdateLivePanelRect(Border panel, double dipX, double dipY, double dipW, double dipH, double scale)
+        {
+            if (!_panelLive || !ReferenceEquals(_panelTarget, panel)) return;
+            if (dipW < 2 || dipH < 2) return;
+            var rect = DipRectToPixels(panel, dipX, dipY, dipW, dipH);
+            if (rect == null) return;
+            _panelRect = rect;
+            _panelScale = scale <= 0.05 ? 0.05 : (scale > 1.0 ? 1.0 : scale);
+            _panelWake.Set();
+        }
+
+        /// <summary>取证用:展开页实时玻璃当前状态(一行)。</summary>
+        internal static string DiagnosticPanelState()
+        {
+            var surf = _panelSurface;
+            var rect = _panelRect;
+            string fx = surf == null ? "无玻璃层" : (surf.Effect == null ? "无着色器" : surf.Effect.GetType().Name);
+            string fill = surf == null || surf.Fill == null ? "null" : surf.Fill.GetType().Name;
+            return string.Format("实时={0} 玻璃层Fill={1} Effect={2} 采样矩形={3}x{4} 缩放={5:F2} 位图={6}x{7}",
+                _panelLive ? "开" : "关", fill, fx,
+                rect == null ? 0 : rect[2], rect == null ? 0 : rect[3], _panelScale,
+                _panelBodyWb == null ? 0 : _panelBodyWb.PixelWidth, _panelBodyWb == null ? 0 : _panelBodyWb.PixelHeight);
+        }
+
+        /// <summary>展开页收起/模块销毁时调用:停采样(玻璃层留着最后一帧,窗口已隐藏,不会重呈)。</summary>
+        internal static void StopLivePanel(Border panel)
+        {
+            if (panel != null && !ReferenceEquals(_panelTarget, panel)) return;
+            _panelLive = false;
+            _panelRect = null;
+            _panelLastRect = null;
+            _panelPrevSharp = null;
+            _panelTarget = null;
+            _panelSurface = null;
+            try { _panelWake.Set(); } catch { }
+        }
+
+        private static int[] DipRectToPixels(Border panel, double dipX, double dipY, double dipW, double dipH)
+        {
+            try
+            {
+                var dpi = VisualTreeHelper.GetDpi(panel);
+                int px = (int)Math.Floor(dipX * dpi.DpiScaleX);
+                int py = (int)Math.Floor(dipY * dpi.DpiScaleY);
+                int pw = (int)Math.Ceiling(dipW * dpi.DpiScaleX);
+                int ph = (int)Math.Ceiling(dipH * dpi.DpiScaleY);
+                if (pw < 4 || ph < 4) return null;
+                return new[] { px, py, pw, ph };
+            }
+            catch { return null; }
+        }
+
+        private static void PanelLoop()
+        {
+            GlassDiagnostics.TagThread("面板捕获");
+            while (!_panelThreadStop)
+            {
+                try
+                {
+                    var rect = _panelRect;
+                    if (!_panelLive || _shotPause || rect == null)
+                    {
+                        // 没有展开页时彻底睡死,不占 CPU(只在 Start/动画帧/设置变更时被 Set 唤醒)
+                        _panelWake.Wait(750);
+                        _panelWake.Reset();
+                        continue;
+                    }
+                    long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                    bool published = PublishPanelFrame(rect[0], rect[1], rect[2], rect[3], _panelScale);
+                    // 静止降频:展开页背后没变化时每帧 BitBlt(固定约 2.4ms)纯属浪费。
+                    // 一帧没发布就退到 100ms,持续静止再退到 250ms;一旦有变化立刻回满帧率。
+                    if (published) _panelStaticRun = 0; else _panelStaticRun++;
+                    var s = App.Settings;
+                    int fps = s == null ? 30 : Math.Max(10, Math.Min(60, s.GlassMaxFps));
+                    int budget = 1000 / fps;
+                    if (_panelStaticRun > 40) budget = Math.Max(budget, 250);
+                    else if (_panelStaticRun > 12) budget = Math.Max(budget, 100);
+                    int spent = (int)((System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1000L / System.Diagnostics.Stopwatch.Frequency);
+                    int wait = budget - spent;
+                    if (wait > 1)
+                    {
+                        _panelWake.Wait(wait - 1);
+                        _panelWake.Reset();
+                    }
+                }
+                catch { try { Thread.Sleep(20); } catch { } }
+            }
+        }
+
+        /// <summary>
+        /// 抓「展开页当前屏幕矩形」→ 半分辨率 → 一份锐帧(折射用)+ 一份盒式模糊 → 染色 → 交给 UI 线程。
+        /// 静态画面(矩形与像素都没变)直接不发布:展开页窗口不重呈 = 静态零开销。
+        /// </summary>
+        private static bool PublishPanelFrame(int px, int py, int pw, int ph, double scale)
         {
             var s = App.Settings;
-            if (s == null || (s.PillMaterial != 3 && s.PillMaterial != 4) || panel == null) return;
-            if (dipW < 1 || dipH < 1) return;
-            var dpi = VisualTreeHelper.GetDpi(panel);
-            // 位置一律由调用方传入 DIP 矩形:此时面板窗口尚未显示、也没有 RenderTransform 动画,
-            // 用 PointToScreen/ActualWidth 反而不可靠(未 Arrange)。
-            double originX = dipX, originY = dipY;
-            if (double.IsNaN(originX) || double.IsNaN(originY))
-            {
-                var fallback = panel.PointToScreen(new Point(0, 0));
-                originX = fallback.X / dpi.DpiScaleX;
-                originY = fallback.Y / dpi.DpiScaleY;
-            }
-            int px = (int)Math.Floor(originX * dpi.DpiScaleX), py = (int)Math.Floor(originY * dpi.DpiScaleY);
-            int pw = (int)Math.Ceiling(dipW * dpi.DpiScaleX);
-            int ph = (int)Math.Ceiling(dipH * dpi.DpiScaleY);
-            if (pw < 8 || ph < 8) return;
-
+            if (s == null || (s.PillMaterial != 3 && s.PillMaterial != 4)) return false;
+            if (pw < 8 || ph < 8) return false;
+            if (scale < 0.05) scale = 0.05;
             double dsy = NativeMethods.SystemDpiScale();
+            // 模糊半径不乘 scale:抓到的纹理是「当前可见矩形」按 1:1 映射到元素上的
+            // (元素再被 RenderTransform 缩回同样大小),所以采样到的就是屏幕上真实的模糊强度;
+            // 乘 scale 反而会让动画中的玻璃比周围桌面更清晰。圆角才需要按 scale 缩。
             int blurHalf = BoxHalfFor(s.GlassBlurRadius * dsy);
-            int bleed = Math.Min(220, blurHalf * 2 + 12);        // 半分辨率半径 → 全分辨率出血×2
+            int bleed = Math.Min(220, blurHalf * 2 + 12);
             int x = Math.Max(0, px - bleed), y = Math.Max(0, py - bleed);
             int rx = Math.Min(NativeMethods.ScreenWidth(), px + pw + bleed);
             int by = Math.Min(NativeMethods.ScreenHeight(), py + ph + bleed);
-            int cw = (rx - x) & ~1, ch = (by - y) & ~1;          // 偶数化,方便对半降采样
-            if (cw < 8 || ch < 8) return;
+            int cw = (rx - x) & ~1, ch = (by - y) & ~1;
+            if (cw < 8 || ch < 8) return false;
+            int hw = cw / 2, hh = ch / 2;
+            int ox = Math.Max(0, (px - x) / 2), oy = Math.Max(0, (py - y) / 2);
+            int ow = Math.Min(hw - ox, Math.Max(2, (pw / 2) & ~1));
+            int oh = Math.Min(hh - oy, Math.Max(2, (ph / 2) & ~1));
+            if (ow < 4 || oh < 4) return false;
 
             byte tr = 20, tg = 20, tb = 28;
             try
@@ -512,10 +671,9 @@ namespace DesktopBar.Services
             }
             catch { }
             double tintA = Math.Max(0, Math.Min(1, s.GlassTintOpacity));
-            double glassOp = Math.Max(0.05, Math.Min(1, s.GlassOpacity));
 
+            byte[] body = null, sharp = null;
             long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
-            byte[] blurred = null, sharp = null; int hw = 0, hh = 0;
             if (NativeMethods.CreateStripCapture(cw, ch, out var screenDc, out var memoryDc, out var dib, out var bits))
             {
                 try
@@ -524,56 +682,139 @@ namespace DesktopBar.Services
                     {
                         var full = new byte[cw * ch * 4];
                         Marshal.Copy(bits, full, 0, full.Length);
-                        hw = cw / 2; hh = ch / 2;
                         var half = new byte[hw * hh * 4];
                         Downsample2x(full, cw, ch, half, hw, hh);
-                        blurred = new byte[half.Length];
+                        // 折射要「未模糊」的高频细节(与顶栏双采样源同一思路):先裁锐帧,再原地模糊后裁主体
+                        sharp = CropHalf(half, hw, ox, oy, ow, oh);
+                        var blurred = new byte[half.Length];
                         Array.Copy(half, blurred, half.Length);
-                        // 折射要"未模糊"的高频细节(和顶栏双采样源同一思路):先留一份锐帧再模糊
-                        sharp = new byte[half.Length];
-                        Array.Copy(half, sharp, half.Length);
                         BoxBlur3(blurred, half, hw, hh, blurHalf);
-                        // 液态玻璃档:在 CPU 上把轮廓折射/色散/边缘光一次性烘进去,
-                        // 面板观感与胶囊完全一致(不再只是"一块糊")。
-                        if (s.PillMaterial == 4 && !_panelNoBake)
-                        {
-                            BakeLiquidPanel(blurred, sharp, hw, hh,
-                                (px - x) / 2.0, (py - y) / 2.0, pw / 2.0, ph / 2.0,
-                                16 * Ui.Scale * dpi.DpiScaleY * 0.5,
-                                Math.Max(0, Math.Min(1, s.GlassRefraction)) * _panelBakeGain,
-                                Math.Max(0, Math.Min(1, s.GlassRim)) * _panelBakeGain,
-                                Math.Max(0, Math.Min(1, s.GlassChroma)) * _panelBakeGain,
-                                _panelBand, _panelSheen);
-                        }
-                        BakeTint(blurred, tr, tg, tb, tintA);
+                        body = CropHalf(blurred, hw, ox, oy, ow, oh);
+                        BakeTint(body, tr, tg, tb, tintA);
                     }
                 }
                 finally { NativeMethods.DestroyStripCapture(ref screenDc, ref memoryDc, ref dib); }
             }
-            if (blurred == null) return;
-            var wb2 = new WriteableBitmap(hw, hh, 96, 96, PixelFormats.Bgr32, null);
-            wb2.WritePixels(new Int32Rect(0, 0, hw, hh), blurred, hw * 4, 0);
-            wb2.Freeze();
-            // Viewbox = 面板物理矩形在半分辨率捕获图里的位置(全除 2),与云母画笔同口径。
-            var brush = new ImageBrush
+            if (body == null || sharp == null) return false;
+
+            // 门控:矩形没变、画面也没变 → 完全不出帧
+            var last = _panelLastRect;
+            bool rectSame = last != null && last[0] == px && last[1] == py && last[2] == pw && last[3] == ph;
+            if (rectSame && _panelPrevSharp != null && _panelPrevSharp.Length == sharp.Length
+                && MeanAbsDiff(_panelPrevSharp, sharp, ow, oh, 8) < DiffThreshold)
+                return false;
+            _panelLastRect = new[] { px, py, pw, ph };
+            _panelPrevSharp = sharp;
+            double radiusPx = 16 * Ui.Scale * dsy * 0.5 * scale;   // 展开页圆角 → 半分辨率像素
+            lock (Gate)
             {
-                ImageSource = wb2,
-                ViewboxUnits = BrushMappingMode.Absolute,
-                Viewbox = new Rect((px - x) / 2.0, (py - y) / 2.0, pw / 2.0, ph / 2.0),
-                ViewportUnits = BrushMappingMode.RelativeToBoundingBox,
-                Viewport = new Rect(0, 0, 1, 1),
-                Stretch = Stretch.Fill,
-                Opacity = glassOp
-            };
-            brush.Freeze();
-            panel.Background = brush;
-            if (!_panelGlassLogged)
-            {
-                _panelGlassLogged = true;
-                double ms = (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-                App.Log(string.Format("面板玻璃:预捕获 {0}x{1}(物理) 半分辨率 {2}x{3} 耗时={4:F1}ms",
-                    pw, ph, hw, hh, ms));
+                _panelPendingBody = body;
+                _panelPendingSharp = sharp;
+                _panelPendingW = ow;
+                _panelPendingH = oh;
+                _panelPendingRadius = radiusPx;
+                _panelPendingSeq++;
             }
+            Interlocked.Increment(ref StatPanelFrames);
+            SchedulePanelPump();
+            if (!_panelGlassDiag)
+            {
+                _panelGlassDiag = true;
+                double ms = (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+                App.Log(string.Format("面板玻璃:实时采样 {0}x{1}(物理) 半分辨率 {2}x{3} 缩放={4:F2} 耗时={5:F1}ms",
+                    pw, ph, ow, oh, scale, ms));
+            }
+            return true;
+        }
+
+        /// <summary>从半分辨率帧里裁出子矩形(按行 BlockCopy,帧很小,够用)。</summary>
+        private static byte[] CropHalf(byte[] src, int sw, int sx, int sy, int w, int h)
+        {
+            var dst = new byte[w * h * 4];
+            for (int y = 0; y < h; y++)
+                Buffer.BlockCopy(src, ((sy + y) * sw + sx) * 4, dst, y * w * 4, w * 4);
+            return dst;
+        }
+
+        /// <summary>有新帧才唤醒 UI 线程;静止/收起时 0 唤醒(与顶栏泵同一套合并去重)。</summary>
+        private static void SchedulePanelPump()
+        {
+            if (_stopped) return;
+            if (Interlocked.Exchange(ref _panelPumpQueued, 1) != 0) return;
+            try
+            {
+                var d = Application.Current == null ? null : Application.Current.Dispatcher;
+                if (d == null || d.HasShutdownStarted) { Interlocked.Exchange(ref _panelPumpQueued, 0); return; }
+                d.BeginInvoke(DispatcherPriority.Render, new Action(() =>
+                {
+                    Interlocked.Exchange(ref _panelPumpQueued, 0);
+                    PanelPumpTick();
+                }));
+            }
+            catch { Interlocked.Exchange(ref _panelPumpQueued, 0); }
+        }
+
+        /// <summary>UI 线程:写位图 → 挂/更新 LiquidGlassEffect(几何只改寄存器,不重编译)。</summary>
+        private static void PanelPumpTick()
+        {
+            if (_stopped) return;
+            var surface = _panelSurface;
+            if (surface == null) return;
+            byte[] body, sharp; int w, h, seq; double rad;
+            lock (Gate)
+            {
+                body = _panelPendingBody;
+                sharp = _panelPendingSharp;
+                w = _panelPendingW;
+                h = _panelPendingH;
+                seq = _panelPendingSeq;
+                rad = _panelPendingRadius;
+            }
+            if (body == null || sharp == null || w < 4 || h < 4 || seq == _panelConsumedSeq) return;
+            _panelConsumedSeq = seq;
+            var s = App.Settings;
+            if (s == null) return;
+            bool liquid = s.PillMaterial == 4;
+            if (_panelBodyWb == null || _panelBodyWb.PixelWidth != w || _panelBodyWb.PixelHeight != h)
+            {
+                _panelBodyWb = new WriteableBitmap(w, h, 96, 96, PixelFormats.Bgra32, null);
+                _panelSharpWb = new WriteableBitmap(w, h, 96, 96, PixelFormats.Bgra32, null);
+                _panelBodyBrush = new ImageBrush(_panelBodyWb) { Stretch = Stretch.Fill };
+                _panelSharpBrush = new ImageBrush(_panelSharpWb) { Stretch = Stretch.Fill };
+            }
+            _panelBodyWb.WritePixels(new Int32Rect(0, 0, w, h), body, w * 4, 0);
+            _panelSharpWb.WritePixels(new Int32Rect(0, 0, w, h), sharp, w * 4, 0);
+            if (liquid)
+            {
+                if (_panelEffect == null)
+                {
+                    _panelEffect = LiquidGlassEffect.CreatePanel(rad, w, h);
+                    if (_panelEffect == null) App.Log("面板玻璃:液态着色器不可用,降级为普通模糊");
+                }
+                if (_panelEffect != null)
+                {
+                    // 几何(半径/纹理尺寸)全走寄存器:动画期间每帧变尺寸也不用重编译
+                    _panelEffect.Radius = rad;
+                    _panelEffect.TexW = w;
+                    _panelEffect.TexH = h;
+                    _panelEffect.Refr = Math.Max(0, Math.Min(1, s.GlassRefraction));
+                    _panelEffect.Rim = Math.Max(0, Math.Min(1, s.GlassRim));
+                    _panelEffect.Chroma = Math.Max(0, Math.Min(1, s.GlassChroma));
+                    _panelEffect.Sheen = LiquidSheen;
+                    // 效果对象重建/位图换尺寸后必须重绑采样源(不重绑会采到全黑,顶栏踩过这个坑)
+                    if (!ReferenceEquals(_panelEffect.Input, _panelBodyBrush)) _panelEffect.Input = _panelBodyBrush;
+                    if (!ReferenceEquals(_panelEffect.Sharp, _panelSharpBrush)) _panelEffect.Sharp = _panelSharpBrush;
+                    if (!ReferenceEquals(surface.Effect, _panelEffect)) surface.Effect = _panelEffect;
+                    if (!ReferenceEquals(surface.Fill, Brushes.Black)) surface.Fill = Brushes.Black;
+                }
+            }
+            if (_panelEffect == null || !ReferenceEquals(surface.Effect, _panelEffect))
+            {
+                // 普通玻璃档(或着色器不可用):直接显示模糊位图
+                surface.Effect = null;
+                if (!ReferenceEquals(surface.Fill, _panelBodyBrush)) surface.Fill = _panelBodyBrush;
+            }
+            surface.Opacity = Math.Max(0.05, Math.Min(1, s.GlassOpacity));
         }
 
         // ---------- 内部:UI 侧 ----------
@@ -675,8 +916,12 @@ namespace DesktopBar.Services
             else
             {
                 Interlocked.Exchange(ref _pumpQueued, 0);
+                // 玻璃关掉时展开页也停止实时采样(面板随即由主题色接管)
+                _panelLive = false;
+                _panelPrevSharp = null;
                 RestoreExclusionAll();
                 _wake.Set();
+                try { _panelWake?.Set(); } catch { }
             }
         }
 
@@ -1155,121 +1400,6 @@ namespace DesktopBar.Services
             for (int i = 3; i < px.Length; i += 4) px[i] = 255;
         }
 
-
-        /// <summary>
-        /// 展开页版液态玻璃:在 CPU 上一次性烘焙(不挂 ShaderEffect)。
-        /// 展开页是"一次性静态捕获",不像顶栏每帧重来,所以直接把着色器那套数学搬到 CPU:
-        /// 圆角矩形 SDF → 轮廓内侧一圈用**未模糊**帧折射采样(RGB 三通道错位做色散)→ 叠边缘光。
-        /// 这样面板与胶囊观感完全一致,且不依赖 WPF Effect——面板是独立窗口 + 背景画刷,
-        /// 给画刷挂 Effect 会牵动整窗重呈,得不偿失。
-        /// rect 参数是面板在半分辨率捕获图里的像素矩形。
-        /// </summary>
-        private static void BakeLiquidPanel(byte[] body, byte[] sharp, int w, int h,
-            double rectX, double rectY, double rectW, double rectH, double radius,
-            double refr, double rim, double chroma, double band, double sheen)
-        {
-            if (band < 1.0) band = LiquidEdgeBand;
-            if (body == null || w < 8 || h < 8 || rectW < 2 || rectH < 2) return;
-            double cx = rectX + rectW * 0.5, cy = rectY + rectH * 0.5;
-            double hx = Math.Max(0.5, rectW * 0.5), hy = Math.Max(0.5, rectH * 0.5);
-            double rad = Math.Max(0, Math.Min(radius, Math.Min(hx, hy) - 0.5));
-            bool lensOn = sharp != null && sharp.Length == body.Length && (refr > 0.001 || chroma > 0.001);
-            // 只扫轮廓带(面板矩形外扩 8px 的环形区域),面板内部纯 body 不重算。
-            double pad = band + 4;
-            int x0 = Math.Max(0, (int)Math.Floor(rectX - pad));
-            int x1 = Math.Min(w - 1, (int)Math.Ceiling(rectX + rectW + pad));
-            int y0 = Math.Max(0, (int)Math.Floor(rectY - pad));
-            int y1 = Math.Min(h - 1, (int)Math.Ceiling(rectY + rectH + pad));
-            const double e = 2.0;
-            for (int y = y0; y <= y1; y++)
-            {
-                for (int x = x0; x <= x1; x++)
-                {
-                    double px = x + 0.5, py = y + 0.5;
-                    double d = SdRoundRect(px, py, cx, cy, hx, hy, rad);
-                    if (Math.Abs(d) >= band) continue;   // 带外不动(body 保持模糊)
-                    double edge = 1.0 - Math.Abs(d) / band;
-                    if (edge <= 0) continue;
-                    double e2 = edge * edge;
-                    double gx = SdRoundRect(px + e, py, cx, cy, hx, hy, rad) - SdRoundRect(px - e, py, cx, cy, hx, hy, rad);
-                    double gy = SdRoundRect(px, py + e, cx, cy, hx, hy, rad) - SdRoundRect(px, py - e, cx, cy, hx, hy, rad);
-                    double gl = Math.Sqrt(gx * gx + gy * gy) + 1e-4;
-                    double nx = gx / gl, ny = gy / gl;
-                    // 带宽变大时位移同比例放大:透镜的"折角"是物理量,带越宽走得越远,否则宽边只会变糊
-                    double dispScale = LiquidDispScale * (band / LiquidEdgeBand);
-                    double dxs = nx * refr * e2 * dispScale;
-                    double dys = ny * refr * e2 * dispScale;
-                    int i = (y * w + x) * 4;
-                    double cb = body[i], cg = body[i + 1], cr = body[i + 2];
-                    if (lensOn)
-                    {
-                        double ca = chroma * e2 * LiquidChromaScale;
-                        // 三个通道各自位移采样:边缘出现极轻微的红/蓝分离,是液态玻璃的标志性色散
-                        SampleBilinear(sharp, w, h, px + dxs * (1.0 + ca), py + dys * (1.0 + ca), out _, out _, out double lr);
-                        SampleBilinear(sharp, w, h, px + dxs, py + dys, out _, out double lg, out _);
-                        SampleBilinear(sharp, w, h, px + dxs * (1.0 - ca), py + dys * (1.0 - ca), out double lb, out _, out _);
-                        double mix = Math.Min(1.0, e2 * 1.1) * 0.85;
-                        cb = cb * (1 - mix) + lb * mix;
-                        cg = cg * (1 - mix) + lg * mix;
-                        cr = cr * (1 - mix) + lr * mix;
-                    }
-                    // 轮廓内侧一圈亮边(与 HLSL 同口径:rim*edge²*saturate(-d/6+0.5)*0.5)
-                    double rimTerm = rim * e2 * Math.Min(1.0, Math.Max(0.0, -d / band + 0.5)) * 0.5 * 255.0;
-                    cb += rimTerm; cg += rimTerm; cr += rimTerm;
-                    if (sheen > 0.001)
-                    {
-                        // 方向光(左上方)在斜面上打出高光、右下方压暗:玻璃厚板的"体积感"靠这一对比,
-                        // 否则面板内部只是均匀半透明色,看起来像塑料片。
-                        double dotL = -(nx * 0.55 + ny * 0.83);
-                        double lit = Math.Max(0.0, dotL), shade = Math.Max(0.0, -dotL);
-                        double sh = sheen * e2 * (lit - shade * 0.55) * 255.0 * 0.35;
-                        cb += sh; cg += sh; cr += sh;
-                    }
-                    body[i] = ClampByte(cb);
-                    body[i + 1] = ClampByte(cg);
-                    body[i + 2] = ClampByte(cr);
-                }
-            }
-        }
-
-        private const double LiquidEdgeBand = 6.0;    // 折射带宽度(半分辨率像素),与 HLSL 的 6.0 一致
-        private const double LiquidDispScale = 14.0;  // 折射位移上限,与 HLSL 的 14.0 一致
-        private const double LiquidChromaScale = 0.08;
-
-        /// <summary>圆角矩形有向距离场(与着色器里的 sd() 同一公式,内部为负)。</summary>
-        private static double SdRoundRect(double px, double py, double cx, double cy,
-            double hx, double hy, double radius)
-        {
-            double qx = Math.Abs(px - cx) - hx + radius;
-            double qy = Math.Abs(py - cy) - hy + radius;
-            double mx = Math.Max(qx, 0), my = Math.Max(qy, 0);
-            return Math.Sqrt(mx * mx + my * my) + Math.Min(Math.Max(qx, qy), 0) - radius;
-        }
-
-        private static byte ClampByte(double v)
-        {
-            if (v <= 0) return 0;
-            if (v >= 255) return 255;
-            return (byte)(v + 0.5);
-        }
-
-        /// <summary>双线性采样 BGRA 缓冲(越界钳边),用于 CPU 折射。</summary>
-        private static void SampleBilinear(byte[] px, int w, int h, double sx, double sy,
-            out double b, out double g, out double r)
-        {
-            if (sx < 0) sx = 0; else if (sx > w - 1) sx = w - 1;
-            if (sy < 0) sy = 0; else if (sy > h - 1) sy = h - 1;
-            int ix = (int)sx, iy = (int)sy;
-            double fx = sx - ix, fy = sy - iy;
-            int ix1 = ix + 1 < w ? ix + 1 : ix;
-            int iy1 = iy + 1 < h ? iy + 1 : iy;
-            int i00 = (iy * w + ix) * 4, i01 = (iy * w + ix1) * 4;
-            int i10 = (iy1 * w + ix) * 4, i11 = (iy1 * w + ix1) * 4;
-            double w00 = (1 - fx) * (1 - fy), w01 = fx * (1 - fy), w10 = (1 - fx) * fy, w11 = fx * fy;
-            b = px[i00] * w00 + px[i01] * w01 + px[i10] * w10 + px[i11] * w11;
-            g = px[i00 + 1] * w00 + px[i01 + 1] * w01 + px[i10 + 1] * w10 + px[i11 + 1] * w11;
-            r = px[i00 + 2] * w00 + px[i01 + 2] * w01 + px[i10 + 2] * w10 + px[i11 + 2] * w11;
-        }
 
         /// <summary>把染色直接烘进像素(展开页没有 WPF 染色层,一次性捕获顺手烘焙)。</summary>
         private static void BakeTint(byte[] px, byte r, byte g, byte b, double a)

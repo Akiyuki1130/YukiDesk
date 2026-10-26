@@ -99,9 +99,26 @@ namespace DesktopBar.UI
         public static LiquidGlassEffect Create(float[][] rects, int count,
             double radiusPx, double texW, double texH)
         {
+            return CreateCore(BuildHlsl(rects, Math.Max(0, count), false), radiusPx, texW, texH);
+        }
+
+        /// <summary>
+        /// 展开页(整块圆角矩形)版本:与胶囊版共用同一份 main() 主体,只有距离场不同——
+        /// 展开页的距离场完全来自 pTexW/pTexH/pRadius 三个寄存器,不烘焙任何几何字面量,
+        /// 因此**任意尺寸、任意圆角的展开页共用同一份字节码**。
+        /// 这是"面板实时玻璃"的前提:动画期间面板每帧都在变尺寸,重编译着色器是不可接受的,
+        /// 而这里每帧只改寄存器(参数),编译一次就够。
+        /// 另外展开页窗口没有 GeometryGroup 裁剪,圆角/边缘柔化由着色器按距离场输出 alpha。
+        /// </summary>
+        public static LiquidGlassEffect CreatePanel(double radiusPx, double texW, double texH)
+        {
+            return CreateCore(BuildHlsl(null, 0, true), radiusPx, texW, texH);
+        }
+
+        private static LiquidGlassEffect CreateCore(string hlsl, double radiusPx, double texW, double texH)
+        {
             try
             {
-                string hlsl = BuildHlsl(rects, Math.Max(0, count));
                 try
                 {
                     var dbgDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "YukiDesk");
@@ -130,7 +147,7 @@ namespace DesktopBar.UI
 
         // ---------- HLSL 生成与字节码缓存 ----------
 
-        private static string BuildHlsl(float[][] rects, int count)
+        private static string BuildHlsl(float[][] rects, int count, bool panel)
         {
             var inv = CultureInfo.InvariantCulture;
             var sb = new StringBuilder();
@@ -152,11 +169,20 @@ float sd(float cx, float cy, float hx, float hy, float2 p)
 float field(float2 p)
 {
     float b = 1e9;");
-            for (int i = 0; i < count && i < rects.Length; i++)
+            if (panel)
             {
-                // 胶囊几何烘焙成字面量:寄存器数组封送在各 WPF 版本上不可靠,字面量零风险
-                sb.AppendLine(string.Format(inv, "    b = min(b, sd({0}, {1}, {2}, {3}, p));",
-                    Fmt(rects[i][0]), Fmt(rects[i][1]), Fmt(rects[i][2]), Fmt(rects[i][3])));
+                // 展开页:整块圆角矩形,几何全部来自寄存器(texW/texH/radius),
+                // 所以同一份字节码能服务任意尺寸——实时面板每帧尺寸都在变,不能重编译。
+                sb.AppendLine("    b = min(b, sd(pTexW * 0.5, pTexH * 0.5, pTexW * 0.5, pTexH * 0.5, p));");
+            }
+            else
+            {
+                for (int i = 0; i < count && i < rects.Length; i++)
+                {
+                    // 胶囊几何烘焙成字面量:寄存器数组封送在各 WPF 版本上不可靠,字面量零风险
+                    sb.AppendLine(string.Format(inv, "    b = min(b, sd({0}, {1}, {2}, {3}, p));",
+                        Fmt(rects[i][0]), Fmt(rects[i][1]), Fmt(rects[i][2]), Fmt(rects[i][3])));
+                }
             }
             sb.AppendLine(@"    return b;
 }");
@@ -231,8 +257,20 @@ float field(float2 p)
     if (DEBUG_MODE == 6) { float4 c0 = tex2D(Input, uv); c0.rgb = c0.a; c0.a = 1.0; return c0; }
     if (DEBUG_MODE == 7) { float4 c0 = tex2D(Input, uv); c0.rgb = pow(saturate(c0.rgb), 0.45454544); c0.a = 1.0; return c0; }
     if (DEBUG_MODE == 8) { float4 c0 = tex2D(Input, uv); return c0; }
-    return float4(col, 1);
+");
+            if (panel)
+            {
+                // 展开页:窗口没有几何裁剪,圆角与边缘柔化直接由距离场给 alpha。
+                // (WPF 对带 Effect 的元素按整体包围盒跑像素着色器,形状必须自己画,否则四角是方的)
+                sb.AppendLine(@"    float pa = saturate(0.5 - d);
+    return float4(col * pa, pa);
 }");
+            }
+            else
+            {
+                sb.AppendLine(@"    return float4(col, 1);
+}");
+            }
             // 调试档号填进模板里的 DEBUG_MODE 占位符;不认识的号码一律按 0(正常路径)
             string mode = dbg == null ? "0" : dbg;
             switch (mode)

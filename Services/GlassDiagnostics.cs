@@ -285,7 +285,20 @@ namespace DesktopBar.Services
                         }
                     }
                 }
-                TagThread("UI线程");
+                // 可选:测量期间保持一个悬停面板打开(YUKI_PERF_PANEL=<模块名片段>),
+            // 用来量「展开页实时玻璃」的常驻成本(采样线程在面板打开时按帧率上限跑)。
+            ModuleBase openPanel = null;
+            string perfPanel = Environment.GetEnvironmentVariable("YUKI_PERF_PANEL");
+            if (!string.IsNullOrEmpty(perfPanel) && MainWindow.Bar != null)
+            {
+                foreach (var m in MainWindow.Bar.DiagnosticModules)
+                {
+                    if (!m.DiagnosticHasPanel) continue;
+                    if (m.DiagnosticName.ToLowerInvariant().Contains(perfPanel.ToLowerInvariant())) { openPanel = m; break; }
+                }
+                if (openPanel != null) { openPanel.ShowPanel(); Note("性能[面板] 已打开 " + openPanel.DiagnosticName + " 动画属性=" + openPanel.DiagnosticPanelAnimated); }
+            }
+            TagThread("UI线程");
                 // 计数布局失效:若空闲时 LayoutUpdated 仍在狂跑,说明有东西每帧弄脏可视树(会把渲染线程拖成常开)。
                 long layout0 = 0;
                 var bar = MainWindow.Bar;
@@ -351,7 +364,8 @@ namespace DesktopBar.Services
                     msOf(ft0, System.Threading.Interlocked.Read(ref GlassService.StatDiffTicks), b1 - b0),
                     msOf(bl0, System.Threading.Interlocked.Read(ref GlassService.StatBlurTicks), s1 - s0)));
                 Note("性能[布局] LayoutUpdated=" + System.Threading.Interlocked.Read(ref layout0) + " 次/" + secs + "s");
-                if (hideBar && probeBar != null) { try { probeBar.Show(); } catch { } }
+                if (openPanel != null) { try { Note("性能[面板] 状态 " + GlassService.DiagnosticPanelState() + " 动画属性=" + openPanel.DiagnosticPanelAnimated + " " + openPanel.DiagnosticPanelTransform); openPanel.ClosePanelImmediately(); } catch { } }
+            if (hideBar && probeBar != null) { try { probeBar.Show(); } catch { } }
                 Note("性能[终点] " + GlassService.DiagnosticSnapshot());
             }
             catch (Exception ex) { Note("性能自检异常: " + ex); }
@@ -400,7 +414,11 @@ namespace DesktopBar.Services
                     try
                     {
                         m.ShowPanel();
-                        await Task.Delay(1400);          // 等面板淡入动画 + 一次性捕获完成
+                        // 等面板淡入动画结束(可用 YUKI_SHOT_PANEL_DELAY 覆盖,用于抓"动画进行中"的画面)
+            int fadeMs = 1400;
+            int.TryParse(Environment.GetEnvironmentVariable("YUKI_SHOT_PANEL_DELAY"), out fadeMs);
+            if (fadeMs <= 0) fadeMs = 1400;
+            await Task.Delay(fadeMs);
                         try
                         {
                             var pw = m.DiagnosticPanelWindow; var pb = m.DiagnosticPanel;
@@ -410,6 +428,8 @@ namespace DesktopBar.Services
                                 pb == null || pb.Background == null ? "null" : pb.Background.GetType().Name,
                                 fill == null || fill.ImageSource == null ? "无" : fill.ImageSource.GetType().Name + " " + ((System.Windows.Media.Imaging.BitmapSource)fill.ImageSource).PixelWidth + "x" + ((System.Windows.Media.Imaging.BitmapSource)fill.ImageSource).PixelHeight,
                                 fill == null ? 0 : fill.Opacity));
+                            // 现在玻璃是垫在展开页里的一层(带着色器的 Rectangle),不再是面板背景贴图
+                            Note("面板玻璃 " + name + " " + GlassService.DiagnosticPanelState());
                         }
                         catch (Exception ex) { Note("面板 " + name + " 矩形读取失败: " + ex.Message); }
                         await ShotAsync("panel-" + name);
