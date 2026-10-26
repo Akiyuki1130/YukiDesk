@@ -440,8 +440,11 @@ namespace DesktopBar
                     h => { S.GlassTint = h; App.Save(); Services.GlassService.ApplyLive(); })));
                 body.Children.Add(Row("染色浓度", NumberSlider(0, 100, S.GlassTintOpacity * 100, "%",
                     v => { S.GlassTintOpacity = Math.Round(v) / 100; App.Save(); Services.GlassService.ApplyLive(); })));
-                body.Children.Add(Row("帧率上限", NumberSlider(5, 60, S.GlassMaxFps, " fps",
+                body.Children.Add(Row("帧率上限", NumberSlider(5, 300, S.GlassMaxFps, " fps",
                     v => { S.GlassMaxFps = (int)Math.Round(v); App.Save(); Services.GlassService.ApplyLive(); })));
+                body.Children.Add(MakeHint("帧率上限 = 每秒最多抓几次屏幕，它决定「背后变化 → 玻璃更新」的延迟上限。"
+                    + "单次抓屏约 4.5ms，所以实际能跑到 200fps 左右；但屏幕每秒只刷新 60 次，WPF 合成也不会更快，"
+                    + "超过 60 只会多烧 CPU（背后完全静止时仍会自动降频，不额外耗电）。", 12));
                 body.Children.Add(Row("间隙玻璃", NumberSlider(0, 100, S.GlassGapFill * 100, "%",
                     v => { S.GlassGapFill = Math.Round(v) / 100; App.Save(); Services.GlassService.ApplyLive(); })));
                 body.Children.Add(MakeHint("间隙玻璃 0%：只有胶囊是玻璃，胶囊之间完全透明，点击可穿透到桌面图标。"

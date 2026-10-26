@@ -116,8 +116,13 @@ namespace DesktopBar.Services
         private static bool IsGlass => App.Settings?.PillMaterial == 3 || App.Settings?.PillMaterial == 4;
 
         // 捕获线程的静止计数(自适应降频:静止越久采样越稀)
-        private static int _staticRun;
+        // 静止程度用"距离上次发布多久"衡量(TickCount64 毫秒),不用帧数:
+        // 帧数阈值在 60fps 设置下要等 0.5~1.5 秒才降频,期间白烧 12% 单核。
         private static long _lastPubTick;   // 上次发布的时刻(TickCount64),用于小幅漂移限流
+        // 「捕获开始 → UI 线程写进 WriteableBitmap」的延迟统计,用于回答"玻璃有几帧延迟"。
+        private static long _pubCaptureTick;
+        private static double _latLastMs, _latSumMs, _latMaxMs;
+        private static int _latCount;
         // 诊断开关:跳过静止差分门控,强制每帧发布(=模拟"顶栏背后一直在动"的最坏情况,如动态壁纸/视频)。
         private static bool _alwaysPub;
 
@@ -160,7 +165,7 @@ namespace DesktopBar.Services
             var spec = _spec;
             double busyMs = StatBusyTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
             return string.Format(
-                "材质={0} 启用={1} 采样规格={2}x{3}(半分辨率 {4}x{5}) 捕获帧={6} 发布={7} BitBlt={8} 累计忙={9:F1}ms 液态着色器={10} 帧率上限={11} 泵tick={12} 写帧={13} 写锐帧={14} 面板帧={15}",
+                "材质={0} 启用={1} 采样规格={2}x{3}(半分辨率 {4}x{5}) 捕获帧={6} 发布={7} BitBlt={8} 累计忙={9:F1}ms 液态着色器={10} 帧率上限={11} 泵tick={12} 写帧={13} 写锐帧={14} 面板帧={15} 捕获→写屏={16:F1}/{17:F1}/{18:F1}ms(末/均/峰) 捕获相位={19}",
                 s == null ? -1 : s.PillMaterial, _enabled,
                 spec == null ? 0 : spec.Width, spec == null ? 0 : spec.Height,
                 _latestW, _latestH,
@@ -169,7 +174,9 @@ namespace DesktopBar.Services
                 _liquid == null ? "无(降级普通玻璃)" : "已启用",
                 spec == null ? 0 : Math.Round(1000.0 / Math.Max(1, spec.FpsMs)),
                 Interlocked.Read(ref StatPumps), Interlocked.Read(ref StatWrites), Interlocked.Read(ref StatSharpWrites),
-                  Interlocked.Read(ref StatPanelFrames));
+                Interlocked.Read(ref StatPanelFrames),
+                _latLastMs, _latCount == 0 ? 0.0 : _latSumMs / _latCount, _latMaxMs,
+                _loopPhase);
         }
 
         /// <summary>取证:把当前发布的玻璃输入帧(半分辨率模糊结果)另存为 PNG。</summary>
@@ -493,6 +500,8 @@ namespace DesktopBar.Services
         private static Thread _panelThread;
         private static volatile bool _panelLive;
         private static volatile bool _panelThreadStop;
+        // 捕获线程当前停在哪个分支(诊断用):1=等待启用 2=WDA 等待 3=抓图暂停 4=建条带失败 5=被遮挡 6=BitBlt 失败 7=正常
+        private static volatile int _loopPhase;
         private static volatile int[] _panelRect;            // 目标屏幕矩形(物理像素) x,y,w,h
         private static double _panelScale = 1.0;             // 动画缩放系数(只影响圆角半径;模糊按真实屏幕强度算)
         private static int[] _panelLastRect;
@@ -620,7 +629,7 @@ namespace DesktopBar.Services
                     // 一帧没发布就退到 100ms,持续静止再退到 250ms;一旦有变化立刻回满帧率。
                     if (published) _panelStaticRun = 0; else _panelStaticRun++;
                     var s = App.Settings;
-                    int fps = s == null ? 30 : Math.Max(10, Math.Min(60, s.GlassMaxFps));
+                    int fps = s == null ? 30 : Math.Max(10, Math.Min(300, s.GlassMaxFps));
                     int budget = 1000 / fps;
                     if (_panelStaticRun > 40) budget = Math.Max(budget, 250);
                     else if (_panelStaticRun > 12) budget = Math.Max(budget, 100);
@@ -856,13 +865,13 @@ namespace DesktopBar.Services
             double blurPhys = Math.Max(1, (s == null ? 24 : s.GlassBlurRadius) * dsy);
             int bleed = (int)Math.Ceiling(blurPhys) + 8;
             int h = (int)Math.Ceiling(barPhysH) + bleed;
-            int fps = s == null ? 30 : Math.Clamp(s.GlassMaxFps, 5, 60);
+            int fps = s == null ? 30 : Math.Clamp(s.GlassMaxFps, 5, 300);
             var spec = new GlassSpec
             {
                 Width = Math.Max(16, physW + 1) & ~1,
                 Height = Math.Max(8, h + 1) & ~1,
                 BlurHalf = BoxHalfFor((s == null ? 24 : s.GlassBlurRadius) * dsy),
-                FpsMs = Math.Max(16, 1000 / fps),
+                FpsMs = Math.Max(2, 1000 / fps),   // 300fps 也允许:单个捕获周期本身约 4.5ms,会被自然限住
                 MidY = Math.Max(4, (int)Math.Ceiling(barPhysH / 2)),
             };
             spec.HalfWidth = spec.Width / 2;
@@ -1030,6 +1039,15 @@ namespace DesktopBar.Services
                     }
                     _consumed = f;
                 }
+                long ct = Interlocked.Read(ref _pubCaptureTick);
+                if (ct != 0)
+                {
+                    double ms = (System.Diagnostics.Stopwatch.GetTimestamp() - ct) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+                    _latLastMs = ms;
+                    _latSumMs += ms;
+                    if (ms > _latMaxMs) _latMaxMs = ms;
+                    _latCount++;
+                }
             }
             catch { }
         }
@@ -1111,12 +1129,14 @@ namespace DesktopBar.Services
                     var spec = _spec;
                     if (!_enabled || !_active || spec == null)
                     {
+                        _loopPhase = 1;
                         _wake.Wait(400);
                         _wake.Reset();
                         continue;
                     }
                     if (Environment.TickCount64 < Volatile.Read(ref _holdUntil))
                     {
+                        _loopPhase = 2;
                         Thread.Sleep(100);
                         continue;
                     }
@@ -1124,6 +1144,7 @@ namespace DesktopBar.Services
                     // 必须停止 BitBlt,否则就会把自己拍进下一帧形成正反馈。
                     if (_shotPause)
                     {
+                        _loopPhase = 3;
                         Thread.Sleep(50);
                         continue;
                     }
@@ -1161,6 +1182,7 @@ namespace DesktopBar.Services
                                 loggedCapFail = true;
                                 App.Log("玻璃:创建捕获条带失败 err=" + Marshal.GetLastWin32Error() + ",稍后重试");
                             }
+                            _loopPhase = 4;
                             Thread.Sleep(1000);
                             continue;
                         }
@@ -1170,7 +1192,7 @@ namespace DesktopBar.Services
                     // 反正玻璃也不可见——省 BitBlt 也避免独占全屏下抓到黑帧。
                     if (IsCovered(spec))
                     {
-                        _staticRun = 0;
+                        _loopPhase = 5;
                         Thread.Sleep(300);
                         continue;
                     }
@@ -1179,6 +1201,7 @@ namespace DesktopBar.Services
                     Interlocked.Increment(ref StatFrames);
                     if (!NativeMethods.BlitStrip(memoryDc, capW, capH, screenDc, 0, 0))
                     {
+                        _loopPhase = 6;
                         Thread.Sleep(250);
                         continue;
                     }
@@ -1198,7 +1221,9 @@ namespace DesktopBar.Services
                     // 小幅漂移(例如慢速滚动、小面积动画)不必按满帧率发布:每次发布都要整条窗口重呈。
                     // 但 100ms 的闸门(10fps)在液态玻璃下能看出卡顿,收到 50ms(20fps)——
                     // 折中:CPU 只多一半,肉眼基本连续。
-                    if (publish && !_alwaysPub && diff < SmallDiffThreshold && nowTick - _lastPubTick < 50) publish = false;
+                    // 闸门按帧率缩放(≈半速):30fps 时约 66ms,60fps 时 33ms,300fps 时 6ms。
+            int pubGateMs = Math.Max(2, spec.FpsMs * 2);
+            if (publish && !_alwaysPub && diff < SmallDiffThreshold && nowTick - _lastPubTick < pubGateMs) publish = false;
                     if (publish)
                     {
                         _lastPubTick = nowTick;
@@ -1224,8 +1249,8 @@ namespace DesktopBar.Services
                         }
                         Array.Copy(halfRaw, halfBase, halfBase.Length);
                         hasBaseline = true;
-                        _staticRun = 0;
                         Interlocked.Increment(ref StatPublishes);
+                        Interlocked.Exchange(ref _pubCaptureTick, busyStart);
                         SchedulePump();   // 有新帧才唤醒 UI 线程(静止时 0 唤醒)
                         if (!loggedSelf)
                         {
@@ -1234,10 +1259,6 @@ namespace DesktopBar.Services
                             App.Log(string.Format("玻璃:首帧 {0}x{1}(半分辨率) 红通道均值={2:F1} 标准差={3:F1} 采样={4}",
                                 hw, hh, m, sd, n));
                         }
-                    }
-                    else
-                    {
-                        _staticRun++;
                     }
                     Interlocked.Add(ref StatBusyTicks, System.Diagnostics.Stopwatch.GetTimestamp() - busyStart);
 
@@ -1248,9 +1269,11 @@ namespace DesktopBar.Services
                     // 观感就是"液态玻璃卡住了/很慢"。现在上限 250ms(深静止)/120ms(静止),
                     // 一次 BitBlt 的固定成本约 2.5ms,深静止档常驻约 1%。20fps 的持续大动限帧也已取消,
                     // 持续运动时直接跑满「帧率上限」设置(默认 30fps)。
+                    _loopPhase = 7;
                     int delay = spec.FpsMs;
-                    if (_staticRun > 90) delay = 250;
-                    else if (_staticRun > 30) delay = 120;
+                    long idleMs = Environment.TickCount64 - _lastPubTick;
+                    if (idleMs > 1200) delay = 250;
+                    else if (idleMs > 400) delay = 120;
                     Thread.Sleep(delay);
                 }
             }
