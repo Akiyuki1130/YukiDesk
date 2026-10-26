@@ -410,13 +410,13 @@ namespace DesktopBar
             bool liquid = S.PillMaterial == 4;
             bool glass = S.PillMaterial == 3 || liquid;
             bool acrylic = S.PillMaterial == 2;
-            string name = S.PillMaterial == 0 ? "纯色" : liquid ? "液态玻璃" : glass ? "玻璃" : acrylic ? "亚克力" : "云母";
+            string name = S.PillMaterial == 0 ? "纯色" : liquid ? "液态玻璃" : glass ? "高斯模糊" : acrylic ? "亚克力" : "云母";
             string subtitle = liquid
                 ? "液态玻璃：实时捕获背后屏幕 → 高斯模糊 → 着色器叠加折射/色散/边缘光（iOS 26 式凸透镜边缘收缩）。"
                   + "胶囊轮廓有真实折射感；参数见下方,静止桌面自动降到近零开销。"
                 : glass
-                ? "实时背景玻璃：捕获顶栏背后的真实屏幕（窗口+图标+壁纸）→ 高斯模糊 → 染色，铺进胶囊。"
-                  + "静止桌面自动降到近零开销；云母/亚克力已下架（旧配置自动迁移到玻璃）。"
+                ? "高斯模糊：捕获顶栏背后的真实屏幕（窗口+图标+壁纸）→ 高斯模糊 → 染色，铺进胶囊。"
+                  + "静止桌面自动降到近零开销；云母/亚克力已下架（旧配置自动迁移到高斯模糊）。"
                 : acrylic
                 ? "自绘亚克力：采样壁纸 → 磨砂重模糊 → 保留色彩 → 随明暗主题提亮/压暗 → 噪点，烘焙成一张位图。"
                   + "比云母更通透、更“彩色”，是磨砂玻璃质感；零屏幕捕获、零每帧开销，每个胶囊按自己在屏幕上的位置取对应一段。"
@@ -426,7 +426,7 @@ namespace DesktopBar
             body.Children.Add(Row("材质", BuildPillMaterialPicker()));
             if (S.PillMaterial == 0)
             {
-                body.Children.Add(MakeHint("当前为纯色：胶囊沿用上方「主题」卡片的外观设置。选择玻璃后，这里会显示玻璃的材质参数。", 12));
+                body.Children.Add(MakeHint("当前为纯色：胶囊沿用上方「主题」卡片的外观设置。选择「高斯模糊」后，这里会显示模糊与染色的参数。", 12));
             }
             else if (glass)
             {
@@ -453,7 +453,7 @@ namespace DesktopBar
                     body.Children.Add(Row("色散", NumberSlider(0, 100, S.GlassChroma * 100, "%",
                         v => { S.GlassChroma = Math.Round(v) / 100; App.Save(); Services.GlassService.ApplyLive(); })));
                 }
-                body.Children.Add(MakeHint("玻璃会实时捕获顶栏背后的屏幕。注意：捕获期间用截图/录屏/OBS 看不到顶栏本身"
+                body.Children.Add(MakeHint("高斯模糊/液态玻璃会实时捕获顶栏背后的屏幕。注意：捕获期间用截图/录屏/OBS 看不到顶栏本身"
                     + "（系统级排除，防止玻璃把自己拍进去）；顶栏被全屏窗口盖住时自动暂停捕获。", 12));
             }
             else
@@ -483,13 +483,13 @@ namespace DesktopBar
             AppearanceHost.Children.Add(card);
         }
 
-        /// <summary>胶囊材质选择：纯色（默认）/ 玻璃（实时背景高斯）/ 液态玻璃（折射+色散+边缘光）。云母/亚克力已下架。</summary>
+        /// <summary>胶囊材质选择：纯色（默认）/ 高斯模糊（实时背景高斯）/ 液态玻璃（折射+色散+边缘光）。云母/亚克力已下架。</summary>
         private FrameworkElement BuildPillMaterialPicker()
         {
             var panel = new StackPanel { Orientation = Orientation.Horizontal };
             var options = new (string Label, int Mode)[]
             {
-                ("纯色", 0), ("玻璃", 3), ("液态玻璃", 4)
+                ("纯色", 0), ("高斯模糊", 3), ("液态玻璃", 4)
             };
             foreach (var (label, mode) in options)
             {

@@ -51,7 +51,30 @@ namespace DesktopBar.Services
         private static readonly object Gate = new object();
         private static readonly HashSet<IntPtr> _excluded = new HashSet<IntPtr>();
         private static readonly Dictionary<IntPtr, long> _wdaReady = new Dictionary<IntPtr, long>();
+        private static double ReadEnvDouble(string name, double fallback)
+        {
+            double v;
+            if (double.TryParse(Environment.GetEnvironmentVariable(name), out v)) return v;
+            return fallback;
+        }
+
+        private static double ReadBakeGain()
+        {
+            double v;
+            if (double.TryParse(Environment.GetEnvironmentVariable("YUKI_PANEL_BAKE_GAIN"), out v) && v > 0) return v;
+            return 1.4;   // 面板面积大,折射/rim 需要放大才与胶囊同观感
+        }
+
         private static bool _panelGlassLogged;
+        // 诊断:A/B 面板液态烘焙。YUKI_PANEL_NOBAKE=1 关掉烘焙(只剩模糊),YUKI_PANEL_BAKE_GAIN 缩放强度。
+        private static readonly bool _panelNoBake = Environment.GetEnvironmentVariable("YUKI_PANEL_NOBAKE") == "1";
+        private static readonly double _panelBakeGain = ReadBakeGain();
+        // 面板比胶囊大得多:同样带宽/强度在大面上几乎看不见,所以按面板尺寸放大带宽与强度,
+        // 让"斜边折角"在两处占屏比例接近,观感才一致。
+        private static readonly double _panelBand = ReadEnvDouble("YUKI_PANEL_BAND", 14.0);
+        // 斜面明暗(方向光高光/背光压暗):胶囊与面板共用一个强度,保证是同一种材质。
+        private static readonly double LiquidSheen = ReadEnvDouble("YUKI_LIQUID_SHEEN", 1.0);
+        private static readonly double _panelSheen = ReadEnvDouble("YUKI_PANEL_SHEEN", LiquidSheen);
         private static volatile GlassSpec _spec;
 
         private static bool _started, _stopped, _enabled, _active = true, _stopThread;
@@ -108,7 +131,6 @@ namespace DesktopBar.Services
         // 捕获线程的静止计数(自适应降频:静止越久采样越稀)
         private static int _staticRun;
         private static long _lastPubTick;   // 上次发布的时刻(TickCount64),用于小幅漂移限流
-        private static int _motionRun;      // 连续"有变化"的采样次数,用于持续大动时限帧
         // 诊断开关:跳过静止差分门控,强制每帧发布(=模拟"顶栏背后一直在动"的最坏情况,如动态壁纸/视频)。
         private static bool _alwaysPub;
 
@@ -304,6 +326,7 @@ namespace DesktopBar.Services
                 _liquid.Refr = s.GlassRefraction;
                 _liquid.Rim = s.GlassRim;
                 _liquid.Chroma = s.GlassChroma;
+                _liquid.Sheen = LiquidSheen;
             }
         }
 
@@ -492,7 +515,7 @@ namespace DesktopBar.Services
             double glassOp = Math.Max(0.05, Math.Min(1, s.GlassOpacity));
 
             long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
-            byte[] blurred = null; int hw = 0, hh = 0;
+            byte[] blurred = null, sharp = null; int hw = 0, hh = 0;
             if (NativeMethods.CreateStripCapture(cw, ch, out var screenDc, out var memoryDc, out var dib, out var bits))
             {
                 try
@@ -506,7 +529,22 @@ namespace DesktopBar.Services
                         Downsample2x(full, cw, ch, half, hw, hh);
                         blurred = new byte[half.Length];
                         Array.Copy(half, blurred, half.Length);
+                        // 折射要"未模糊"的高频细节(和顶栏双采样源同一思路):先留一份锐帧再模糊
+                        sharp = new byte[half.Length];
+                        Array.Copy(half, sharp, half.Length);
                         BoxBlur3(blurred, half, hw, hh, blurHalf);
+                        // 液态玻璃档:在 CPU 上把轮廓折射/色散/边缘光一次性烘进去,
+                        // 面板观感与胶囊完全一致(不再只是"一块糊")。
+                        if (s.PillMaterial == 4 && !_panelNoBake)
+                        {
+                            BakeLiquidPanel(blurred, sharp, hw, hh,
+                                (px - x) / 2.0, (py - y) / 2.0, pw / 2.0, ph / 2.0,
+                                16 * Ui.Scale * dpi.DpiScaleY * 0.5,
+                                Math.Max(0, Math.Min(1, s.GlassRefraction)) * _panelBakeGain,
+                                Math.Max(0, Math.Min(1, s.GlassRim)) * _panelBakeGain,
+                                Math.Max(0, Math.Min(1, s.GlassChroma)) * _panelBakeGain,
+                                _panelBand, _panelSheen);
+                        }
                         BakeTint(blurred, tr, tg, tb, tintA);
                     }
                 }
@@ -912,9 +950,10 @@ namespace DesktopBar.Services
                     Interlocked.Add(ref StatDiffTicks, System.Diagnostics.Stopwatch.GetTimestamp() - tDiff);
                     long nowTick = Environment.TickCount64;
                     bool publish = _alwaysPub || diff >= DiffThreshold;
-                    // 小幅漂移(例如光标闪烁、慢速动画)不必按满帧率发布:模糊本身是低频信号,
-                    // 10fps 与 30fps 的观感无差,但每次发布都要整条窗口重呈,省下来的是实打实的 CPU。
-                    if (publish && !_alwaysPub && diff < SmallDiffThreshold && nowTick - _lastPubTick < 100) publish = false;
+                    // 小幅漂移(例如慢速滚动、小面积动画)不必按满帧率发布:每次发布都要整条窗口重呈。
+                    // 但 100ms 的闸门(10fps)在液态玻璃下能看出卡顿,收到 50ms(20fps)——
+                    // 折中:CPU 只多一半,肉眼基本连续。
+                    if (publish && !_alwaysPub && diff < SmallDiffThreshold && nowTick - _lastPubTick < 50) publish = false;
                     if (publish)
                     {
                         _lastPubTick = nowTick;
@@ -941,8 +980,6 @@ namespace DesktopBar.Services
                         Array.Copy(halfRaw, halfBase, halfBase.Length);
                         hasBaseline = true;
                         _staticRun = 0;
-                        if (diff >= SmallDiffThreshold) { if (_motionRun < 100000) _motionRun++; }
-                        else _motionRun = 0;
                         Interlocked.Increment(ref StatPublishes);
                         SchedulePump();   // 有新帧才唤醒 UI 线程(静止时 0 唤醒)
                         if (!loggedSelf)
@@ -961,12 +998,14 @@ namespace DesktopBar.Services
 
                     // 自适应降频:连续静止就拉长采样间隔,静止桌面接近 0 开销;
                     // 任何变化(或被唤醒)都会立刻回到满速。
+                    // 采样间隔就是「玻璃多久看一眼背后」= 用户感知的更新延迟上限,所以不能拉太长了:
+                    // 之前深静止档是 1000ms,桌面静止 22 秒后任何运动都要最多 1 秒才反映到玻璃上,
+                    // 观感就是"液态玻璃卡住了/很慢"。现在上限 250ms(深静止)/120ms(静止),
+                    // 一次 BitBlt 的固定成本约 2.5ms,深静止档常驻约 1%。20fps 的持续大动限帧也已取消,
+                    // 持续运动时直接跑满「帧率上限」设置(默认 30fps)。
                     int delay = spec.FpsMs;
-                    if (_staticRun > 90) delay = 1000;
-                    else if (_staticRun > 30) delay = 250;
-                    // 持续大幅变化(视频/动画壁纸在顶栏背后)时把有效帧率压到 20fps:
-                    // 模糊纹理每 50ms 更新一次肉眼几乎无感,但省掉 1/3 的"整窗重呈"。
-                    else if (_staticRun == 0 && _motionRun > 60) delay = Math.Max(delay, 50);
+                    if (_staticRun > 90) delay = 250;
+                    else if (_staticRun > 30) delay = 120;
                     Thread.Sleep(delay);
                 }
             }
@@ -1114,6 +1153,122 @@ namespace DesktopBar.Services
         private static void SetAlphaOpaque(byte[] px)
         {
             for (int i = 3; i < px.Length; i += 4) px[i] = 255;
+        }
+
+
+        /// <summary>
+        /// 展开页版液态玻璃:在 CPU 上一次性烘焙(不挂 ShaderEffect)。
+        /// 展开页是"一次性静态捕获",不像顶栏每帧重来,所以直接把着色器那套数学搬到 CPU:
+        /// 圆角矩形 SDF → 轮廓内侧一圈用**未模糊**帧折射采样(RGB 三通道错位做色散)→ 叠边缘光。
+        /// 这样面板与胶囊观感完全一致,且不依赖 WPF Effect——面板是独立窗口 + 背景画刷,
+        /// 给画刷挂 Effect 会牵动整窗重呈,得不偿失。
+        /// rect 参数是面板在半分辨率捕获图里的像素矩形。
+        /// </summary>
+        private static void BakeLiquidPanel(byte[] body, byte[] sharp, int w, int h,
+            double rectX, double rectY, double rectW, double rectH, double radius,
+            double refr, double rim, double chroma, double band, double sheen)
+        {
+            if (band < 1.0) band = LiquidEdgeBand;
+            if (body == null || w < 8 || h < 8 || rectW < 2 || rectH < 2) return;
+            double cx = rectX + rectW * 0.5, cy = rectY + rectH * 0.5;
+            double hx = Math.Max(0.5, rectW * 0.5), hy = Math.Max(0.5, rectH * 0.5);
+            double rad = Math.Max(0, Math.Min(radius, Math.Min(hx, hy) - 0.5));
+            bool lensOn = sharp != null && sharp.Length == body.Length && (refr > 0.001 || chroma > 0.001);
+            // 只扫轮廓带(面板矩形外扩 8px 的环形区域),面板内部纯 body 不重算。
+            double pad = band + 4;
+            int x0 = Math.Max(0, (int)Math.Floor(rectX - pad));
+            int x1 = Math.Min(w - 1, (int)Math.Ceiling(rectX + rectW + pad));
+            int y0 = Math.Max(0, (int)Math.Floor(rectY - pad));
+            int y1 = Math.Min(h - 1, (int)Math.Ceiling(rectY + rectH + pad));
+            const double e = 2.0;
+            for (int y = y0; y <= y1; y++)
+            {
+                for (int x = x0; x <= x1; x++)
+                {
+                    double px = x + 0.5, py = y + 0.5;
+                    double d = SdRoundRect(px, py, cx, cy, hx, hy, rad);
+                    if (Math.Abs(d) >= band) continue;   // 带外不动(body 保持模糊)
+                    double edge = 1.0 - Math.Abs(d) / band;
+                    if (edge <= 0) continue;
+                    double e2 = edge * edge;
+                    double gx = SdRoundRect(px + e, py, cx, cy, hx, hy, rad) - SdRoundRect(px - e, py, cx, cy, hx, hy, rad);
+                    double gy = SdRoundRect(px, py + e, cx, cy, hx, hy, rad) - SdRoundRect(px, py - e, cx, cy, hx, hy, rad);
+                    double gl = Math.Sqrt(gx * gx + gy * gy) + 1e-4;
+                    double nx = gx / gl, ny = gy / gl;
+                    // 带宽变大时位移同比例放大:透镜的"折角"是物理量,带越宽走得越远,否则宽边只会变糊
+                    double dispScale = LiquidDispScale * (band / LiquidEdgeBand);
+                    double dxs = nx * refr * e2 * dispScale;
+                    double dys = ny * refr * e2 * dispScale;
+                    int i = (y * w + x) * 4;
+                    double cb = body[i], cg = body[i + 1], cr = body[i + 2];
+                    if (lensOn)
+                    {
+                        double ca = chroma * e2 * LiquidChromaScale;
+                        // 三个通道各自位移采样:边缘出现极轻微的红/蓝分离,是液态玻璃的标志性色散
+                        SampleBilinear(sharp, w, h, px + dxs * (1.0 + ca), py + dys * (1.0 + ca), out _, out _, out double lr);
+                        SampleBilinear(sharp, w, h, px + dxs, py + dys, out _, out double lg, out _);
+                        SampleBilinear(sharp, w, h, px + dxs * (1.0 - ca), py + dys * (1.0 - ca), out double lb, out _, out _);
+                        double mix = Math.Min(1.0, e2 * 1.1) * 0.85;
+                        cb = cb * (1 - mix) + lb * mix;
+                        cg = cg * (1 - mix) + lg * mix;
+                        cr = cr * (1 - mix) + lr * mix;
+                    }
+                    // 轮廓内侧一圈亮边(与 HLSL 同口径:rim*edge²*saturate(-d/6+0.5)*0.5)
+                    double rimTerm = rim * e2 * Math.Min(1.0, Math.Max(0.0, -d / band + 0.5)) * 0.5 * 255.0;
+                    cb += rimTerm; cg += rimTerm; cr += rimTerm;
+                    if (sheen > 0.001)
+                    {
+                        // 方向光(左上方)在斜面上打出高光、右下方压暗:玻璃厚板的"体积感"靠这一对比,
+                        // 否则面板内部只是均匀半透明色,看起来像塑料片。
+                        double dotL = -(nx * 0.55 + ny * 0.83);
+                        double lit = Math.Max(0.0, dotL), shade = Math.Max(0.0, -dotL);
+                        double sh = sheen * e2 * (lit - shade * 0.55) * 255.0 * 0.35;
+                        cb += sh; cg += sh; cr += sh;
+                    }
+                    body[i] = ClampByte(cb);
+                    body[i + 1] = ClampByte(cg);
+                    body[i + 2] = ClampByte(cr);
+                }
+            }
+        }
+
+        private const double LiquidEdgeBand = 6.0;    // 折射带宽度(半分辨率像素),与 HLSL 的 6.0 一致
+        private const double LiquidDispScale = 14.0;  // 折射位移上限,与 HLSL 的 14.0 一致
+        private const double LiquidChromaScale = 0.08;
+
+        /// <summary>圆角矩形有向距离场(与着色器里的 sd() 同一公式,内部为负)。</summary>
+        private static double SdRoundRect(double px, double py, double cx, double cy,
+            double hx, double hy, double radius)
+        {
+            double qx = Math.Abs(px - cx) - hx + radius;
+            double qy = Math.Abs(py - cy) - hy + radius;
+            double mx = Math.Max(qx, 0), my = Math.Max(qy, 0);
+            return Math.Sqrt(mx * mx + my * my) + Math.Min(Math.Max(qx, qy), 0) - radius;
+        }
+
+        private static byte ClampByte(double v)
+        {
+            if (v <= 0) return 0;
+            if (v >= 255) return 255;
+            return (byte)(v + 0.5);
+        }
+
+        /// <summary>双线性采样 BGRA 缓冲(越界钳边),用于 CPU 折射。</summary>
+        private static void SampleBilinear(byte[] px, int w, int h, double sx, double sy,
+            out double b, out double g, out double r)
+        {
+            if (sx < 0) sx = 0; else if (sx > w - 1) sx = w - 1;
+            if (sy < 0) sy = 0; else if (sy > h - 1) sy = h - 1;
+            int ix = (int)sx, iy = (int)sy;
+            double fx = sx - ix, fy = sy - iy;
+            int ix1 = ix + 1 < w ? ix + 1 : ix;
+            int iy1 = iy + 1 < h ? iy + 1 : iy;
+            int i00 = (iy * w + ix) * 4, i01 = (iy * w + ix1) * 4;
+            int i10 = (iy1 * w + ix) * 4, i11 = (iy1 * w + ix1) * 4;
+            double w00 = (1 - fx) * (1 - fy), w01 = fx * (1 - fy), w10 = (1 - fx) * fy, w11 = fx * fy;
+            b = px[i00] * w00 + px[i01] * w01 + px[i10] * w10 + px[i11] * w11;
+            g = px[i00 + 1] * w00 + px[i01 + 1] * w01 + px[i10 + 1] * w10 + px[i11 + 1] * w11;
+            r = px[i00 + 2] * w00 + px[i01 + 2] * w01 + px[i10 + 2] * w10 + px[i11 + 2] * w11;
         }
 
         /// <summary>把染色直接烘进像素(展开页没有 WPF 染色层,一次性捕获顺手烘焙)。</summary>

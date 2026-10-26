@@ -49,6 +49,7 @@ namespace DesktopBar.Services
         }
 
         private static bool _skipPanels;
+        private static string _only;          // --only=<片段>:只取证匹配的模块
         private static bool _skipWallpaper;   // --nopanels:只抓顶栏,迭代时省掉每面板 2.3s
         private static string _originalWallpaper;
         private static readonly List<string> _log = new List<string>();
@@ -64,6 +65,15 @@ namespace DesktopBar.Services
             _skipPanels = Array.IndexOf(args ?? Array.Empty<string>(), "--nopanels") >= 0;
             // --nobg:不换测试壁纸,直接在用户当前壁纸下取证(给"看一眼真实观感"用)
             _skipWallpaper = Array.IndexOf(args ?? Array.Empty<string>(), "--nobg") >= 0;
+            // --only=<片段>:只取证名字里含该片段的模块(调参时把一轮 27s 压到几秒)
+            foreach (var a in args ?? Array.Empty<string>())
+            {
+                if (a != null && a.StartsWith("--only=", StringComparison.Ordinal))
+                {
+                    _only = a.Substring(7).ToLowerInvariant();
+                    break;
+                }
+            }
             Application.Current.ShutdownMode = ShutdownMode.OnExplicitShutdown;
             Application.Current.Dispatcher.BeginInvoke(new Action(async () => await RunAsync()));
         }
@@ -299,12 +309,13 @@ namespace DesktopBar.Services
                 double busyMs = (bu1 - bu0) * 1000.0 / Stopwatch.Frequency;
                 long frames = f1 - f0;
                 Note(string.Format(
-                    "性能[区间] {0}s CPU={1:F2}%(单核) 捕获帧={2} BitBlt={3} 发布={4} 捕获忙={5:F1}ms 均={6:F2}ms/帧 CPU增量={7:F2}s 线程={8} 工作集={9:F0}MB 泵={10} 写帧={11} 写锐帧={12}",
+                    "性能[区间] {0}s CPU={1:F2}%(单核) 捕获帧={2} BitBlt={3} 发布={4} 更新fps={13:F1} 捕获忙={5:F1}ms 均={6:F2}ms/帧 CPU增量={7:F2}s 线程={8} 工作集={9:F0}MB 泵={10} 写帧={11} 写锐帧={12}",
                     secs, (c1 - c0) / secs * 100.0, frames, b1 - b0, s1 - s0, busyMs,
                     frames > 0 ? busyMs / frames : 0.0, c1 - c0, p.Threads.Count, p.WorkingSet64 / 1048576.0,
                     System.Threading.Interlocked.Read(ref GlassService.StatPumps) - pu0,
                     System.Threading.Interlocked.Read(ref GlassService.StatWrites) - wr0,
-                    System.Threading.Interlocked.Read(ref GlassService.StatSharpWrites) - sw0));
+                    System.Threading.Interlocked.Read(ref GlassService.StatSharpWrites) - sw0,
+                    (s1 - s0) / (double)secs));
                 // 按线程看 CPU 增量:定位"到底是哪个线程在烧",比只看进程总账有用得多。
                 var t1 = ThreadCpu();
                 var rows = new List<string>();
@@ -385,6 +396,7 @@ namespace DesktopBar.Services
                     string name = "?";
                     try { hasPanel = m.DiagnosticHasPanel; name = m.DiagnosticName; } catch { }
                     if (!hasPanel) continue;
+                    if (!string.IsNullOrEmpty(_only) && !name.ToLowerInvariant().Contains(_only)) continue;
                     try
                     {
                         m.ShowPanel();

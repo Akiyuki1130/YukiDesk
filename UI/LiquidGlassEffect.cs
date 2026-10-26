@@ -41,6 +41,11 @@ namespace DesktopBar.UI
         public double Rim { get { return (double)GetValue(RimProperty); } set { SetValue(RimProperty, value); } }
         /// <summary>色散强度(0..1,边缘 RGB 错位)。</summary>
         public double Chroma { get { return (double)GetValue(ChromaProperty); } set { SetValue(ChromaProperty, value); } }
+        /// <summary>斜面明暗(0..1):方向光在轮廓斜面上打高光、背光侧压暗,给玻璃"厚度"。</summary>
+        public static readonly DependencyProperty SheenProperty = DependencyProperty.Register(
+            "Sheen", typeof(double), typeof(LiquidGlassEffect),
+            new UIPropertyMetadata(1.0, PixelShaderConstantCallback(6)));
+        public double Sheen { get { return (double)GetValue(SheenProperty); } set { SetValue(SheenProperty, value); } }
 
         private LiquidGlassEffect(byte[] bytecode, double radiusPx, double texW, double texH)
         {
@@ -137,6 +142,7 @@ namespace DesktopBar.UI
             sb.AppendLine("float pRadius : register(c3);");
             sb.AppendLine("float pTexW : register(c4);");
             sb.AppendLine("float pTexH : register(c5);");
+            sb.AppendLine("float pSheen : register(c6);");
             sb.AppendLine(@"
 float sd(float cx, float cy, float hx, float hy, float2 p)
 {
@@ -209,6 +215,13 @@ float field(float2 p)
     // 轮廓内侧一圈亮边(压薄一点,否则远景看就是白描边)
     float rim = pRim * edge * edge * saturate(-d / 6.0 + 0.5);
     col += rim * 0.5;
+    // 方向光(左上)在斜面上打高光、右下侧压暗:玻璃厚板的体积感靠这一对比,
+    // 否则胶囊内部只是均匀半透明色,大块面板尤其像塑料片(与 CPU 烘焙面板同一口径)。
+    float dotL = -(n.x * 0.55 + n.y * 0.83);
+    float lit = max(dotL, 0.0);
+    float shade = max(-dotL, 0.0);
+    float sheen = pSheen * edge * edge * (lit - shade * 0.55);
+    col += sheen * 0.35;
     col = saturate(col);
     // ---- 调试档(SM3 下构造函数/隐式转换很挑,统一用分量赋值,别用 float4(x,y,z,w) 混类型) ----
     if (DEBUG_MODE == 2) { float4 c0 = tex2D(Input, uv); c0.rgb = edge; c0.a = 1.0; return c0; }
