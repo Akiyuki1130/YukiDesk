@@ -78,6 +78,8 @@ namespace DesktopBar.Services
         internal static long StatWrites;        // 实际 WritePixels 到模糊位图的次数
         internal static long StatSharpWrites;   // 实际 WritePixels 到未模糊位图的次数(仅液态玻璃)
         internal static long StatPanelFrames;   // 展开页实时玻璃真正发布的帧数(静态时为 0)
+        internal static long StatDxgiIdle;      // GPU 捕获:等不到新合成帧的次数(桌面没变化,零成本)
+        internal static long StatDxgiSkip;      // GPU 捕获:拿到帧但脏矩形不碰顶栏条带,整帧跳过
         // 分阶段耗时(Stopwatch 刻度):定位"4~5ms 一帧到底花在哪"
         internal static long StatBlitTicks, StatDownTicks, StatDiffTicks, StatBlurTicks;
         internal static bool HasFrame { get { return _latest != null; } }
@@ -123,14 +125,29 @@ namespace DesktopBar.Services
         private static long _pubCaptureTick;
         private static double _latLastMs, _latSumMs, _latMaxMs;
         private static int _latCount;
+        // 「捕获开始 → WPF 开始渲染这一帧」= 端到端管线延迟(一个屏幕刷新周期 ≈ 一帧)。
+        // 只在 --glassperf 里临时订阅 CompositionTarget.Rendering:常驻订阅会让 WPF 渲染循环永不歇,白烧 CPU。
+        private static EventHandler _latRenderHook;
+        private static long _latRenderSeen;
+        private static double _latRenderLastMs, _latRenderSumMs, _latRenderMaxMs;
+        private static int _latRenderCount, _renderFrames;
+        private static long _renderStartTick;
         // 诊断开关:跳过静止差分门控,强制每帧发布(=模拟"顶栏背后一直在动"的最坏情况,如动态壁纸/视频)。
         private static bool _alwaysPub;
+
+        // GPU 捕获(DXGI Desktop Duplication)。抓一帧约 0.35ms(BitBlt 是 3.5~6ms),
+        // 而且 AcquireNextFrame 会阻塞到下一次桌面合成 → 节拍自动等于刷新率、端到端只延迟一帧。
+        // 设备初始化失败(老系统/受保护内容/会话被占用)时回退 GDI,功能不受影响。
+        private static DxgiCapture _dxgi;
+        private static bool _dxgiTried;
 
         /// <summary>App 启动时调用:只订阅事件,不开线程。真正的开销由 EnsureHost(材质=3)驱动。</summary>
         internal static void Start()
         {
             _testSrc = Environment.GetEnvironmentVariable("YUKI_GLASS_TESTSRC") == "1";
             _alwaysPub = Environment.GetEnvironmentVariable("YUKI_GLASS_ALWAYS_PUB") == "1";
+            // 注意:这里**不**建 GPU 捕获会话。材质=0 时连 D3D 设备都不该创建
+            // (D3D11 会带出 30+ 条驱动线程),真正需要时由捕获线程懒建(EnsureDxgi)。
             if (_started || _stopped) return;
             _started = true;
             try { Microsoft.Win32.SystemEvents.DisplaySettingsChanged += OnDisplaySettingsChanged; } catch { }
@@ -158,25 +175,74 @@ namespace DesktopBar.Services
             _wake.Set();
         }
 
+        /// <summary>开启/关闭渲染侧延迟探针(只给性能自检用,平时必须关掉)。</summary>
+        internal static void SetRenderLatencyProbe(bool on)
+        {
+            try
+            {
+                if (on)
+                {
+                    if (_latRenderHook != null) return;
+                    _latRenderLastMs = _latRenderSumMs = _latRenderMaxMs = 0;
+                    _latRenderCount = 0;
+                    _renderFrames = 0;
+                    _renderStartTick = Environment.TickCount64;
+                    _latRenderSeen = 0;
+                    _latRenderHook = (s, e) =>
+                    {
+                        _renderFrames++;
+                        long ct = Interlocked.Read(ref _pubCaptureTick);
+                        if (ct == 0 || ct == Interlocked.Read(ref _latRenderSeen)) return;
+                        Interlocked.Exchange(ref _latRenderSeen, ct);
+                        double ms = (System.Diagnostics.Stopwatch.GetTimestamp() - ct) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+                        _latRenderLastMs = ms;
+                        _latRenderSumMs += ms;
+                        if (ms > _latRenderMaxMs) _latRenderMaxMs = ms;
+                        _latRenderCount++;
+                    };
+                    System.Windows.Media.CompositionTarget.Rendering += _latRenderHook;
+                }
+                else if (_latRenderHook != null)
+                {
+                    System.Windows.Media.CompositionTarget.Rendering -= _latRenderHook;
+                    _latRenderHook = null;
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>渲染侧统计:实际渲染帧率 + 「捕获开始→开始渲染」延迟(端到端管线延迟,1 帧≈一个刷新周期)。</summary>
+        internal static string RenderLatencyReport()
+        {
+            long ms = Environment.TickCount64 - _renderStartTick;
+            double fps = ms <= 0 ? 0.0 : _renderFrames * 1000.0 / ms;
+            return string.Format("渲染帧={0} 渲染帧率={1:F1}fps 捕获→开始渲染={2:F1}/{3:F1}/{4:F1}ms(末/均/峰) 样本={5}",
+                _renderFrames, fps, _latRenderLastMs,
+                _latRenderCount == 0 ? 0.0 : _latRenderSumMs / _latRenderCount, _latRenderMaxMs, _latRenderCount);
+        }
+
         /// <summary>诊断快照:一行人类可读状态,写进日志/取证目录。</summary>
         internal static string DiagnosticSnapshot()
         {
             var s = App.Settings;
             var spec = _spec;
             double busyMs = StatBusyTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            string fpsText = spec == null ? "?" : (spec.FpsMs <= 0 ? "不限" : Math.Round(1000.0 / spec.FpsMs).ToString("F0"));
             return string.Format(
-                "材质={0} 启用={1} 采样规格={2}x{3}(半分辨率 {4}x{5}) 捕获帧={6} 发布={7} BitBlt={8} 累计忙={9:F1}ms 液态着色器={10} 帧率上限={11} 泵tick={12} 写帧={13} 写锐帧={14} 面板帧={15} 捕获→写屏={16:F1}/{17:F1}/{18:F1}ms(末/均/峰) 捕获相位={19}",
+                "材质={0} 启用={1} 采样规格={2}x{3}(半分辨率 {4}x{5}) 捕获帧={6} 发布={7} BitBlt={8} 累计忙={9:F1}ms 液态着色器={10} 帧率上限={11} 泵tick={12} 写帧={13} 写锐帧={14} 面板帧={15} 捕获→写屏={16:F1}/{17:F1}/{18:F1}ms(末/均/峰) 捕获相位={19} GPU捕获={20} 空等={21} 脏区跳过={22}",
                 s == null ? -1 : s.PillMaterial, _enabled,
                 spec == null ? 0 : spec.Width, spec == null ? 0 : spec.Height,
                 _latestW, _latestH,
                 Interlocked.Read(ref StatFrames), Interlocked.Read(ref StatPublishes),
                 Interlocked.Read(ref StatBlits), busyMs,
                 _liquid == null ? "无(降级普通玻璃)" : "已启用",
-                spec == null ? 0 : Math.Round(1000.0 / Math.Max(1, spec.FpsMs)),
+                fpsText,
                 Interlocked.Read(ref StatPumps), Interlocked.Read(ref StatWrites), Interlocked.Read(ref StatSharpWrites),
                 Interlocked.Read(ref StatPanelFrames),
                 _latLastMs, _latCount == 0 ? 0.0 : _latSumMs / _latCount, _latMaxMs,
-                _loopPhase);
+                _loopPhase,
+                _dxgi == null ? "无(回退GDI)" : "DXGI",
+                Interlocked.Read(ref StatDxgiIdle), Interlocked.Read(ref StatDxgiSkip));
         }
 
         /// <summary>取证:把当前发布的玻璃输入帧(半分辨率模糊结果)另存为 PNG。</summary>
@@ -209,8 +275,25 @@ namespace DesktopBar.Services
             _enabled = false;
             _stopThread = true;
             _wake.Set();
-            try { _thread?.Join(1200); } catch { }
+            // 等捕获线程真的退出再释放 GPU 会话:线程若还卡在 AcquireNextFrame/CopyBand 原生调用里
+            // 就被 Dispose 掉设备,会踩到已释放的 D3D 对象(进程退出瞬间随机 AV/异常退出码)。
+            try
+            {
+                for (int i = 0; i < 20 && _thread != null && _thread.IsAlive; i++)
+                {
+                    _wake.Set();
+                    _thread.Join(100);
+                }
+            }
+            catch { }
+            TraceStop("join 结束 alive=" + (_thread != null && _thread.IsAlive));
+            bool captureGone = _thread == null || !_thread.IsAlive;
+            DxgiCapture dx = captureGone ? _dxgi : null;   // 线程还在跑就只丢引用,绝不释放它正在用的原生对象
+            _dxgi = null; _dxgiTried = true;   // 停止后不再重建(重启走 Start)
+            if (dx != null) DisposeDxgiAsync(dx);
+            TraceStop("GPU 会话处理完毕");
             RestoreExclusionAll();
+            TraceStop("WDA 已还原");
             try { if (_host != null && _host.Parent is Panel p) p.Children.Remove(_host); } catch { }
             _host = null; _image = null; _tint = null; _wb = null; _thread = null;
             Interlocked.Exchange(ref _pumpQueued, 0);
@@ -651,16 +734,25 @@ namespace DesktopBar.Services
                     // 一帧没发布就退到 100ms,持续静止再退到 250ms;一旦有变化立刻回满帧率。
                     if (published) _panelStaticRun = 0; else _panelStaticRun++;
                     var s = App.Settings;
-                    int fps = s == null ? 30 : Math.Max(10, Math.Min(300, s.GlassMaxFps));
-                    int budget = 1000 / fps;
+                    // 0 = 不限制(与顶栏同一套语义):按 DWM 合成节拍抓,端到端只延迟一帧
+                    int fps = s == null ? 30 : Math.Max(0, Math.Min(300, s.GlassMaxFps));
+                    int budget = fps <= 0 ? 0 : 1000 / Math.Max(1, fps);
                     if (_panelStaticRun > 40) budget = Math.Max(budget, 250);
                     else if (_panelStaticRun > 12) budget = Math.Max(budget, 100);
                     int spent = (int)((System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1000L / System.Diagnostics.Stopwatch.Frequency);
-                    int wait = budget - spent;
-                    if (wait > 1)
+                    if (budget <= 0)
                     {
-                        _panelWake.Wait(wait - 1);
+                        if (!NativeMethods.WaitComposition()) _panelWake.Wait(15);
                         _panelWake.Reset();
+                    }
+                    else
+                    {
+                        int wait = budget - spent;
+                        if (wait > 1)
+                        {
+                            _panelWake.Wait(wait - 1);
+                            _panelWake.Reset();
+                        }
                     }
                 }
                 catch { try { Thread.Sleep(20); } catch { } }
@@ -884,13 +976,14 @@ namespace DesktopBar.Services
             double blurPhys = Math.Max(1, (s == null ? 24 : s.GlassBlurRadius) * dsy);
             int bleed = (int)Math.Ceiling(blurPhys) + 8;
             int h = (int)Math.Ceiling(barPhysH) + bleed;
-            int fps = s == null ? 30 : Math.Clamp(s.GlassMaxFps, 5, 300);
+            // 帧率上限 0 = 不限制:捕获按 DWM 合成节拍跑(等于屏幕刷新率),不设人为上限
+            int fps = s == null ? 30 : Math.Clamp(s.GlassMaxFps, 0, 300);
             var spec = new GlassSpec
             {
                 Width = Math.Max(16, physW + 1) & ~1,
                 Height = Math.Max(8, h + 1) & ~1,
                 BlurHalf = BoxHalfFor((s == null ? 24 : s.GlassBlurRadius) * dsy),
-                FpsMs = Math.Max(2, 1000 / fps),   // 300fps 也允许:单个捕获周期本身约 4.5ms,会被自然限住
+                FpsMs = fps <= 0 ? 0 : Math.Max(2, 1000 / fps),   // 0=不限制(按合成节拍跑)
                 MidY = Math.Max(4, (int)Math.Ceiling(barPhysH / 2)),
             };
             spec.HalfWidth = spec.Width / 2;
@@ -1134,6 +1227,47 @@ namespace DesktopBar.Services
 
         // ---------- 内部:捕获线程 ----------
 
+        /// <summary>
+        /// 懒建 GPU 捕获会话。失败只记一次日志并回退 GDI BitBlt。
+        /// </summary>
+        /// <summary>
+        /// 释放 GPU 捕获会话。Stop 只在进程退出时调用,而 DXGI 会话的 Release 偶尔会在驱动里
+        /// 卡住(实测卡死 12 秒以上,导致托盘"退出"后进程僵着、exe 被锁、下次启动失败),
+        /// 所以放到后台线程做:最多等 400ms,超时就丢下不管(进程马上结束,系统会回收)。
+        /// </summary>
+        /// <summary>退出期追踪:直接追加到 %TEMP%\yuki-exit.txt,绕开共享日志互斥体(日志锁本身也可能卡住)。</summary>
+        internal static void TraceStop(string what)
+        {
+            try
+            {
+                System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "yuki-exit.txt"),
+                    DateTime.Now.ToString("HH:mm:ss.fff") + " PID=" + System.Diagnostics.Process.GetCurrentProcess().Id + " " + what + Environment.NewLine);
+            }
+            catch { }
+        }
+
+        private static void DisposeDxgiAsync(DxgiCapture dx)
+        {
+            // 实测:在退出路径上 Release IDXGIOutputDuplication/ID3D11Device 有一半概率在显示驱动里
+            // 卡住十几秒甚至直接 AV(进程退出码 139)——这是驱动侧的行为,不是我们引用的生命周期错。
+            // Stop 只在进程退出时调用,所以最稳的做法是**不释放**:直接丢引用,交给系统在建进程销毁时回收。
+            // 唯一代价是退出瞬间多占约 8MB 显存,进程结束后消失。
+            TraceStop("跳过 GPU 显式释放(避免驱动卡死),引用已丢弃");
+        }
+
+        private static void EnsureDxgi()
+        {
+            if (_dxgi != null || _dxgiTried) return;
+            _dxgiTried = true;
+            // 对照/兜底开关:强制走 GDI(排查"GPU 捕获是否影响观感/稳定性"时用)。
+            if (Environment.GetEnvironmentVariable("YUKI_GLASS_GDI") == "1") return;
+            try { _dxgi = DxgiCapture.TryCreate(); } catch (Exception ex) { _dxgi = null; try { App.Log("玻璃:GPU 捕获异常 " + ex.Message); } catch { } }
+            if (_dxgi != null)
+            {
+                try { App.Log(string.Format("玻璃:GPU 捕获已启用(DXGI Desktop Duplication {0}x{1}),AcquireNextFrame 自带合成节拍", _dxgi.Width, _dxgi.Height)); } catch { }
+            }
+        }
+
         private static void CaptureLoop()
         {
             GlassDiagnostics.TagThread("玻璃捕获");
@@ -1167,6 +1301,8 @@ namespace DesktopBar.Services
                         Thread.Sleep(50);
                         continue;
                     }
+                    // 会话失效/首次进入时懒建 GPU 捕获(失败则永远走 GDI)。
+                    if (_dxgi == null && !_dxgiTried) EnsureDxgi();
 
                     if (capW != spec.Width || capH != spec.Height)
                     {
@@ -1216,18 +1352,64 @@ namespace DesktopBar.Services
                         continue;
                     }
 
-                    long busyStart = System.Diagnostics.Stopwatch.GetTimestamp();
-                    Interlocked.Increment(ref StatFrames);
-                    if (!NativeMethods.BlitStrip(memoryDc, capW, capH, screenDc, 0, 0))
+                    long busyStart;
+                    if (_dxgi != null)
                     {
-                        _loopPhase = 6;
-                        Thread.Sleep(250);
-                        continue;
+                        // 等下一次桌面合成:静止时超时返回(完全不产生 CPU 负载),有变化时立刻返回。
+                        int waitMs = spec.FpsMs <= 0 ? 100 : Math.Min(100, Math.Max(1, spec.FpsMs));
+                        int acq = _dxgi.Acquire(waitMs);
+                        if (acq == 1)
+                        {
+                            Interlocked.Increment(ref StatDxgiIdle);
+                            continue;
+                        }
+                        if (acq != 0)
+                        {
+                            // 会话失效:切分辨率/全屏独占/安全桌面。丢掉重建,期间这一轮先跳过。
+                            try { _dxgi.Dispose(); } catch { }
+                            _dxgi = null;
+                            _dxgiTried = false;
+                            hasBaseline = false;
+                            _loopPhase = 8;
+                            Thread.Sleep(300);
+                            continue;
+                        }
+                        if (hasBaseline && !_dxgi.BandDirty(0, 0, capW, capH))
+                        {
+                            // 脏矩形不碰顶栏条带:这一帧与玻璃无关,连读回都省。
+                            _dxgi.ReleaseFrame();
+                            Interlocked.Increment(ref StatDxgiSkip);
+                            continue;
+                        }
+                        Interlocked.Increment(ref StatFrames);
+                        Interlocked.Increment(ref StatBlits);
+                        long startD = System.Diagnostics.Stopwatch.GetTimestamp();
+                        bool copied = _dxgi.CopyBand(0, 0, capW, capH, full);
+                        _dxgi.ReleaseFrame();
+                        if (!copied)
+                        {
+                            _loopPhase = 6;
+                            Thread.Sleep(50);
+                            continue;
+                        }
+                        Interlocked.Add(ref StatBlitTicks, System.Diagnostics.Stopwatch.GetTimestamp() - startD);
+                        busyStart = startD;
                     }
-                    Interlocked.Increment(ref StatBlits);
-                    long tBlit = System.Diagnostics.Stopwatch.GetTimestamp();
-                    Marshal.Copy(bits, full, 0, full.Length);
-                    Interlocked.Add(ref StatBlitTicks, System.Diagnostics.Stopwatch.GetTimestamp() - tBlit);
+                    else
+                    {
+                        busyStart = System.Diagnostics.Stopwatch.GetTimestamp();
+                        Interlocked.Increment(ref StatFrames);
+                        if (!NativeMethods.BlitStrip(memoryDc, capW, capH, screenDc, 0, 0))
+                        {
+                            _loopPhase = 6;
+                            Thread.Sleep(250);
+                            continue;
+                        }
+                        Interlocked.Increment(ref StatBlits);
+                        long tBlit = System.Diagnostics.Stopwatch.GetTimestamp();
+                        Marshal.Copy(bits, full, 0, full.Length);
+                        Interlocked.Add(ref StatBlitTicks, System.Diagnostics.Stopwatch.GetTimestamp() - tBlit);
+                    }
                     long tDown = System.Diagnostics.Stopwatch.GetTimestamp();
                     Downsample2x(full, capW, capH, halfRaw, hw, hh);
                     Interlocked.Add(ref StatDownTicks, System.Diagnostics.Stopwatch.GetTimestamp() - tDown);
@@ -1289,8 +1471,35 @@ namespace DesktopBar.Services
                     // 一次 BitBlt 的固定成本约 2.5ms,深静止档常驻约 1%。20fps 的持续大动限帧也已取消,
                     // 持续运动时直接跑满「帧率上限」设置(默认 30fps)。
                     _loopPhase = 7;
+                    if (_dxgi != null)
+                    {
+                        // GPU 捕获自带节拍(AcquireNextFrame 卡在合成上),但本机 DWM 是持续 300Hz 合成的,
+                        // 长时间没有东西要显示时每帧唤醒(脏矩形查询+同步)也要约 15% 单核。
+                        // 所以"无事发生"时照样退避:休眠期间屏幕变化最多晚 30~120ms 才被发现(与旧 GDI 档位一致)。
+                        long idleMsD = Environment.TickCount64 - _lastPubTick;
+                        if (idleMsD > 400)
+                        {
+                            Thread.Sleep(idleMsD > 1200 ? 250 : 30);
+                            continue;
+                        }
+                        long spentTicks = System.Diagnostics.Stopwatch.GetTimestamp() - busyStart;
+                        int spent = (int)(spentTicks * 1000L / System.Diagnostics.Stopwatch.Frequency);
+                        if (spec.FpsMs > spent) Thread.Sleep(spec.FpsMs - spent);
+                        continue;
+                    }
                     int delay = spec.FpsMs;
                     long idleMs = Environment.TickCount64 - _lastPubTick;
+                    if (delay <= 0)
+                    {
+                        // 不限制帧率:节拍交给合成器。DwmFlush 在下一次合成完成后返回,
+                        // 紧接着抓屏(约 5ms)→ 发布 → UI 线程写位图,仍赶得上这一轮渲染提交,
+                        // 所以端到端只延迟一帧(以前固定 Sleep 会和合成节拍错相,经常晚一帧)。
+                        // 背后完全静止时仍降频:60Hz 常驻 BitBlt 会白烧约 15% 单核。
+                        if (idleMs > 1200) Thread.Sleep(60);
+                        else if (idleMs > 400) Thread.Sleep(30);
+                        else if (!NativeMethods.WaitComposition()) Thread.Sleep(16);
+                        continue;
+                    }
                     if (idleMs > 1200) delay = 250;
                     else if (idleMs > 400) delay = 120;
                     Thread.Sleep(delay);

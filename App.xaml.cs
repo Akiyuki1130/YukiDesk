@@ -439,20 +439,31 @@ namespace DesktopBar
 
         protected override void OnExit(ExitEventArgs e)
         {
+            // 退出过程留痕:自检(--glassperf/--glassshot)结束时会对比这两行的落盘顺序,
+            // 判断"进程是正常走完拆解"还是"在拆解途中被原生层带走"。
+            try { Log("YukiDesk 退出开始,代码=" + e.ApplicationExitCode); } catch { }
+            // 每个拆解步骤都留痕(带毫秒耗时):退出偶发卡死时,一眼就能看出卡在哪一步。
             // 只阻止新操作;已经在跑的后台复制/移动必须等它收尾,否则进程退出会留下半份文件。
-            try { UI.OperationProgressDialog.BeginShutdown(); } catch { }
-            try { UI.OperationProgressDialog.WaitForIdle(5000); } catch { }
-            try { Services.UpdateService.StopAutoCheck(); } catch { }
-            try { Services.ThemeService.Stop(); } catch { }
-            try { Services.MicaService.Stop(); } catch { }
+            System.Diagnostics.Stopwatch swExit = System.Diagnostics.Stopwatch.StartNew();
+            Action<string, Action> step = (name, act) =>
+            {
+                try { act(); } catch { }
+                try { Services.GlassService.TraceStop("OnExit 步骤 " + name + " 用时=" + swExit.ElapsedMilliseconds + "ms"); } catch { }
+                try { Log("退出步骤 " + name + " 用时=" + swExit.ElapsedMilliseconds + "ms"); } catch { }
+            };
+            step("操作对话框", () => { UI.OperationProgressDialog.BeginShutdown(); UI.OperationProgressDialog.WaitForIdle(5000); });
+            step("更新检查", () => Services.UpdateService.StopAutoCheck());
+            step("主题服务", () => Services.ThemeService.Stop());
+            step("云母服务", () => Services.MicaService.Stop());
             // 玻璃捕获线程引用主窗几何与位图,必须在主窗 Close 之前停(下一位就是 Restore/Close)。
-            try { Services.GlassService.Stop(); } catch { }
-            try { DesktopSpaceService.Restore(); } catch { }
+            step("玻璃服务", () => Services.GlassService.Stop());
+            step("AppBar还原", () => DesktopSpaceService.Restore());
             try { if (_tray != null) { _tray.Visible = false; _tray.Dispose(); } } catch { }
             try { _trayIcon?.Dispose(); } catch { }
             try { Bar?.ClosePanels(); } catch { }
             try { Bar?.Close(); } catch { }
             try { SpectrumService.Instance.Stop(); } catch { }
+            try { Log("YukiDesk 退出拆解完成"); } catch { }
             try { _logMutex?.Dispose(); } catch { }
             base.OnExit(e);
         }

@@ -136,7 +136,7 @@ namespace DesktopBar.Services
             s.GlassBlurRadius = Clamp(s.GlassBlurRadius, 4, 60, 24);
             s.GlassTint = NormalizeColor(s.GlassTint, "#14141C");
             s.GlassTintOpacity = Clamp(s.GlassTintOpacity, 0, 1, 0.18);
-            s.GlassMaxFps = Math.Clamp(s.GlassMaxFps, 5, 300);
+            s.GlassMaxFps = Math.Clamp(s.GlassMaxFps, 0, 300);   // 0 = 不限制(捕获按屏幕合成节拍跑)
             s.GlassGapFill = Clamp(s.GlassGapFill, 0, 1, 0);
             s.GlassRefraction = Clamp(s.GlassRefraction, 0, 1, 0.45);
             s.GlassRim = Clamp(s.GlassRim, 0, 1, 0.5);

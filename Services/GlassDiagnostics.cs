@@ -304,13 +304,15 @@ namespace DesktopBar.Services
                 var bar = MainWindow.Bar;
                 if (bar != null) bar.LayoutUpdated += (s, e) => System.Threading.Interlocked.Increment(ref layout0);
                 var t0 = ThreadCpu();
+                GlassService.SetRenderLatencyProbe(true);       // 量「捕获开始→开始渲染」的端到端管线延迟
                 Note("性能[起点] " + GlassService.DiagnosticSnapshot());
                 try
                 {
                     int tier = System.Windows.Media.RenderCapability.Tier >> 16;
                     Note("性能[渲染] Tier=" + tier + "(0=软件 1=部分硬件 2=全硬件) RenderMode="
                         + System.Windows.Media.RenderOptions.ProcessRenderMode
-                        + " 屏幕=" + NativeMethods.ScreenWidth() + "x" + NativeMethods.ScreenHeight());
+                        + " 屏幕=" + NativeMethods.ScreenWidth() + "x" + NativeMethods.ScreenHeight()
+                        + " 刷新率=" + NativeMethods.ScreenRefreshHz() + "Hz");
                 }
                 catch { }
                 await Task.Delay(secs * 1000);
@@ -365,6 +367,9 @@ namespace DesktopBar.Services
                     msOf(bl0, System.Threading.Interlocked.Read(ref GlassService.StatBlurTicks), s1 - s0)));
                 Note("性能[布局] LayoutUpdated=" + System.Threading.Interlocked.Read(ref layout0) + " 次/" + secs + "s");
                 if (openPanel != null) { try { Note("性能[面板] 状态 " + GlassService.DiagnosticPanelState() + " 动画属性=" + openPanel.DiagnosticPanelAnimated + " " + openPanel.DiagnosticPanelTransform); openPanel.ClosePanelImmediately(); } catch { } }
+                // 端到端延迟:捕获开始 → WPF 开始渲染含这帧的绘制(1 帧 ≈ 一个刷新周期 ≈ 16.7ms)
+                Note("性能[延迟] " + GlassService.RenderLatencyReport());
+                GlassService.SetRenderLatencyProbe(false);
             if (hideBar && probeBar != null) { try { probeBar.Show(); } catch { } }
                 Note("性能[终点] " + GlassService.DiagnosticSnapshot());
             }

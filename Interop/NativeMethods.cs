@@ -697,6 +697,40 @@ namespace DesktopBar.Interop
             catch { return false; }
         }
 
+        // ---------- 合成节拍(dwmapi / gdi32) ----------
+
+        [DllImport("dwmapi.dll")]
+        private static extern int DwmFlush();
+
+        [DllImport("gdi32.dll")]
+        private static extern int GetDeviceCaps(IntPtr hdc, int index);
+
+        /// <summary>
+        /// 阻塞到下一次 DWM 合成(等价于等一次 vsync,约一个屏幕刷新周期)。
+        /// 玻璃的「不限制帧率」模式用它给捕获定节拍:合成一结束立刻抓屏,抓完(约 5ms)
+        /// 还赶得上这一轮的渲染提交,端到端只延迟一帧;顺便避免忙等烧 CPU。
+        /// 合成被禁用(DWM 关闭/远程会话)时返回 false,调用方退回普通 Sleep。
+        /// </summary>
+        internal static bool WaitComposition()
+        {
+            try { return DwmFlush() == 0; } catch { return false; }
+        }
+
+        /// <summary>显示器刷新率(Hz);拿不到返回 0。</summary>
+        internal static int ScreenRefreshHz()
+        {
+            IntPtr dc = IntPtr.Zero;
+            try
+            {
+                dc = GetDC(IntPtr.Zero);
+                if (dc == IntPtr.Zero) return 0;
+                int hz = GetDeviceCaps(dc, 116);   // VREFRESH
+                return hz > 1 ? hz : 0;
+            }
+            catch { return 0; }
+            finally { if (dc != IntPtr.Zero) { try { ReleaseDC(IntPtr.Zero, dc); } catch { } } }
+        }
+
         internal static void DestroyStripCapture(ref IntPtr screenDc, ref IntPtr memoryDc, ref IntPtr dib)
         {
             try { if (dib != IntPtr.Zero) DeleteObject(dib); } catch { }
