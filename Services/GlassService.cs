@@ -317,6 +317,16 @@ namespace DesktopBar.Services
                 return null;
             }
             if (_host == null) BuildElements();
+            // 旧 root 在被新 Content 替换前仍持有玻璃层的父链(逻辑树里 Parent 不会自动清),
+            // 直接 Add 到新 root 会抛「元素已经是另一个元素的逻辑子元素」并中断整次重建
+            // (表现为设置改动不生效 + log 里每改一次一条未处理异常)。先摘离旧父节点。
+            try
+            {
+                if (_host.Parent is Panel oldParent) oldParent.Children.Remove(_host);
+                else if (_host.Parent is ContentControl oldContent) oldContent.Content = null;
+                else if (_host.Parent is Decorator oldDecorator) oldDecorator.Child = null;
+            }
+            catch { }
             RefreshSpec();
             SetEnabled(true);
             // 展开页着色器提前编好:面板几何全走寄存器,同一份字节码服务任意尺寸,
