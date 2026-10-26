@@ -45,8 +45,11 @@ namespace DesktopBar.Interop
         [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int ReleaseFrameFn(IntPtr self);
         [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int CreateTexture2DFn(IntPtr self, IntPtr desc, IntPtr initialData, out IntPtr texture);
         [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int MapFn(IntPtr self, IntPtr resource, uint sub, uint mapType, uint flags, IntPtr mapped);
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int UnmapFn(IntPtr self, IntPtr resource, uint sub);
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int CopyFn(IntPtr self, IntPtr dst, uint dstSub, uint dstX, uint dstY, uint dstZ, IntPtr src, uint srcSub, IntPtr box);
+        // ⚠ ID3D11DeviceContext::Unmap / CopySubresourceRegion 原生返回 void,不是 HRESULT:
+        // 若按 int 声明会把 EAX 里的残留值当返回值,偶尔读出负数(实测 0x8F517520)误判为失败,
+        // 导致整段抓帧全丢(捕获相位=6)且极难复现。
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate void UnmapFn(IntPtr self, IntPtr resource, uint sub);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate void CopyFn(IntPtr self, IntPtr dst, uint dstSub, uint dstX, uint dstY, uint dstZ, IntPtr src, uint srcSub, IntPtr box);
 
         [DllImport("d3d11.dll")]
         private static extern int D3D11CreateDevice(IntPtr adapter, int driverType, IntPtr software, uint flags,
@@ -57,9 +60,24 @@ namespace DesktopBar.Interop
         private byte[] _descBuf;
         private int _stageW, _stageH;
         private IntPtr _stage, _stageDesc;
-        private IntPtr _frameInfo, _mapBuf, _boxBuf, _dirtyBuf;
+        private IntPtr _frameInfo, _mapBuf, _boxBuf, _dirtyBuf, _dirtyReq;
         private uint _dirtyBufSize;
         private bool _hasFrame;
+        // 热路径(静止时每 33ms 一次、跟随时每帧一次)上反复用到的几个方法指针:
+        // Fn<T>() 每次 Marshal.GetDelegateForFunctionPointer 都要分配一个托管委托,
+        // 加上脏矩形查询每次都 AllocHGlobal(4) 再 Free,静止时每秒几十次、跟随时每秒几百次,
+        // 全部提到字段里缓存,避免持续 GC 压力。
+        private AcquireNextFrameFn _acquire;
+        private GetFrameDirtyRectsFn _dirtyRects;
+        private ReleaseFrameFn _idupReleaseFrame;
+        private CreateTexture2DFn _createTexture;
+        private CopyFn _copyRegion;
+        private MapFn _map;
+        private UnmapFn _unmap;
+        private QueryInterfaceFn _qiResource;
+        private ReleaseFn _relResource;
+        private ReleaseFn _relTexture;
+        private IntPtr _resVtbl, _texVtbl;
 
         public int Width { get; private set; }
         public int Height { get; private set; }
@@ -132,8 +150,19 @@ namespace DesktopBar.Interop
             _frameInfo = Marshal.AllocHGlobal(24);
             _mapBuf = Marshal.AllocHGlobal(24);
             _boxBuf = Marshal.AllocHGlobal(24);
+            _dirtyReq = Marshal.AllocHGlobal(4);
+            // 脏矩形缓冲预分配 512 个矩形(8KB):静止时一次脏矩形查询就够,省掉"先问大小再取"的往返。
+            _dirtyBufSize = 512 * 16;
+            _dirtyBuf = Marshal.AllocHGlobal((int)_dirtyBufSize);
             _texSlot = DetectTextureSlot();
             if (_texSlot < 0) return "探测 CreateTexture2D 槽位失败";
+            _acquire = Fn<AcquireNextFrameFn>(_duplication, 8);
+            _dirtyRects = Fn<GetFrameDirtyRectsFn>(_duplication, 9);
+            _idupReleaseFrame = Fn<ReleaseFrameFn>(_duplication, 14);
+            _createTexture = Fn<CreateTexture2DFn>(_device, _texSlot);
+            _copyRegion = Fn<CopyFn>(_context, 46);
+            _map = Fn<MapFn>(_context, 14);
+            _unmap = Fn<UnmapFn>(_context, 15);
             return null;
         }
 
@@ -204,11 +233,21 @@ namespace DesktopBar.Interop
             if (_hasFrame) return 0;
             if (_duplication == IntPtr.Zero) return 2;
             int hr;
-            try { hr = Fn<AcquireNextFrameFn>(_duplication, 8)(_duplication, (uint)Math.Max(0, timeoutMs), _frameInfo, out _resource); }
+            if (_acquire == null) return 2;
+            try { hr = _acquire(_duplication, (uint)Math.Max(0, timeoutMs), _frameInfo, out _resource); }
             catch { return 2; }
             if (hr == 0 && _resource != IntPtr.Zero) { _hasFrame = true; return 0; }
             if (hr == DXGI_ERROR_WAIT_TIMEOUT) return 1;
             return 2;
+        }
+
+        private bool _copyDiag;
+        /// <summary>只写一条失败原因(捕获失败通常每帧都一样,记一次足够)。</summary>
+        private void Diag(string msg)
+        {
+            if (_copyDiag) return;
+            _copyDiag = true;
+            try { DesktopBar.App.Log("[dxgi] CopyBand " + msg); } catch { }
         }
 
         /// <summary>把当前帧的矩形区域读回 dst(BGRA,无行填充)。必须紧跟 Acquire 成功之后调用。</summary>
@@ -221,8 +260,8 @@ namespace DesktopBar.Interop
             if (x + width > Width) width = Width - x;
             if (y + height > Height) height = Height - y;
 
-            IntPtr src = QueryInterface(_resource, IID_ID3D11Texture2D);
-            if (src == IntPtr.Zero) return false;
+            IntPtr src = ResourceToTexture(_resource);
+            if (src == IntPtr.Zero) { Diag("ResourceToTexture 失败"); return false; }
             bool ok = false;
             try
             {
@@ -231,12 +270,14 @@ namespace DesktopBar.Interop
                     if (_stage != IntPtr.Zero) { Release(_stage); _stage = IntPtr.Zero; }
                     FillTextureDesc(width, height);
                     IntPtr tex;
-                    if (Fn<CreateTexture2DFn>(_device, _texSlot)(_device, _stageDesc, IntPtr.Zero, out tex) >= 0 && tex != IntPtr.Zero)
+                    int hrc = _createTexture(_device, _stageDesc, IntPtr.Zero, out tex);
+                    if (hrc >= 0 && tex != IntPtr.Zero)
                     {
                         _stage = tex;
                         _stageW = width;
                         _stageH = height;
                     }
+                    else Diag("CreateTexture2D 失败 hr=0x" + hrc.ToString("X8") + " tex=" + tex);
                 }
                 if (_stage == IntPtr.Zero) return false;
 
@@ -246,16 +287,15 @@ namespace DesktopBar.Interop
                 Marshal.WriteInt32(_boxBuf, 12, x + width);     // right
                 Marshal.WriteInt32(_boxBuf, 16, y + height);    // bottom
                 Marshal.WriteInt32(_boxBuf, 20, 1);             // back
-                int hr = Fn<CopyFn>(_context, 46)(_context, _stage, 0, 0, 0, 0, src, 0, _boxBuf);
-                if (hr < 0) return false;
+                _copyRegion(_context, _stage, 0, 0, 0, 0, src, 0, _boxBuf);
 
                 for (int i = 0; i < 24; i++) Marshal.WriteByte(_mapBuf, i, 0);
-                hr = Fn<MapFn>(_context, 14)(_context, _stage, 0, D3D11_MAP_READ, 0, _mapBuf);
-                if (hr < 0) return false;
+                int hr = _map(_context, _stage, 0, D3D11_MAP_READ, 0, _mapBuf);
+                if (hr < 0) { Diag("Map 失败 hr=0x" + hr.ToString("X8")); return false; }
                 IntPtr data = Marshal.ReadIntPtr(_mapBuf);
                 int pitch = Marshal.ReadInt32(_mapBuf, 8);
                 int rowBytes = width * 4;
-                if (dst.Length < rowBytes * height) return false;
+                if (dst.Length < rowBytes * height) { Diag("目标缓冲太小 dst=" + dst.Length + " 需要=" + (rowBytes * height)); return false; }
                 if (pitch == rowBytes)
                 {
                     Marshal.Copy(data, dst, 0, rowBytes * height);
@@ -265,12 +305,12 @@ namespace DesktopBar.Interop
                     for (int row = 0; row < height; row++)
                         Marshal.Copy(new IntPtr(data.ToInt64() + (long)row * pitch), dst, row * rowBytes, rowBytes);
                 }
-                Fn<UnmapFn>(_context, 15)(_context, _stage, 0);
+                _unmap(_context, _stage, 0);
                 ok = true;
             }
             finally
             {
-                Release(src);
+                try { if (_relTexture != null) _relTexture(src); } catch { }
             }
             return ok;
         }
@@ -278,24 +318,24 @@ namespace DesktopBar.Interop
         /// <summary>矩形区域是否在本帧的脏矩形里(桌面没动就返回 false,可整帧跳过)。</summary>
         public bool BandDirty(int x, int y, int width, int height)
         {
-            if (!_hasFrame || _duplication == IntPtr.Zero) return true;
-            IntPtr required = Marshal.AllocHGlobal(4);
+            if (!_hasFrame || _duplication == IntPtr.Zero || _dirtyRects == null) return true;
             try
             {
-                Marshal.WriteInt32(required, 0);
-                int hr = Fn<GetFrameDirtyRectsFn>(_duplication, 9)(_duplication, 0, IntPtr.Zero, required);
-                int need = Marshal.ReadInt32(required);
-                if (hr != DXGI_ERROR_MORE_DATA || need <= 0) return true;
-                if (_dirtyBuf == IntPtr.Zero || _dirtyBufSize < (uint)need)
+                Marshal.WriteInt32(_dirtyReq, 0);
+                int hr = _dirtyRects(_duplication, _dirtyBufSize, _dirtyBuf, _dirtyReq);
+                if (hr == DXGI_ERROR_MORE_DATA)
                 {
-                    if (_dirtyBuf != IntPtr.Zero) { Marshal.FreeHGlobal(_dirtyBuf); _dirtyBuf = IntPtr.Zero; }
-                    _dirtyBuf = Marshal.AllocHGlobal(need);
+                    // 脏矩形比预分配的多(整屏在动),扩容后重试一次
+                    int need = Marshal.ReadInt32(_dirtyReq);
+                    if (need <= 0) return true;
+                    if (_dirtyBuf != IntPtr.Zero) Marshal.FreeHGlobal(_dirtyBuf);
                     _dirtyBufSize = (uint)need;
+                    _dirtyBuf = Marshal.AllocHGlobal(need);
+                    Marshal.WriteInt32(_dirtyReq, 0);
+                    hr = _dirtyRects(_duplication, _dirtyBufSize, _dirtyBuf, _dirtyReq);
                 }
-                Marshal.WriteInt32(required, need);
-                hr = Fn<GetFrameDirtyRectsFn>(_duplication, 9)(_duplication, (uint)need, _dirtyBuf, required);
                 if (hr < 0) return true;
-                int count = Marshal.ReadInt32(required) / 16;
+                int count = Marshal.ReadInt32(_dirtyReq) / 16;
                 for (int i = 0; i < count; i++)
                 {
                     int left = Marshal.ReadInt32(_dirtyBuf, i * 16);
@@ -307,15 +347,14 @@ namespace DesktopBar.Interop
                 return false;
             }
             catch { return true; }
-            finally { Marshal.FreeHGlobal(required); }
         }
 
         public void ReleaseFrame()
         {
             if (!_hasFrame) return;
             _hasFrame = false;
-            if (_resource != IntPtr.Zero) { Release(_resource); _resource = IntPtr.Zero; }
-            try { if (_duplication != IntPtr.Zero) Fn<ReleaseFrameFn>(_duplication, 14)(_duplication); } catch { }
+            if (_resource != IntPtr.Zero) { try { _relResource(_resource); } catch { } _resource = IntPtr.Zero; }
+            try { if (_idupReleaseFrame != null) _idupReleaseFrame(_duplication); } catch { }
         }
 
         public void Dispose()
@@ -330,6 +369,35 @@ namespace DesktopBar.Interop
             if (_mapBuf != IntPtr.Zero) { Marshal.FreeHGlobal(_mapBuf); _mapBuf = IntPtr.Zero; }
             if (_boxBuf != IntPtr.Zero) { Marshal.FreeHGlobal(_boxBuf); _boxBuf = IntPtr.Zero; }
             if (_dirtyBuf != IntPtr.Zero) { Marshal.FreeHGlobal(_dirtyBuf); _dirtyBuf = IntPtr.Zero; }
+            if (_dirtyReq != IntPtr.Zero) { Marshal.FreeHGlobal(_dirtyReq); _dirtyReq = IntPtr.Zero; }
+        }
+
+        /// <summary>
+        /// 帧资源(IDXGIResource)→ ID3D11Texture2D。帧资源每帧都是新对象,但 vtable 是同一个,
+        /// 所以 QI/Release 的方法指针只查一次(vtable 变了才重建),避免每帧分配委托。
+        /// </summary>
+        private IntPtr ResourceToTexture(IntPtr resource)
+        {
+            if (resource == IntPtr.Zero) return IntPtr.Zero;
+            IntPtr vt = Marshal.ReadIntPtr(resource);
+            if (_qiResource == null || vt != _resVtbl)
+            {
+                _resVtbl = vt;
+                _qiResource = Fn<QueryInterfaceFn>(resource, 0);
+                _relResource = Fn<ReleaseFn>(resource, 2);
+            }
+            Guid g = IID_ID3D11Texture2D;
+            IntPtr ppv;
+            if (_qiResource(resource, ref g, out ppv) < 0) return IntPtr.Zero;
+            // Release 必须用「纹理自己 vtable 槽 2」的函数:不同 COM 类的 Release 实现里
+            // 引用计数字段的偏移不一定相同,借资源的方法指针去释放纹理会踩坏内存(实测 AV)。
+            IntPtr texVt = Marshal.ReadIntPtr(ppv);
+            if (_relTexture == null || texVt != _texVtbl)
+            {
+                _texVtbl = texVt;
+                _relTexture = Fn<ReleaseFn>(ppv, 2);
+            }
+            return ppv;
         }
 
         private static IntPtr Alloc(int bytes, out byte[] keep)
