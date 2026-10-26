@@ -469,7 +469,11 @@ namespace DesktopBar.Services
                 GlassService.BeginShoot();
                 try
                 {
-                    await Task.Delay(420);               // 让 DWM 把恢复后的窗口重新合成进去
+                    // 默认等 420ms 让 DWM 把恢复后的窗口重新合成进去;抓"刚显形的那几帧"时可调小
+                    int grabDelay = 420;
+                    int.TryParse(Environment.GetEnvironmentVariable("YUKI_SHOT_GRAB_DELAY"), out grabDelay);
+                    if (grabDelay < 0) grabDelay = 420;
+                    await Task.Delay(grabDelay);
                     bool ok = await Task.Run(() => GrabScreen(file));
                     Note(string.Format("抓图 {0} {1} t={2:F1}s", name, ok ? "成功" : "失败", _clock.Elapsed.TotalSeconds));
                 }

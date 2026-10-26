@@ -236,6 +236,9 @@ namespace DesktopBar.Services
             if (_host == null) BuildElements();
             RefreshSpec();
             SetEnabled(true);
+            // 展开页着色器提前编好:面板几何全走寄存器,同一份字节码服务任意尺寸,
+            // 所以启动时创建一次就能被所有展开页复用,第一次悬停不再卡一次编译(约 100ms)。
+            PrewarmPanelEffect();
             return _host;
         }
 
@@ -512,6 +515,25 @@ namespace DesktopBar.Services
         private static int _panelPumpQueued;
         private static int _panelStaticRun;        // 连续没出帧的采样次数(用于静止降频)
         private static bool _panelGlassDiag;
+
+        /// <summary>
+        /// 启动时把展开页着色器编好(材质 4)。面板几何(半径/纹理尺寸)全部走寄存器,
+        /// 同一份字节码服务任意尺寸的展开页,所以这里创建一次,之后所有面板都复用它。
+        /// 好处:第一次悬停展开页不用在 UI 线程上现编译(约 100ms,期间面板是空窗)。
+        /// </summary>
+        private static void PrewarmPanelEffect()
+        {
+            try
+            {
+                if (_panelEffect != null) return;
+                var s = App.Settings;
+                if (s == null || s.PillMaterial != 4) return;
+                double rad = 16 * Ui.Scale * NativeMethods.SystemDpiScale() * 0.5;
+                _panelEffect = LiquidGlassEffect.CreatePanel(rad, 256, 128);
+                if (_panelEffect == null) App.Log("面板玻璃:展开页着色器预热失败,首次打开时会再尝试");
+            }
+            catch { }
+        }
 
         /// <summary>
         /// 展开页打开「之前」调用(此时窗口还完全不可见):立刻同步抓一帧并挂上玻璃层。
@@ -814,15 +836,12 @@ namespace DesktopBar.Services
                     if (!ReferenceEquals(_panelEffect.Input, _panelBodyBrush)) _panelEffect.Input = _panelBodyBrush;
                     if (!ReferenceEquals(_panelEffect.Sharp, _panelSharpBrush)) _panelEffect.Sharp = _panelSharpBrush;
                     if (!ReferenceEquals(surface.Effect, _panelEffect)) surface.Effect = _panelEffect;
-                    if (!ReferenceEquals(surface.Fill, Brushes.Black)) surface.Fill = Brushes.Black;
                 }
             }
-            if (_panelEffect == null || !ReferenceEquals(surface.Effect, _panelEffect))
-            {
-                // 普通玻璃档(或着色器不可用):直接显示模糊位图
-                surface.Effect = null;
-                if (!ReferenceEquals(surface.Fill, _panelBodyBrush)) surface.Fill = _panelBodyBrush;
-            }
+            // 玻璃层的基础填充始终是「模糊位图」:着色器正常时它的输出会覆盖掉它;
+            // 着色器缺失/正在重建时看到的是模糊玻璃而不是黑底,任何一瞬间都不会露黑。
+            if (!ReferenceEquals(surface.Fill, _panelBodyBrush)) surface.Fill = _panelBodyBrush;
+            if (_panelEffect == null || !ReferenceEquals(surface.Effect, _panelEffect)) surface.Effect = null;
             surface.Opacity = Math.Max(0.05, Math.Min(1, s.GlassOpacity));
         }
 

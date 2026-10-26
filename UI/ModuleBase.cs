@@ -77,7 +77,9 @@ namespace DesktopBar.UI
             // 形状(圆角/边缘柔化)由着色器按距离场输出 alpha,窗口的 SetWindowRgn 只是额外一层裁剪。
             _panelGlass = new Rectangle
             {
-                Fill = Brushes.Black,
+                // 初始必须"什么都不画":以前这里是纯黑填充,一旦着色器/位图还没到位,
+                // 展开页显形的那一帧就是整块黑玻璃(用户报的"面板由黑变成液态玻璃,中间闪一下黑色")。
+                Fill = Brushes.Transparent,
                 IsHitTestVisible = false,
                 RadiusX = 16 * scale,
                 RadiusY = 16 * scale
@@ -154,6 +156,10 @@ namespace DesktopBar.UI
                 // 窗口懒创建:SourceInitialized 在首次 ShowPanel 时才触发,正合适。
                 GlassService.RegisterWindow(h);
             };
+            // 提前把 HWND 建出来:RegisterWindow(SourceInitialized 里挂)随之在构造期就生效,
+            // 展开页从第一次抓图开始就被排除在屏幕捕获之外。否则面板显示后的头几帧会被
+            // 自己的捕获线程拍进去(采样到自己 → 玻璃变黑,和顶栏同一个坑)。
+            try { new System.Windows.Interop.WindowInteropHelper(w).EnsureHandle(); } catch { }
             w.MouseEnter += (s, e) => _closeTimer.Stop();
             w.MouseLeave += (s, e) => { if (Open) StartCloseTimer(); };
             w.SizeChanged += (s, e) => ApplyRoundRegion(w);
@@ -392,8 +398,9 @@ namespace DesktopBar.UI
             {
                 GlassService.StopLivePanel(Panel);
             }
-            PanelWindow.Visibility = Visibility.Visible;
-
+            // 变换/不透明度必须在"窗口可见"之前设好。ShowWindow 会立刻把窗口映射上屏,
+            // 映射用的就是那一刻的可视树状态;以前这段在 Visibility 之后,于是每开一次面板
+            // 都会先闪一帧「满尺寸、不透明度 1、玻璃层还是黑底」的画面,肉眼就是黑一下才变玻璃。
             _panelTransform = new TranslateTransform(0, (above ? 8 : -8) * Ui.Scale);
             _panelScale = new ScaleTransform(0.52, 0.68);
             _panelTransforms = new TransformGroup();
@@ -406,6 +413,16 @@ namespace DesktopBar.UI
             double originX = Math.Max(0.12, Math.Min(0.88, ((p.X + Pill.ActualWidth * 0.5) - left) / width));
             _panelSurface.RenderTransformOrigin = new Point(originX, above ? 1 : 0);
             _panelSurface.Opacity = 0;
+
+            if (Environment.GetEnvironmentVariable("YUKI_PANEL_SHOWLOG") == "1")
+            {
+                App.Log(string.Format("面板显形 {0} Opacity={1:F2} 变换={2} 玻璃层 Effect={3} Fill={4}",
+                    GetType().Name, _panelSurface.Opacity,
+                    _panelSurface.RenderTransform == null ? "null" : _panelSurface.RenderTransform.GetType().Name,
+                    _panelGlass.Effect == null ? "null" : _panelGlass.Effect.GetType().Name,
+                    _panelGlass.Fill == null ? "null" : _panelGlass.Fill.GetType().Name));
+            }
+            PanelWindow.Visibility = Visibility.Visible;
             var duration = TimeSpan.FromMilliseconds(Math.Max(120, App.Settings?.AnimationDurationMs ?? 180));
             var ease = new BackEase { EasingMode = EasingMode.EaseOut, Amplitude = 0.12 };
             _panelTransform.BeginAnimation(TranslateTransform.YProperty, new DoubleAnimation(0, duration) { EasingFunction = ease });
@@ -567,7 +584,9 @@ namespace DesktopBar.UI
                 _panelScale.BeginAnimation(ScaleTransform.ScaleYProperty, null);
             }
             _panelSurface.RenderTransform = null;
-            _panelSurface.Opacity = 1;
+            // 隐藏态必须是不透明度 0:窗口下次被映射上屏时用的是那一刻的可视树状态,
+            // 若基值留 1,重新打开的第一帧就会是「满尺寸、全不透明」的旧画面(闪一下)。
+            _panelSurface.Opacity = 0;
             StopPanelTracking();
             GlassService.StopLivePanel(Panel);
             PanelWindow.Visibility = Visibility.Hidden;
