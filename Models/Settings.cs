@@ -90,8 +90,13 @@ namespace DesktopBar.Models
         /// (WPF 分层窗口的穿透判据是像素 alpha,不是 IsHitTestVisible,实测探针验证)。
         /// </summary>
         public double GlassGapFill { get; set; } = 0;
-        /// <summary>捕获帧率上限(5..60;静止画面经差分门控后实际写屏远低于此值)。</summary>
-        public int GlassMaxFps { get; set; } = 30;
+        /// <summary>
+        /// 捕获帧率上限(0..300)。0 = 不限制:捕获直接按屏幕合成节拍跑(DwmFlush),抓完就发布,
+        /// 端到端只延迟一帧,实测 300Hz 屏能到 280fps 更新;填具体值时按该帧率节流。
+        /// 默认 0 —— 静止画面本来就会被差分门控 + 时长降频压到 0 写屏,只有"背后真的在动"时才会吃满,
+        /// 而那正是最需要跟手的场景。嫌费电的用户可以在设置里下调。
+        /// </summary>
+        public int GlassMaxFps { get; set; } = 0;
 
         // ---- 液态玻璃(PillMaterial=4)专属:着色器参数 ----
         /// <summary>折射强度(0..1,胶囊轮廓边缘的位移采样,凸透镜收缩感)。</summary>
