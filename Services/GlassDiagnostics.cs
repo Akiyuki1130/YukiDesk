@@ -48,7 +48,8 @@ namespace DesktopBar.Services
             string n; return _threadNames.TryGetValue(id, out n) ? "[" + n + "]" : "";
         }
 
-        private static bool _skipPanels;   // --nopanels:只抓顶栏,迭代时省掉每面板 2.3s
+        private static bool _skipPanels;
+        private static bool _skipWallpaper;   // --nopanels:只抓顶栏,迭代时省掉每面板 2.3s
         private static string _originalWallpaper;
         private static readonly List<string> _log = new List<string>();
         private static readonly Stopwatch _clock = Stopwatch.StartNew();
@@ -61,6 +62,8 @@ namespace DesktopBar.Services
             try { Directory.CreateDirectory(dir); } catch { }
             _dir = dir;
             _skipPanels = Array.IndexOf(args ?? Array.Empty<string>(), "--nopanels") >= 0;
+            // --nobg:不换测试壁纸,直接在用户当前壁纸下取证(给"看一眼真实观感"用)
+            _skipWallpaper = Array.IndexOf(args ?? Array.Empty<string>(), "--nobg") >= 0;
             Application.Current.ShutdownMode = ShutdownMode.OnExplicitShutdown;
             Application.Current.Dispatcher.BeginInvoke(new Action(async () => await RunAsync()));
         }
@@ -364,7 +367,7 @@ namespace DesktopBar.Services
                 await ShotAsync("bar-original");
 
                 // 2) 换成高频细节测试壁纸,才看得清"糊没糊"
-                bool wallpaper = TryInstallTestWallpaper();
+                bool wallpaper = _skipWallpaper ? false : TryInstallTestWallpaper();
                 if (wallpaper)
                 {
                     await Task.Delay(900);

@@ -220,15 +220,14 @@ float field(float2 p)
     if (DEBUG_MODE == 8) { float4 c0 = tex2D(Input, uv); return c0; }
     return float4(col, 1);
 }");
-            if (dbg == "2") return sb.ToString().Replace("DEBUG_MODE", "2");
-            if (dbg == "5") return sb.ToString().Replace("DEBUG_MODE", "5");
-            if (dbg == "6") return sb.ToString().Replace("DEBUG_MODE", "6");
-            if (dbg == "7") return sb.ToString().Replace("DEBUG_MODE", "7");
-            if (dbg == "3") return sb.ToString().Replace("DEBUG_MODE", "3");
-            if (dbg == "4") return sb.ToString().Replace("DEBUG_MODE", "4");
-            if (dbg != null && dbg != "0") return sb.ToString().Replace("DEBUG_MODE", "0");
-            return sb.ToString().Replace("DEBUG_MODE", "0");
-            return sb.ToString();
+            // 调试档号填进模板里的 DEBUG_MODE 占位符;不认识的号码一律按 0(正常路径)
+            string mode = dbg == null ? "0" : dbg;
+            switch (mode)
+            {
+                case "2": case "3": case "4": case "5": case "6": case "7": break;
+                default: mode = "0"; break;
+            }
+            return sb.ToString().Replace("DEBUG_MODE", mode);
         }
 
         /// <summary>
