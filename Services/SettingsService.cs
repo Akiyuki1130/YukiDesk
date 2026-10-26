@@ -137,6 +137,7 @@ namespace DesktopBar.Services
             s.GlassTint = NormalizeColor(s.GlassTint, "#14141C");
             s.GlassTintOpacity = Clamp(s.GlassTintOpacity, 0, 1, 0.18);
             s.GlassMaxFps = Math.Clamp(s.GlassMaxFps, 5, 60);
+            s.GlassGapFill = Clamp(s.GlassGapFill, 0, 1, 0);
             s.GlassRefraction = Clamp(s.GlassRefraction, 0, 1, 0.45);
             s.GlassRim = Clamp(s.GlassRim, 0, 1, 0.5);
             s.GlassChroma = Clamp(s.GlassChroma, 0, 1, 0.35);

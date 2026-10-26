@@ -243,6 +243,8 @@ namespace DesktopBar.Services
             bool liquid = s.PillMaterial == 4;
             if (!liquid && _image != null) _image.Effect = null;
             if (liquid) UpdateLiquidConstants();
+            // 间隙玻璃强度变了要重算裁剪/遮罩(它由主窗的 LayoutUpdated 派生,这里主动踢一次)
+            try { MainWindow.Bar?.RefreshGlassClip(); } catch { }
         }
 
         /// <summary>把胶囊矩形(DIP)换算成半分辨率捕获图像素坐标;几何变化时重编译着色器(几何烘焙进字面量)。</summary>
@@ -361,13 +363,79 @@ namespace DesktopBar.Services
         /// <summary>设置胶囊并集裁剪几何(主窗 LayoutUpdated 防抖后调用);rects 同时喂给液态玻璃着色器。</summary>
         internal static void SetClip(Geometry clip, List<Rect> rects)
         {
+            SetClip(clip, rects, 0);
+        }
+
+        /// <summary>
+        /// gapFill &gt; 0 时:玻璃铺满整条顶栏(间隙也呈现玻璃),用透明度遮罩让"胶囊外"淡到 gapFill 倍。
+        /// 遮罩值按 DIP 绝对坐标绘制,与胶囊矩形同源,避免与 DPI 换算打架。
+        /// </summary>
+        internal static void SetClip(Geometry clip, List<Rect> rects, double gapFill)
+        {
             _pillRectsDip = rects;
             try { UpdateLiquidConstants(); } catch { }
             var ui = Application.Current?.Dispatcher;
-            if (ui == null || !ui.CheckAccess()) { ui?.BeginInvoke(new Action(() => { try { SetClip(clip, rects); } catch { } })); return; }
+            if (ui == null || !ui.CheckAccess()) { ui?.BeginInvoke(new Action(() => { try { SetClip(clip, rects, gapFill); } catch { } })); return; }
             if (_host == null) return;
             _host.Clip = clip;
+            try { ApplyGapMask(gapFill, rects); } catch { }
             _host.Visibility = clip != null && _enabled ? Visibility.Visible : Visibility.Collapsed;
+        }
+
+        /// <summary>胶囊间隙的玻璃强度倍数(0=间隙完全透明,维持穿透);环境变量 YUKI_GLASS_FILL 可临时覆盖以便取证。</summary>
+        internal static double GapFill
+        {
+            get
+            {
+                try
+                {
+                    var v = Environment.GetEnvironmentVariable("YUKI_GLASS_FILL");
+                    double d;
+                    if (!string.IsNullOrWhiteSpace(v) && double.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out d))
+                        return Math.Max(0, Math.Min(1, d));
+                }
+                catch { }
+                var s = App.Settings;
+                return s == null ? 0 : Math.Max(0, Math.Min(1, s.GlassGapFill));
+            }
+        }
+
+        /// <summary>胶囊外区域的玻璃透明度倍数(0=不铺间隙,1=整条同强度)。实验性产品选项。</summary>
+        private static void ApplyGapMask(double gapFill, List<Rect> rects)
+        {
+            if (_image == null || _tint == null) return;
+            double w = _host == null ? 0 : _host.ActualWidth;
+            double h = _host == null ? 0 : _host.ActualHeight;
+            if (gapFill <= 0.01 || gapFill >= 0.999 || w < 1 || h < 1 || rects == null || rects.Count == 0)
+            {
+                _image.OpacityMask = null;
+                _tint.OpacityMask = null;
+                return;
+            }
+            var dg = new DrawingGroup();
+            dg.Children.Add(new GeometryDrawing(new SolidColorBrush(Color.FromArgb(Alpha(gapFill), 255, 255, 255)), null, new RectangleGeometry(new Rect(0, 0, w, h))));
+            foreach (var r in rects)
+                dg.Children.Add(new GeometryDrawing(Brushes.White, null, new RectangleGeometry(r, 19 * Ui.Scale, 19 * Ui.Scale)));
+            var brush = new DrawingBrush(dg)
+            {
+                Stretch = Stretch.None,
+                AlignmentX = AlignmentX.Left,
+                AlignmentY = AlignmentY.Top,
+                ViewboxUnits = BrushMappingMode.Absolute,
+                Viewbox = new Rect(0, 0, w, h),
+                ViewportUnits = BrushMappingMode.Absolute,
+                Viewport = new Rect(0, 0, w, h),
+                TileMode = TileMode.None
+            };
+            brush.Freeze();
+            _image.OpacityMask = brush;
+            _tint.OpacityMask = brush;
+        }
+
+        private static byte Alpha(double v)
+        {
+            int a = (int)Math.Round(Math.Max(0, Math.Min(1, v)) * 255);
+            return (byte)(a < 0 ? 0 : (a > 255 ? 255 : a));
         }
 
         // ---------- 展开页玻璃(一次性捕获) ----------

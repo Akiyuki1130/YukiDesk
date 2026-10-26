@@ -84,6 +84,12 @@ namespace DesktopBar.Models
         public string GlassTint { get; set; } = "#14141C";
         /// <summary>玻璃染色不透明度。</summary>
         public double GlassTintOpacity { get; set; } = 0.18;
+        /// <summary>
+        /// 胶囊间隙的玻璃强度:0=间隙完全透明(保留"点空白处穿透到桌面"的契约);
+        /// 大于 0 时整条顶栏都铺玻璃,间隙按此强度淡化。注意:铺了间隙后顶栏整条不再点击穿透
+        /// (WPF 分层窗口的穿透判据是像素 alpha,不是 IsHitTestVisible,实测探针验证)。
+        /// </summary>
+        public double GlassGapFill { get; set; } = 0;
         /// <summary>捕获帧率上限(5..60;静止画面经差分门控后实际写屏远低于此值)。</summary>
         public int GlassMaxFps { get; set; } = 30;
 

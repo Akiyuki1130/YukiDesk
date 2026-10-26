@@ -440,6 +440,10 @@ namespace DesktopBar
                     v => { S.GlassTintOpacity = Math.Round(v) / 100; App.Save(); Services.GlassService.ApplyLive(); })));
                 body.Children.Add(Row("帧率上限", NumberSlider(5, 60, S.GlassMaxFps, " fps",
                     v => { S.GlassMaxFps = (int)Math.Round(v); App.Save(); Services.GlassService.ApplyLive(); })));
+                body.Children.Add(Row("间隙玻璃", NumberSlider(0, 100, S.GlassGapFill * 100, "%",
+                    v => { S.GlassGapFill = Math.Round(v) / 100; App.Save(); Services.GlassService.ApplyLive(); })));
+                body.Children.Add(MakeHint("间隙玻璃 0%：只有胶囊是玻璃，胶囊之间完全透明，点击可穿透到桌面图标。"
+                    + "调高后整条顶栏都模糊其下内容，但这条不再点击穿透（系统按像素透明度判定穿透）。", 12));
                 if (liquid)
                 {
                     body.Children.Add(Row("折射强度", NumberSlider(0, 100, S.GlassRefraction * 100, "%",

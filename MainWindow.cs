@@ -275,6 +275,13 @@ namespace DesktopBar
 
         private List<Rect> _lastGlassRects;
 
+        /// <summary>玻璃参数变化(如"间隙玻璃"滑条)后强制重算裁剪几何:清缓存再算,避免被 Rect 比较挡掉。</summary>
+        internal void RefreshGlassClip()
+        {
+            _lastGlassRects = null;
+            UpdateGlassClip();
+        }
+
         /// <summary>
         /// 重算玻璃层裁剪几何 = 所有可见胶囊圆角矩形的并集(DIP,窗口坐标系)。
         /// 并集之外的玻璃像素保持 alpha=0,维持"胶囊外点击穿透到桌面"的契约。
@@ -304,14 +311,24 @@ namespace DesktopBar
             catch { }
             if (SameRects(rects, _lastGlassRects)) return;   // 布局没动:直接返回,不给 Clip 赋新值
             _lastGlassRects = rects;
+            // 实验性选项(环境变量):胶囊间隙也铺玻璃,强度按倍数淡化。0/未设置=维持"胶囊外完全透明"的穿透契约。
+            double gapFill = GlassService.GapFill;
             GeometryGroup group = null;
             try
             {
                 group = new GeometryGroup { FillRule = FillRule.Nonzero };
-                foreach (var r in rects)
-                    // 19*scale 与 ModuleBase 胶囊 CornerRadius 同源,保持圆角一致。
-                    group.Children.Add(new RectangleGeometry(r, 19 * Ui.Scale, 19 * Ui.Scale));
-                GlassService.SetClip(group, rects);
+                if (gapFill > 0.01)
+                {
+                    // 整条顶栏一块玻璃(圆角与窗口等高):间隙也模糊,胶囊仍是更浓的一层。
+                    group.Children.Add(new RectangleGeometry(new Rect(0, 0, root.ActualWidth, root.ActualHeight), 10 * Ui.Scale, 10 * Ui.Scale));
+                }
+                else
+                {
+                    foreach (var r in rects)
+                        // 19*scale 与 ModuleBase 胶囊 CornerRadius 同源,保持圆角一致。
+                        group.Children.Add(new RectangleGeometry(r, 19 * Ui.Scale, 19 * Ui.Scale));
+                }
+                GlassService.SetClip(group, rects, gapFill);
             }
             catch
             {
