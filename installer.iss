@@ -39,11 +39,11 @@ UninstallDisplayName={#MyAppName} {#ARCH} {#FLAVOR}
 UninstallDisplayIcon={app}\{#MyAppExe}
 OutputDir=installers
 OutputBaseFileName=YukiDesk-Setup-{#ARCH}-{#FLAVOR}-{#MyAppVersion}
-; 默认每用户安装到 %LocalAppData%\Programs，全程不弹 UAC（数据本来就在 %AppData%\YukiDesk）。
-; 但有些用户/环境需要装到 Program Files 供所有用户使用，或遇到目标目录写不进去：
-; 允许向导第一页选择「为所有用户安装」（此时才请求管理员），命令行也可用 /ALLUSERS 覆盖。
+; 每用户安装到 %LocalAppData%\Programs，全程**不请求 UAC**（配置本来就在 %AppData%\YukiDesk，
+; 程序本身以 asInvoker 运行，安装与运行都不需要管理员）。
+; 明确不允许覆盖为提权安装：不提供「为所有用户安装」选项、也不认 /ALLUSERS，
+; 保证安装行为是确定的一条路径（此前开放 dialog 覆盖会让同一个包有时弹 UAC、有时不弹）。
 PrivilegesRequired=lowest
-PrivilegesRequiredOverridesAllowed=dialog commandline
 ArchitecturesInstallIn64BitMode=x64compatible or arm64
 Compression=lzma2/max
 SolidCompression=yes
