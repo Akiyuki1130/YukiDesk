@@ -39,8 +39,11 @@ UninstallDisplayName={#MyAppName} {#ARCH} {#FLAVOR}
 UninstallDisplayIcon={app}\{#MyAppExe}
 OutputDir=installers
 OutputBaseFileName=YukiDesk-Setup-{#ARCH}-{#FLAVOR}-{#MyAppVersion}
-; 本程序数据全部在 %AppData%\YukiDesk，按每用户安装，无需管理员权限
+; 默认每用户安装到 %LocalAppData%\Programs，全程不弹 UAC（数据本来就在 %AppData%\YukiDesk）。
+; 但有些用户/环境需要装到 Program Files 供所有用户使用，或遇到目标目录写不进去：
+; 允许向导第一页选择「为所有用户安装」（此时才请求管理员），命令行也可用 /ALLUSERS 覆盖。
 PrivilegesRequired=lowest
+PrivilegesRequiredOverridesAllowed=dialog commandline
 ArchitecturesInstallIn64BitMode=x64compatible or arm64
 Compression=lzma2/max
 SolidCompression=yes
@@ -83,7 +86,9 @@ Name: "{group}\卸载 {#MyAppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\{#MyAppExe}"; Description: "{cm:LaunchProgram,{#MyAppName}}"; Flags: nowait postinstall skipifsilent
+; runasoriginaluser: 选「为所有用户安装」时安装器是提权运行的,若不降回原用户会让顶栏以管理员身份启动,
+; 之后普通权限的覆盖安装就连关都关不掉它(Restart Manager 会提示需要管理员),这里强制降权。
+Filename: "{app}\{#MyAppExe}"; Description: "{cm:LaunchProgram,{#MyAppName}}"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
 [UninstallRun]
 ; 卸载必须回收温度功能留下的持久化痕迹:登录计划任务、自启 Run 键、%TEMP% 下载/脚本残留。
