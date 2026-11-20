@@ -53,7 +53,7 @@ namespace DesktopBar.UI
             _status = new TextBlock
             {
                 Text = title,
-                FontSize = 14 * _scale,
+                FontSize = 15 * _scale,
                 FontWeight = FontWeights.SemiBold,
                 TextTrimming = TextTrimming.CharacterEllipsis
             };
@@ -61,7 +61,7 @@ namespace DesktopBar.UI
             _status.SetResourceReference(TextBlock.ForegroundProperty, "ThemePanelText");
             _detail = new TextBlock
             {
-                FontSize = 11.5 * _scale,
+                FontSize = 12.5 * _scale,
                 Opacity = 0.72,
                 Margin = new Thickness(0, 8 * _scale, 0, 0),
                 TextTrimming = TextTrimming.CharacterEllipsis
@@ -120,6 +120,8 @@ namespace DesktopBar.UI
 
             _window = new Window
             {
+                FontFamily = Ui.TextFont,
+                FontWeight = FontWeights.SemiBold,
                 WindowStyle = WindowStyle.None,
                 ResizeMode = ResizeMode.NoResize,
                 AllowsTransparency = true,

@@ -20,7 +20,7 @@ namespace DesktopBar.UI
                 Style = (Style)Application.Current.FindResource("DarkBox"),
                 Text = initial ?? "",
                 Margin = new Thickness(0, 12, 0, 0),
-                FontSize = 13
+                FontSize = 14
             };
             box.SetResourceReference(TextBox.ForegroundProperty, "ThemePanelText");
             box.SetResourceReference(TextBox.CaretBrushProperty, "ThemePanelText");
@@ -56,7 +56,7 @@ namespace DesktopBar.UI
             var labelText = new TextBlock
             {
                 Text = label,
-                FontSize = 13
+                FontSize = 14
             };
             labelText.SetResourceReference(TextBlock.ForegroundProperty, "ThemePanelText");
             body.Children.Add(labelText);
@@ -73,6 +73,8 @@ namespace DesktopBar.UI
             card.SetResourceReference(Border.BorderBrushProperty, "ThemePanelBorder");
             var w = new Window
             {
+                FontFamily = Ui.TextFont,
+                FontWeight = FontWeights.SemiBold,
                 Title = title,
                 Width = 420,
                 SizeToContent = SizeToContent.Height,

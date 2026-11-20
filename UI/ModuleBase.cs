@@ -24,9 +24,12 @@ namespace DesktopBar.UI
         protected Window PanelWindow;
         protected TabStyle _style;
         private readonly List<(TextBlock tb, double delta)> _texts = new List<(TextBlock, double)>();
-        private readonly List<TextBlock> _glyphs = new List<TextBlock>();
-        private readonly List<Shape> _themedShapes = new List<Shape>();
-        private readonly List<Shape> _themedFills = new List<Shape>();
+        protected const string ContentInkKey = "YukiGlassContentInk";
+        private static readonly Brush DarkGlassInk = Ui.Brush("#101820");
+        private static readonly Brush LightGlassInk = Ui.Brush("#FBFDFF");
+        private Brush _pendingPillInk;
+        private DispatcherTimer _pillInkTimer;
+        private static readonly Brush GlassHover = Ui.Brush("#FFFFFF", 0.075);
         private readonly DispatcherTimer _closeTimer;
         private TranslateTransform _panelTransform;
         private ScaleTransform _panelScale;
@@ -38,11 +41,7 @@ namespace DesktopBar.UI
         protected bool Open;
         private static ModuleBase _active;
 
-        // ---- 展开页实时玻璃 ----
-        // 展开页窗口的内容是「玻璃层 + 面板」两层:玻璃层是挂着 LiquidGlassEffect 的 Rectangle,
-        // 与顶栏胶囊共用同一份 HLSL / 同一组设置项(模糊+折射+色散+rim+斜面明暗),质感必然一致。
-        // 抓图线程在展开页显示期间按「当前屏幕上看到的那块矩形」持续采样(缩放/位移动画期间也跟着变),
-        // 所以玻璃内容始终钉在桌面上,不会像贴纸一样被拉长。
+        // 玻璃使用固定捕获纹理。开合时只更新对应当前屏幕矩形的采样坐标。
         private readonly Rectangle _panelGlass;
         private readonly Grid _panelSurface;
         private double _panelLeft, _panelTop, _panelWidth, _panelHeight;   // 未变换时的完整矩形(DIP)
@@ -97,9 +96,14 @@ namespace DesktopBar.UI
             Root.MouseEnter += (s, e) =>
             {
                 _closeTimer.Stop();
+                RefreshGlassHover();
                 if (HoverOpensPanel) ShowPanel();
             };
-            Root.MouseLeave += (s, e) => { if (Open) StartCloseTimer(); };
+            Root.MouseLeave += (s, e) =>
+            {
+                RefreshGlassHover();
+                if (Open) StartCloseTimer();
+            };
             IsVisibleChanged += (s, e) =>
             {
                 if (!IsVisible) ClosePanelImmediately();
@@ -167,6 +171,7 @@ namespace DesktopBar.UI
             w.ContentRendered += (s, e) => ApplyRoundRegion(w);
             Panel.MouseEnter += (s, e) => _closeTimer.Stop();
             Panel.MouseLeave += (s, e) => { if (Open) StartCloseTimer(); };
+            w.FontFamily = Ui.TextFont;
             PanelWindow = w;
         }
 
@@ -238,25 +243,106 @@ namespace DesktopBar.UI
             Panel.BorderBrush = Pill.BorderBrush;
             Panel.BorderThickness = Pill.BorderThickness;
             PanelWindow.Background = Brushes.Transparent;
-            // 下拉框等模板控件没有直接拿到模块画刷，提供一套同步的动态主题资源。
-            var resources = Application.Current?.Resources;
-            if (resources != null)
+            var ink = Ui.Brush(ThemeService.Text);
+            Resources[ContentInkKey] = ink;
+            PanelWindow.Resources[ContentInkKey] = ink;
+            if (!GlassService.UsesAdaptiveInk(s))
             {
-                resources["ThemePanelBackground"] = Ui.Brush(ThemeService.Background, s?.ThemeOpacity ?? 0.55);
-                resources["ThemePanelBorder"] = s != null && s.BorderEnabled
-                    ? Ui.Brush(ThemeService.Border, s.BorderOpacity)
-                    : Brushes.Transparent;
-                resources["ThemePanelSubtle"] = Ui.Brush(ThemeService.Text, 0.06);
-                resources["ThemePanelControl"] = Ui.Brush(ThemeService.Text, 0.10);
-                resources["ThemePanelControlHover"] = Ui.Brush(ThemeService.Text, 0.18);
-                resources["ThemePanelHover"] = Ui.Brush(ThemeService.Text, 0.12);
-                resources["ThemePanelSelected"] = Ui.Brush(ThemeService.Text, 0.20);
-                resources["ThemePanelText"] = Ui.Brush(ThemeService.Text, 1);
+                ApplyPillInk(null);
+                SetGlassInk(Panel, null, panel: true);
             }
             foreach (var (tb, delta) in _texts) ApplyFont(tb, delta);
-            foreach (var g in _glyphs) g.Foreground = Ui.Brush(ThemeService.Text, 1);
-            foreach (var shape in _themedShapes) shape.Stroke = Ui.Brush(ThemeService.Text, 1);
-            foreach (var shape in _themedFills) shape.Fill = Ui.Brush(ThemeService.Text, 1);
+        }
+
+        internal void ApplyPillInk(double? lightness)
+        {
+            if (!lightness.HasValue)
+            {
+                CancelPendingPillInk();
+                SetGlassInk(Pill, null);
+                return;
+            }
+
+            var previous = Pill.Resources[ContentInkKey] as Brush;
+            var next = PreferredGlassInk(lightness.Value, previous);
+            if (previous == null)
+            {
+                Pill.Resources[ContentInkKey] = next;
+                return;
+            }
+            if (ReferenceEquals(previous, next))
+            {
+                CancelPendingPillInk();
+                return;
+            }
+            if (ReferenceEquals(_pendingPillInk, next)) return;
+
+            // 新的明暗判断稳定一小段时间再换色。最后一帧之后即使没有新图，也由定时器提交。
+            _pendingPillInk = next;
+            if (_pillInkTimer == null)
+            {
+                _pillInkTimer = new DispatcherTimer(DispatcherPriority.Background, Dispatcher)
+                {
+                    Interval = TimeSpan.FromMilliseconds(160)
+                };
+                _pillInkTimer.Tick += (sender, args) =>
+                {
+                    var confirmed = _pendingPillInk;
+                    CancelPendingPillInk();
+                    if (confirmed != null && !_disposed && IsVisible && GlassService.UsesAdaptiveInk(App.Settings))
+                        Pill.Resources[ContentInkKey] = confirmed;
+                };
+            }
+            _pillInkTimer.Start();
+        }
+
+        private void CancelPendingPillInk()
+        {
+            if (_pendingPillInk == null) return;
+            _pendingPillInk = null;
+            _pillInkTimer?.Stop();
+        }
+
+        internal static Brush PreferredGlassInk(double lightness, Brush previous = null)
+        {
+            // 两种墨色对比度接近时，保持上一帧颜色，避免幻灯片过渡或鼠标移动引起闪烁。
+            double threshold = previous == DarkGlassInk ? 0.18 : previous == LightGlassInk ? 0.22 : 0.20;
+            return lightness >= threshold ? DarkGlassInk : LightGlassInk;
+        }
+
+        internal static void SetGlassInk(Border surface, double? lightness, bool panel = false)
+        {
+            if (surface == null) return;
+            var resources = surface.Resources;
+            var previous = resources[ContentInkKey] as Brush;
+            if (!lightness.HasValue)
+            {
+                if (previous == null) return;
+                resources.Remove(ContentInkKey);
+                if (panel)
+                {
+                    foreach (var key in PanelContrastKeys) resources.Remove(key.Name);
+                }
+                return;
+            }
+            var next = PreferredGlassInk(lightness.Value, previous);
+            if (previous == next) return;
+            resources[ContentInkKey] = next;
+            if (!panel) return;
+            string color = next == DarkGlassInk ? "#101820" : "#FBFDFF";
+            foreach (var key in PanelContrastKeys) resources[key.Name] = Ui.Brush(color, key.Opacity);
+        }
+
+        private static readonly (string Name, double Opacity)[] PanelContrastKeys =
+        {
+            ("ThemePanelText", 1), ("ThemePanelSubtle", 0.06), ("ThemePanelControl", 0.10),
+            ("ThemePanelControlHover", 0.18), ("ThemePanelHover", 0.12), ("ThemePanelSelected", 0.20)
+        };
+
+        private void RefreshGlassHover()
+        {
+            if (App.Settings?.PillMaterial is 3 or 4)
+                Pill.Background = App.Settings.PillMaterial == 4 && Root.IsMouseOver ? GlassHover : Brushes.Transparent;
         }
 
         private void OnThemeChanged()
@@ -287,7 +373,7 @@ namespace DesktopBar.UI
                 // null 会让胶囊空白区域不参与命中,悬停开面板就坏了;Transparent 视觉相同。
                 _micaBrush = null;
                 _micaViewbox = Rect.Empty;
-                Pill.Background = Brushes.Transparent;
+                RefreshGlassHover();
                 return;
             }
             bool mica = s != null && (s.PillMaterial == 1 || s.PillMaterial == 2) && MicaService.Backdrop != null;
@@ -385,57 +471,70 @@ namespace DesktopBar.UI
             _panelTop = targetTop;
             _panelWidth = width;
             _panelHeight = height;
-            // 玻璃/液态玻璃材质:展开页里垫一层实时玻璃。关键顺序——必须"先出玻璃、再显形":
-            // 此时窗口还完全不可见,抓图不会拍到面板自己,而且显形前第一帧玻璃就已经在位,
-            // 不会出现"打开时先露出主题色、几十毫秒后才变玻璃"的闪一下。
-            // 抓图/模糊/着色器都在同一套管线里和顶栏胶囊共用,材质不可能再不一致。
-            if (App.Settings != null && (App.Settings.PillMaterial == 3 || App.Settings.PillMaterial == 4))
-            {
-                GlassService.StartLivePanel(Panel, _panelGlass, left, targetTop, width, height);
-                StartPanelTracking();
-            }
-            else
-            {
-                GlassService.StopLivePanel(Panel);
-            }
-            // 变换/不透明度必须在"窗口可见"之前设好。ShowWindow 会立刻把窗口映射上屏,
-            // 映射用的就是那一刻的可视树状态;以前这段在 Visibility 之后,于是每开一次面板
-            // 都会先闪一帧「满尺寸、不透明度 1、玻璃层还是黑底」的画面,肉眼就是黑一下才变玻璃。
-            _panelTransform = new TranslateTransform(0, (above ? 8 : -8) * Ui.Scale);
-            _panelScale = new ScaleTransform(0.52, 0.68);
+            bool glass = App.Settings?.PillMaterial is 3 or 4;
+            double offset = glass ? 5 : 8;
+            _panelTransform = new TranslateTransform(0, (above ? offset : -offset) * Ui.Scale);
+            _panelScale = glass ? new ScaleTransform(0.86, 0.90) : new ScaleTransform(0.52, 0.68);
             _panelTransforms = new TransformGroup();
             _panelTransforms.Children.Add(_panelScale);
             _panelTransforms.Children.Add(_panelTransform);
-            // 变换挂在容器(_panelSurface)而不是面板本身:玻璃层与面板一起缩放位移,
-            // 玻璃纹理由抓图线程按"变换后的可见矩形"重采,所以缩放期间看到的仍是真实桌面内容。
+            // 玻璃与内容共用变换，纹理坐标按变换后的可见矩形更新。
             _panelSurface.RenderTransform = _panelTransforms;
             // Scale from the capsule edge so the panel feels like the tab unfolding in place.
             double originX = Math.Max(0.12, Math.Min(0.88, ((p.X + Pill.ActualWidth * 0.5) - left) / width));
             _panelSurface.RenderTransformOrigin = new Point(originX, above ? 1 : 0);
             _panelSurface.Opacity = 0;
 
-            if (Environment.GetEnvironmentVariable("YUKI_PANEL_SHOWLOG") == "1")
-            {
-                App.Log(string.Format("面板显形 {0} Opacity={1:F2} 变换={2} 玻璃层 Effect={3} Fill={4}",
-                    GetType().Name, _panelSurface.Opacity,
-                    _panelSurface.RenderTransform == null ? "null" : _panelSurface.RenderTransform.GetType().Name,
-                    _panelGlass.Effect == null ? "null" : _panelGlass.Effect.GetType().Name,
-                    _panelGlass.Fill == null ? "null" : _panelGlass.Fill.GetType().Name));
-            }
-            PanelWindow.Visibility = Visibility.Visible;
-            var duration = TimeSpan.FromMilliseconds(Math.Max(120, App.Settings?.AnimationDurationMs ?? 180));
-            var ease = new BackEase { EasingMode = EasingMode.EaseOut, Amplitude = 0.12 };
-            _panelTransform.BeginAnimation(TranslateTransform.YProperty, new DoubleAnimation(0, duration) { EasingFunction = ease });
-            _panelScale.BeginAnimation(ScaleTransform.ScaleXProperty, new DoubleAnimation(1, duration) { EasingFunction = ease });
-            _panelScale.BeginAnimation(ScaleTransform.ScaleYProperty, new DoubleAnimation(1, duration) { EasingFunction = ease });
-            var fade = new DoubleAnimation(1, duration) { EasingFunction = ease };
             int openVersion = _animationVersion;
-            fade.Completed += (s, e) =>
+            bool revealed = false;
+
+            void Reveal()
             {
-                if (openVersion != _animationVersion || !Open) return;
-                ClearPanelAnimations();
-            };
-            _panelSurface.BeginAnimation(OpacityProperty, fade);
+                if (revealed || openVersion != _animationVersion || !Open || _closing) return;
+                revealed = true;
+                if (glass)
+                {
+                    RefreshLivePanelRect();
+                    StartPanelTracking();
+                }
+                if (Environment.GetEnvironmentVariable("YUKI_PANEL_SHOWLOG") == "1")
+                {
+                    App.Log($"面板显形 {GetType().Name} Effect={_panelGlass.Effect?.GetType().Name} Fill={_panelGlass.Fill}");
+                }
+                PanelWindow.Visibility = Visibility.Visible;
+                var duration = TimeSpan.FromMilliseconds(Math.Max(120, App.Settings?.AnimationDurationMs ?? 180));
+                IEasingFunction ease = glass ? new CubicEase { EasingMode = EasingMode.EaseOut }
+                    : new BackEase { EasingMode = EasingMode.EaseOut, Amplitude = 0.12 };
+                _panelTransform.BeginAnimation(TranslateTransform.YProperty, new DoubleAnimation(0, duration) { EasingFunction = ease });
+                _panelScale.BeginAnimation(ScaleTransform.ScaleXProperty, new DoubleAnimation(1, duration) { EasingFunction = ease });
+                _panelScale.BeginAnimation(ScaleTransform.ScaleYProperty, new DoubleAnimation(1, duration) { EasingFunction = ease });
+                var fade = new DoubleAnimation(1, duration) { EasingFunction = ease };
+                fade.Completed += (s, e) =>
+                {
+                    if (openVersion != _animationVersion || !Open) return;
+                    ClearPanelAnimations();
+                    RefreshLivePanelRect();
+                };
+                _panelSurface.BeginAnimation(OpacityProperty, fade);
+            }
+
+            if (glass)
+            {
+                // 在后台准备好首帧后再显形；采集不可用时用主题底色及时打开。
+                GlassService.StartLivePanel(Panel, _panelGlass, left, targetTop, width, height, Reveal);
+                if (!revealed) RevealOnTimeout();
+            }
+            else
+            {
+                GlassService.StopLivePanel(Panel);
+                Reveal();
+            }
+
+            async void RevealOnTimeout()
+            {
+                await System.Threading.Tasks.Task.Delay(90);
+                Reveal();
+            }
         }
 
         /// <summary>
@@ -528,8 +627,9 @@ namespace DesktopBar.UI
             _trackPushes++;
             double ox = _panelSurface.RenderTransformOrigin.X * fullW;
             double oy = _panelSurface.RenderTransformOrigin.Y * fullH;
-            GlassService.UpdateLivePanelRect(Panel, fullLeft + ox * (1 - sx), fullTop + oy * (1 - sy) + ty,
-                fullW * sx, fullH * sy, Math.Min(sx, sy));
+            GlassService.UpdateLivePanelRect(Panel, fullLeft, fullTop, fullW, fullH,
+                fullLeft + ox * (1 - sx), fullTop + oy * (1 - sy) + ty,
+                fullW * sx, fullH * sy, sx, sy);
         }
 
         public void HidePanel() => HidePanelAnimated();
@@ -537,6 +637,11 @@ namespace DesktopBar.UI
         private void HidePanelAnimated()
         {
             if (!Open || _closing) return;
+            if (!PanelWindow.IsVisible)
+            {
+                ClosePanelImmediately();
+                return;
+            }
             Open = false;
             _closing = true;
             var duration = TimeSpan.FromMilliseconds(Math.Max(60, (App.Settings?.AnimationDurationMs ?? 180) * 0.75));
@@ -544,8 +649,9 @@ namespace DesktopBar.UI
             if (_panelTransform == null) _panelTransform = new TranslateTransform();
             _panelTransform.BeginAnimation(TranslateTransform.YProperty, new DoubleAnimation((_panelAbove ? 6 : -6) * Ui.Scale, duration) { EasingFunction = ease });
             if (_panelScale == null) _panelScale = new ScaleTransform(1, 1);
-            _panelScale.BeginAnimation(ScaleTransform.ScaleXProperty, new DoubleAnimation(0.58, duration) { EasingFunction = ease });
-            _panelScale.BeginAnimation(ScaleTransform.ScaleYProperty, new DoubleAnimation(0.72, duration) { EasingFunction = ease });
+            bool glass = App.Settings?.PillMaterial is 3 or 4;
+            _panelScale.BeginAnimation(ScaleTransform.ScaleXProperty, new DoubleAnimation(glass ? 0.88 : 0.58, duration) { EasingFunction = ease });
+            _panelScale.BeginAnimation(ScaleTransform.ScaleYProperty, new DoubleAnimation(glass ? 0.91 : 0.72, duration) { EasingFunction = ease });
             int animationVersion = ++_animationVersion;
             // 收起动画期间继续跟踪可见矩形,玻璃随缩小过程重采(最后 HidePanelImmediate 停掉)
             StartPanelTracking();
@@ -599,6 +705,7 @@ namespace DesktopBar.UI
         {
             if (_disposed) return;
             _disposed = true;
+            CancelPendingPillInk();
             _animationVersion++;
             _closeTimer.Stop();
             if (ReferenceEquals(_active, this)) _active = null;
@@ -622,26 +729,36 @@ namespace DesktopBar.UI
 
         protected TextBlock MakeText(string text = "", double delta = 0)
         {
-            var t = new TextBlock { Text = text, VerticalAlignment = VerticalAlignment.Center };
+            var t = new TextBlock
+            {
+                Text = text, VerticalAlignment = VerticalAlignment.Center, FontWeight = FontWeights.SemiBold
+            };
             _texts.Add((t, delta));
             ApplyFont(t, delta);
             return t;
         }
 
+        protected TextBlock MakePillText(string text, double delta = 0)
+        {
+            var label = MakeText(text, delta);
+            label.FontWeight = FontWeights.Medium;
+            return label;
+        }
+
         private void ApplyFont(TextBlock t, double delta)
         {
-            t.FontFamily = new FontFamily("Microsoft YaHei UI");
-            t.FontSize = Math.Max(9, (13 + delta) * Ui.Scale);
-            t.Foreground = Ui.Brush(ThemeService.Text, 1);
+            t.FontFamily = Ui.TextFont;
+            t.FontSize = Math.Max(9, (14 + delta) * Ui.Scale);
+            t.SetResourceReference(TextBlock.ForegroundProperty, ContentInkKey);
         }
 
         protected TextBlock MakePanelTitle(string text)
         {
-            // 登记进 _texts 随主题刷新,否则面板标题在主题切换后保留旧色(delta=1 → 14px)。
+            // 登记进 _texts 随主题刷新，同时应用缩放和面板字色。
             var t = new TextBlock
             {
                 Text = text,
-                FontWeight = FontWeights.SemiBold,
+                FontWeight = FontWeights.Bold,
                 Margin = new Thickness(2, 0, 2, 8)
             };
             _texts.Add((t, 1));
@@ -698,7 +815,7 @@ namespace DesktopBar.UI
                     StrokeStartLineCap = PenLineCap.Round,
                     StrokeEndLineCap = PenLineCap.Round
                 };
-                _themedShapes.Add(line);
+                line.SetResourceReference(Shape.StrokeProperty, ContentInkKey);
                 canvas.Children.Add(line);
 
                 double tipX = cx + ux * r, tipY = cy + uy * r;
@@ -715,7 +832,7 @@ namespace DesktopBar.UI
                     },
                     Fill = Ui.Brush(ThemeService.Text, 1)
                 };
-                _themedFills.Add(tri);
+                tri.SetResourceReference(Shape.FillProperty, ContentInkKey);
                 canvas.Children.Add(tri);
             }
             return IconViewbox(size, canvas);
@@ -733,7 +850,7 @@ namespace DesktopBar.UI
                 StrokeStartLineCap = PenLineCap.Round,
                 StrokeEndLineCap = PenLineCap.Round
             };
-            _themedShapes.Add(path);
+            path.SetResourceReference(Shape.StrokeProperty, ContentInkKey);
             canvas.Children.Add(path);
             return IconViewbox(size, canvas);
         }
@@ -756,7 +873,7 @@ namespace DesktopBar.UI
                 StrokeLineJoin = PenLineJoin.Round,
                 Stretch = Stretch.None
             };
-            _themedShapes.Add(path);
+            path.SetResourceReference(Shape.StrokeProperty, ContentInkKey);
             canvas.Children.Add(path);
             return IconViewbox(size, canvas);
         }
@@ -777,7 +894,7 @@ namespace DesktopBar.UI
                 StrokeLineJoin = PenLineJoin.Round,
                 Stretch = Stretch.None
             };
-            _themedShapes.Add(path);
+            path.SetResourceReference(Shape.StrokeProperty, ContentInkKey);
             canvas.Children.Add(path);
             return IconViewbox(size, canvas);
         }
@@ -791,7 +908,7 @@ namespace DesktopBar.UI
                 Fill = Ui.Brush(ThemeService.Text, 1),
                 Stretch = Stretch.None
             };
-            _themedFills.Add(body);
+            body.SetResourceReference(Shape.FillProperty, ContentInkKey);
             canvas.Children.Add(body);
             wave1 = new Path
             {
@@ -811,8 +928,8 @@ namespace DesktopBar.UI
                 StrokeEndLineCap = PenLineCap.Round,
                 Stretch = Stretch.None
             };
-            _themedShapes.Add(wave1);
-            _themedShapes.Add(wave2);
+            wave1.SetResourceReference(Shape.StrokeProperty, ContentInkKey);
+            wave2.SetResourceReference(Shape.StrokeProperty, ContentInkKey);
             canvas.Children.Add(wave1);
             canvas.Children.Add(wave2);
             return IconViewbox(size, canvas);
@@ -835,7 +952,7 @@ namespace DesktopBar.UI
                 TextWrapping = TextWrapping.NoWrap,
                 Foreground = Ui.Brush(ThemeService.Text, 1)
             };
-            _glyphs.Add(t);
+            t.SetResourceReference(TextBlock.ForegroundProperty, ContentInkKey);
             return t;
         }
 
@@ -853,7 +970,7 @@ namespace DesktopBar.UI
                 Height = size * 0.82 * s,
                 VerticalAlignment = VerticalAlignment.Center
             };
-            _themedShapes.Add(path);
+            path.SetResourceReference(Shape.StrokeProperty, ContentInkKey);
             return path;
         }
 
@@ -870,7 +987,7 @@ namespace DesktopBar.UI
                 StrokeLineJoin = PenLineJoin.Round,
                 Stretch = Stretch.None
             };
-            _themedShapes.Add(path);
+            path.SetResourceReference(Shape.StrokeProperty, ContentInkKey);
             var canvas = new Canvas { Width = 24, Height = 24 };
             canvas.Children.Add(path);
             return IconViewbox(size, canvas);

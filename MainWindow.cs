@@ -40,6 +40,7 @@ namespace DesktopBar
 
         public MainWindow()
         {
+            FontFamily = Ui.TextFont;
             Bar = this;   // 全局单例:MicaService/GlassService/自检都靠它拿"当前顶栏",
                           // 这里漏赋值过一次,导致液态玻璃几何换算永远拿到 null 而静默不生效。
             AllowsTransparency = true;
@@ -139,6 +140,9 @@ namespace DesktopBar
         {
             if (_closing) return;
             int layoutVersion = ++_layoutVersion;
+            _glassPills.Clear();
+            _pendingGlassPills.Clear();
+            _glassLayoutDirty = true;
             DisposeModules();
             Height = 46 * Ui.Scale;
 
@@ -273,12 +277,29 @@ namespace DesktopBar
             }));
         }
 
-        private List<Rect> _lastGlassRects;
+        private List<(ModuleBase Module, Rect Bounds)> _glassPills = new();
+        private List<(ModuleBase Module, Rect Bounds)> _pendingGlassPills = new();
+        private bool _glassLayoutDirty = true;
 
-        /// <summary>玻璃参数变化(如"间隙玻璃"滑条)后强制重算裁剪几何:清缓存再算,避免被 Rect 比较挡掉。</summary>
+        internal void ResetGlassInk()
+        {
+            foreach (var pill in _glassPills) pill.Module.ApplyPillInk(null);
+        }
+
+        internal void UpdateGlassInk(byte[] pixels, int width, int height, double imageHeight, GlassService.GlassLook look, double opacity)
+        {
+            if (ActualWidth <= 0 || imageHeight <= 0) return;
+            foreach (var (module, bounds) in _glassPills)
+            {
+                var area = new Rect(bounds.X / ActualWidth, bounds.Y / imageHeight,
+                    bounds.Width / ActualWidth, bounds.Height / imageHeight);
+                module.ApplyPillInk(GlassService.SurfaceLightness(pixels, width, height, area, look, opacity));
+            }
+        }
+
         internal void RefreshGlassClip()
         {
-            _lastGlassRects = null;
+            _glassLayoutDirty = true;
             UpdateGlassClip();
         }
 
@@ -295,22 +316,25 @@ namespace DesktopBar
             if (S.PillMaterial != 3 && S.PillMaterial != 4) return;
             var root = Content as Grid;
             if (root == null) return;
-            var rects = new List<Rect>();
-            try
+            _pendingGlassPills.Clear();
+            if (root.ActualWidth < 1 || root.ActualHeight < 1) return;
+            var viewport = new Rect(0, 0, root.ActualWidth, root.ActualHeight);
+            foreach (var module in _modules)
             {
-                foreach (var m in _modules)
-                {
-                    if (m == null || m.Visibility != Visibility.Visible || m.ActualWidth < 1) continue;
-                    var pill = m.Pill;
-                    if (pill == null || pill.ActualWidth < 1) continue;
-                    Rect r = pill.TransformToAncestor(root)
-                        .TransformBounds(new Rect(0, 0, pill.ActualWidth, pill.ActualHeight));
-                    rects.Add(r);
-                }
+                var pill = module.Pill;
+                if (module.Visibility != Visibility.Visible || pill.ActualWidth < 1 || pill.ActualHeight < 1
+                    || !root.IsAncestorOf(pill)) continue;
+                var rect = pill.TransformToAncestor(root)
+                    .TransformBounds(new Rect(0, 0, pill.ActualWidth, pill.ActualHeight));
+                if (rect.IntersectsWith(viewport)) _pendingGlassPills.Add((module, rect));
             }
-            catch { }
-            if (SameRects(rects, _lastGlassRects)) return;   // 布局没动:直接返回,不给 Clip 赋新值
-            _lastGlassRects = rects;
+
+            if (!_glassLayoutDirty && SameGlassLayout()) return;
+            (_glassPills, _pendingGlassPills) = (_pendingGlassPills, _glassPills);
+            _pendingGlassPills.Clear();
+            _glassLayoutDirty = false;
+            var rects = new List<Rect>(_glassPills.Count);
+            foreach (var pill in _glassPills) rects.Add(pill.Bounds);
             // 实验性选项(环境变量):胶囊间隙也铺玻璃,强度按倍数淡化。0/未设置=维持"胶囊外完全透明"的穿透契约。
             double gapFill = GlassService.GapFill;
             GeometryGroup group = null;
@@ -336,14 +360,16 @@ namespace DesktopBar
             }
         }
 
-        /// <summary>Rect 集合逐项比较(0.25 DIP 容差,抵消布局亚像素抖动)。</summary>
-        private static bool SameRects(List<Rect> a, List<Rect> b)
+        // 布局回调可能很频繁，同一个模块的亚像素抖动不触发纹理重建。
+        private bool SameGlassLayout()
         {
-            if (a == null || b == null || a.Count != b.Count) return false;
-            for (int i = 0; i < a.Count; i++)
+            if (_glassPills.Count != _pendingGlassPills.Count) return false;
+            for (int i = 0; i < _glassPills.Count; i++)
             {
-                if (Math.Abs(a[i].X - b[i].X) > 0.25 || Math.Abs(a[i].Y - b[i].Y) > 0.25 ||
-                    Math.Abs(a[i].Width - b[i].Width) > 0.25 || Math.Abs(a[i].Height - b[i].Height) > 0.25)
+                var (module, a) = _glassPills[i];
+                var (nextModule, b) = _pendingGlassPills[i];
+                if (!ReferenceEquals(module, nextModule) || Math.Abs(a.X - b.X) > 0.25 || Math.Abs(a.Y - b.Y) > 0.25
+                    || Math.Abs(a.Width - b.Width) > 0.25 || Math.Abs(a.Height - b.Height) > 0.25)
                     return false;
             }
             return true;

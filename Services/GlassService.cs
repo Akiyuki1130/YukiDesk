@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -7,9 +8,11 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using System.Windows.Media.Media3D;
 using System.Windows.Shapes;
 using System.Windows.Threading;
 using DesktopBar.Interop;
+using DesktopBar.Models;
 using DesktopBar.UI;
 
 namespace DesktopBar.Services
@@ -19,10 +22,10 @@ namespace DesktopBar.Services
     /// 高斯模糊后按胶囊并集铺在主窗口最底层——Apple/小米式"真·毛玻璃"。悬停展开页同理。
     ///
     /// 性能设计(实测教训:WPF BlurEffect 铺满 2560 宽条带会把渲染线程打满一个核):
-    ///   - 模糊全部在捕获线程用"半分辨率 + 滑动和三趟盒式模糊(O(n),与半径无关)"完成,
+    ///   - 主体用四分之一分辨率和三趟盒式模糊，轮廓保留半分辨率锐帧，
     ///     WPF 侧只剩一张普通位图,时钟 250ms/频谱 60fps 的局部重绘不再触发任何模糊重算;
     ///   - 降采样差分门控:静止桌面 0 写屏;遮挡(全屏窗口盖住顶栏)时 0 采样;
-    ///   - 展开页玻璃是一次性捕获(打开时抓一张、模糊、烘焙染色),静止零开销。
+    ///   - 展开页实时采样固定区域；开合时移动纹理视口，静止不重新模糊或上传。
     ///
     /// 捕获配方(根因报告 §9.12.1):GetDC(NULL)+CreateDIBSection(top-down)+BitBlt(SRCCOPY);
     /// 自家窗口(主窗+面板)全部 WDA_EXCLUDEFROMCAPTURE 排除,否则玻璃把自己拍进去(正反馈);
@@ -43,8 +46,13 @@ namespace DesktopBar.Services
             public int Height;           // 条带物理高(偶数)
             public int HalfWidth;
             public int HalfHeight;
-            public int BlurHalf;         // 半分辨率域的盒式半径
+            public int BodyWidth => Width / 4;
+            public int BodyHeight => Height / 4;
+            public int BlurQuarter;
             public int FpsMs;            // 捕获基础间隔
+            public int WallpaperFadeMs;
+            public bool Liquid;
+            public int DisplayGeneration;
             public int MidY;             // 遮挡探测采样点的物理 y(胶囊中线)
             public double ImageHeightDip;
         }
@@ -63,7 +71,8 @@ namespace DesktopBar.Services
         private static readonly double LiquidSheen = ReadEnvDouble("YUKI_LIQUID_SHEEN", 1.0);
         private static volatile GlassSpec _spec;
 
-        private static bool _started, _stopped, _enabled, _active = true, _stopThread;
+        private static bool _started;
+        private static volatile bool _stopped, _enabled, _active = true, _stopThread;
         private static long _holdUntil;
 
         // ---- 诊断/取证 ----(双用途:YUKI_GLASS_DUMP 与 --glassshot;常开计数开销可忽略)
@@ -78,6 +87,7 @@ namespace DesktopBar.Services
         internal static long StatWrites;        // 实际 WritePixels 到模糊位图的次数
         internal static long StatSharpWrites;   // 实际 WritePixels 到未模糊位图的次数(仅液态玻璃)
         internal static long StatPanelFrames;   // 展开页实时玻璃真正发布的帧数(静态时为 0)
+        internal static long StatPanelCaptures, StatPanelBlurs, StatPanelWrites, StatPanelSharpWrites, StatPanelWarmOpens;
         internal static long StatDxgiIdle;      // GPU 捕获:等不到新合成帧的次数(桌面没变化,零成本)
         internal static long StatDxgiSkip;      // GPU 捕获:拿到帧但脏矩形不碰顶栏条带,整帧跳过
         // 分阶段耗时(Stopwatch 刻度):定位"4~5ms 一帧到底花在哪"
@@ -87,7 +97,7 @@ namespace DesktopBar.Services
         internal static int LatestHeight { get { return _latestH; } }
 
         private static Thread _thread;
-        private static readonly ManualResetEventSlim _wake = new ManualResetEventSlim(false);
+        private static readonly AutoResetEvent _wake = new AutoResetEvent(false);
 
         // 发布区(捕获线程写,UI 线程读,全部在 Gate 下)。轮换池 3 块:
         // UI 线程 WritePixels 拷贝(~0.5ms)与捕获线程复用之间至少隔 2 帧,杜绝撕裂。
@@ -95,14 +105,18 @@ namespace DesktopBar.Services
         // 未模糊帧也走三块轮换池:着色器轮廓折射要用它(见 LiquidGlassEffect.Sharp)。
         private static readonly byte[][] _rotateSharp = new byte[3][];
         private static int _rotateIndex;
-        private static byte[] _latest, _consumed, _latestSharp;
-        private static int _latestW, _latestH;
+        private static byte[] _latest, _latestSharp;
+        private static long _latestSequence, _consumedSequence, _latestCaptureTick;
+        private static bool _latestSlideBlending;
+        private static int _latestW, _latestH, _displayGeneration;
+        private static GlassSpec _latestSpec;
 
         // 玻璃层三件套(UI 线程),跨 ApplySettings 全量重建复用,避免重建瞬间空一帧
         private static Grid _host;
         private static Image _image;
         private static Border _tint;
         private static WriteableBitmap _wb, _wbSharp;
+        private static bool _bodyReady;
         // UI 泵由"发布"驱动:捕获线程发布新帧后才 BeginInvoke 一次(合并去重)。
         // 曾经是 30fps 常开 DispatcherTimer,静止桌面下每拍都唤醒 UI 线程纯属浪费(实测约 0.5% 单核)。
         private static int _pumpQueued;
@@ -122,15 +136,14 @@ namespace DesktopBar.Services
         // 帧数阈值在 60fps 设置下要等 0.5~1.5 秒才降频,期间白烧 12% 单核。
         private static long _lastPubTick;   // 上次发布的时刻(TickCount64),用于小幅漂移限流
         // 「捕获开始 → UI 线程写进 WriteableBitmap」的延迟统计,用于回答"玻璃有几帧延迟"。
-        private static long _pubCaptureTick;
+        private static long _pubCaptureTick, _panelWrittenCaptureTick;
         private static double _latLastMs, _latSumMs, _latMaxMs;
         private static int _latCount;
         // 「捕获开始 → WPF 开始渲染这一帧」= 端到端管线延迟(一个屏幕刷新周期 ≈ 一帧)。
         // 只在 --glassperf 里临时订阅 CompositionTarget.Rendering:常驻订阅会让 WPF 渲染循环永不歇,白烧 CPU。
         private static EventHandler _latRenderHook;
-        private static long _latRenderSeen;
-        private static double _latRenderLastMs, _latRenderSumMs, _latRenderMaxMs;
-        private static int _latRenderCount, _renderFrames;
+        private static RenderLatencySamples _barRenderSamples, _panelRenderSamples;
+        private static int _renderFrames;
         private static long _renderStartTick;
         // 诊断开关:跳过静止差分门控,强制每帧发布(=模拟"顶栏背后一直在动"的最坏情况,如动态壁纸/视频)。
         private static bool _alwaysPub;
@@ -138,7 +151,7 @@ namespace DesktopBar.Services
         // GPU 捕获(DXGI Desktop Duplication)。抓一帧约 0.35ms(BitBlt 是 3.5~6ms),
         // 而且 AcquireNextFrame 会阻塞到下一次桌面合成 → 节拍自动等于刷新率、端到端只延迟一帧。
         // 设备初始化失败(老系统/受保护内容/会话被占用)时回退 GDI,功能不受影响。
-        private static DxgiCapture _dxgi;
+        private static volatile DxgiCapture _dxgi;
         private static bool _dxgiTried;
 
         /// <summary>App 启动时调用:只订阅事件,不开线程。真正的开销由 EnsureHost(材质=3)驱动。</summary>
@@ -173,52 +186,70 @@ namespace DesktopBar.Services
             ApplyExclusionAll();
             _shotPause = false;
             _wake.Set();
+            _panelWake.Set();
         }
 
-        /// <summary>开启/关闭渲染侧延迟探针(只给性能自检用,平时必须关掉)。</summary>
+        private sealed class RenderLatencySamples
+        {
+            private readonly double[] _values = new double[8192];
+            private int _count, _next;
+            private long _seen;
+
+            public RenderLatencySamples(long alreadyWritten) { _seen = alreadyWritten; }
+
+            public void Add(long captureTick, long renderTick)
+            {
+                if (captureTick == 0 || captureTick == _seen) return;
+                _seen = captureTick;
+                double ms = (renderTick - captureTick) * 1000.0 / Stopwatch.Frequency;
+                if (ms < 0) return;
+                _values[_next] = ms;
+                _next = (_next + 1) % _values.Length;
+                _count = Math.Min(_count + 1, _values.Length);
+            }
+
+            public string Report()
+            {
+                if (_count == 0) return "无新帧";
+                double[] ordered = _values.AsSpan(0, _count).ToArray();
+                Array.Sort(ordered);
+                double median = ordered[(int)Math.Ceiling(ordered.Length * 0.50) - 1];
+                double p95 = ordered[(int)Math.Ceiling(ordered.Length * 0.95) - 1];
+                return $"P50={median:F2}ms P95={p95:F2}ms 峰值={ordered[ordered.Length - 1]:F2}ms 样本={_count}";
+            }
+        }
+
+        /// <summary>仅在自检期间订阅 WPF 渲染事件，记录已经写入位图的帧。</summary>
         internal static void SetRenderLatencyProbe(bool on)
         {
-            try
+            if (on && _latRenderHook == null)
             {
-                if (on)
+                _barRenderSamples = new RenderLatencySamples(Interlocked.Read(ref _pubCaptureTick));
+                _panelRenderSamples = new RenderLatencySamples(Interlocked.Read(ref _panelWrittenCaptureTick));
+                _renderFrames = 0;
+                _renderStartTick = Environment.TickCount64;
+                _latRenderHook = (s, e) =>
                 {
-                    if (_latRenderHook != null) return;
-                    _latRenderLastMs = _latRenderSumMs = _latRenderMaxMs = 0;
-                    _latRenderCount = 0;
-                    _renderFrames = 0;
-                    _renderStartTick = Environment.TickCount64;
-                    _latRenderSeen = 0;
-                    _latRenderHook = (s, e) =>
-                    {
-                        _renderFrames++;
-                        long ct = Interlocked.Read(ref _pubCaptureTick);
-                        if (ct == 0 || ct == Interlocked.Read(ref _latRenderSeen)) return;
-                        Interlocked.Exchange(ref _latRenderSeen, ct);
-                        double ms = (System.Diagnostics.Stopwatch.GetTimestamp() - ct) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-                        _latRenderLastMs = ms;
-                        _latRenderSumMs += ms;
-                        if (ms > _latRenderMaxMs) _latRenderMaxMs = ms;
-                        _latRenderCount++;
-                    };
-                    System.Windows.Media.CompositionTarget.Rendering += _latRenderHook;
-                }
-                else if (_latRenderHook != null)
-                {
-                    System.Windows.Media.CompositionTarget.Rendering -= _latRenderHook;
-                    _latRenderHook = null;
-                }
+                    _renderFrames++;
+                    long now = Stopwatch.GetTimestamp();
+                    _barRenderSamples.Add(Interlocked.Read(ref _pubCaptureTick), now);
+                    _panelRenderSamples.Add(Interlocked.Read(ref _panelWrittenCaptureTick), now);
+                };
+                CompositionTarget.Rendering += _latRenderHook;
             }
-            catch { }
+            else if (!on && _latRenderHook != null)
+            {
+                CompositionTarget.Rendering -= _latRenderHook;
+                _latRenderHook = null;
+            }
         }
 
-        /// <summary>渲染侧统计:实际渲染帧率 + 「捕获开始→开始渲染」延迟(端到端管线延迟,1 帧≈一个刷新周期)。</summary>
         internal static string RenderLatencyReport()
         {
             long ms = Environment.TickCount64 - _renderStartTick;
             double fps = ms <= 0 ? 0.0 : _renderFrames * 1000.0 / ms;
-            return string.Format("渲染帧={0} 渲染帧率={1:F1}fps 捕获→开始渲染={2:F1}/{3:F1}/{4:F1}ms(末/均/峰) 样本={5}",
-                _renderFrames, fps, _latRenderLastMs,
-                _latRenderCount == 0 ? 0.0 : _latRenderSumMs / _latRenderCount, _latRenderMaxMs, _latRenderCount);
+            return $"WPF渲染帧={_renderFrames} 帧率={fps:F1}fps 捕获→渲染回调"
+                + $" 顶栏[{_barRenderSamples?.Report()}] 面板[{_panelRenderSamples?.Report()}]";
         }
 
         /// <summary>诊断快照:一行人类可读状态,写进日志/取证目录。</summary>
@@ -227,15 +258,15 @@ namespace DesktopBar.Services
             var s = App.Settings;
             var spec = _spec;
             double busyMs = StatBusyTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-            string fpsText = spec == null ? "?" : (spec.FpsMs <= 0 ? "不限" : Math.Round(1000.0 / spec.FpsMs).ToString("F0"));
+            string fpsText = spec == null ? "?" : EffectiveFps(s?.GlassMaxFps ?? 0, panel: false).ToString();
             return string.Format(
-                "材质={0} 启用={1} 采样规格={2}x{3}(半分辨率 {4}x{5}) 捕获帧={6} 发布={7} BitBlt={8} 累计忙={9:F1}ms 液态着色器={10} 帧率上限={11} 泵tick={12} 写帧={13} 写锐帧={14} 面板帧={15} 捕获→写屏={16:F1}/{17:F1}/{18:F1}ms(末/均/峰) 捕获相位={19} GPU捕获={20} 空等={21} 脏区跳过={22}",
+                "材质={0} 启用={1} 采样规格={2}x{3}(主体 {4}x{5}) 捕获帧={6} 发布={7} BitBlt={8} 累计忙={9:F1}ms 液态着色器={10} 帧率上限={11} 泵tick={12} 写帧={13} 写锐帧={14} 面板帧={15} 捕获→写屏={16:F1}/{17:F1}/{18:F1}ms(末/均/峰) 捕获相位={19} GPU捕获={20} 空等={21} 脏区跳过={22}",
                 s == null ? -1 : s.PillMaterial, _enabled,
                 spec == null ? 0 : spec.Width, spec == null ? 0 : spec.Height,
                 _latestW, _latestH,
                 Interlocked.Read(ref StatFrames), Interlocked.Read(ref StatPublishes),
                 Interlocked.Read(ref StatBlits), busyMs,
-                _liquid == null ? "无(降级普通玻璃)" : "已启用",
+                _liquid != null && ReferenceEquals(_image?.Effect, _liquid) ? "已启用" : "无",
                 fpsText,
                 Interlocked.Read(ref StatPumps), Interlocked.Read(ref StatWrites), Interlocked.Read(ref StatSharpWrites),
                 Interlocked.Read(ref StatPanelFrames),
@@ -245,7 +276,7 @@ namespace DesktopBar.Services
                 Interlocked.Read(ref StatDxgiIdle), Interlocked.Read(ref StatDxgiSkip));
         }
 
-        /// <summary>取证:把当前发布的玻璃输入帧(半分辨率模糊结果)另存为 PNG。</summary>
+        /// <summary>取证:把当前发布的玻璃主体另存为 PNG。</summary>
         internal static bool SaveLatestPng(string path)
         {
             byte[] f; int w, h;
@@ -274,6 +305,8 @@ namespace DesktopBar.Services
             Interlocked.Exchange(ref _pumpQueued, 0);
             _enabled = false;
             _stopThread = true;
+            _panelThreadStop = true;
+            StopLivePanel(null);
             _wake.Set();
             // 等捕获线程真的退出再释放 GPU 会话:线程若还卡在 AcquireNextFrame/CopyBand 原生调用里
             // 就被 Dispose 掉设备,会踩到已释放的 D3D 对象(进程退出瞬间随机 AV/异常退出码)。
@@ -287,11 +320,8 @@ namespace DesktopBar.Services
             }
             catch { }
             TraceStop("join 结束 alive=" + (_thread != null && _thread.IsAlive));
-            bool captureGone = _thread == null || !_thread.IsAlive;
-            DxgiCapture dx = captureGone ? _dxgi : null;   // 线程还在跑就只丢引用,绝不释放它正在用的原生对象
-            _dxgi = null; _dxgiTried = true;   // 停止后不再重建(重启走 Start)
-            if (dx != null) DisposeDxgiAsync(dx);
-            TraceStop("GPU 会话处理完毕");
+            // 按现有退出策略把最后一个 DXGI 会话交给进程回收，避免驱动 Release 阻塞退出。
+            if (_thread == null || !_thread.IsAlive) _dxgi = null;
             RestoreExclusionAll();
             TraceStop("WDA 已还原");
             try { if (_host != null && _host.Parent is Panel p) p.Children.Remove(_host); } catch { }
@@ -327,6 +357,8 @@ namespace DesktopBar.Services
                 else if (_host.Parent is Decorator oldDecorator) oldDecorator.Child = null;
             }
             catch { }
+            _image.Opacity = s.GlassOpacity;
+            SetFallbackTint(s);
             RefreshSpec();
             SetEnabled(true);
             // 展开页着色器提前编好:面板几何全走寄存器,同一份字节码服务任意尺寸,
@@ -344,111 +376,194 @@ namespace DesktopBar.Services
             if (!ui.CheckAccess()) { ui.BeginInvoke(new Action(() => { try { ApplyLive(); } catch { } })); return; }
             var s = App.Settings;
             if (s == null) return;
+            ThemeService.Refresh();
             RefreshSpec();
             if (_image != null) _image.Opacity = Math.Max(0.05, Math.Min(1, s.GlassOpacity));
-            if (_tint != null)
-            {
-                _tint.Background = Ui.Brush(s.GlassTint, 1);
-                _tint.Opacity = Math.Max(0, Math.Min(1, s.GlassTintOpacity));
-            }
-            // 液态玻璃:着色器挂在 Image 上(输入=已模糊的捕获图),几何变化时由 UpdateLiquidConstants 重编译,
-            // 编译失败静默降级普通玻璃
-            bool liquid = s.PillMaterial == 4;
-            if (!liquid && _image != null) _image.Effect = null;
-            if (liquid) UpdateLiquidConstants();
-            // 间隙玻璃强度变了要重算裁剪/遮罩(它由主窗的 LayoutUpdated 派生,这里主动踢一次)
+            SetFallbackTint(s);
             try { MainWindow.Bar?.RefreshGlassClip(); } catch { }
-            // 展开页正开着时滑杆要立刻生效:丢掉差分门控的上一帧,让捕获线程马上重出一帧。
-            // 材质切离玻璃档(3/4)则直接停掉实时采样,由 ModuleBase.ApplyTheme 恢复主题色背景。
-            if (_panelLive)
-            {
-                if (s.PillMaterial == 3 || s.PillMaterial == 4)
-                {
-                    _panelPrevSharp = null;
-                    try { _panelWake?.Set(); } catch { }
-                }
-                else
-                {
-                    _panelLive = false;
-                    _panelPrevSharp = null;
-                    // 材质切离玻璃档:玻璃层必须自己清空(它是黑色填充+着色器),
-                    // 否则展开页会被这块黑底盖住,看不到 ApplyTheme 恢复的主题色。
-                    try
-                    {
-                        if (_panelSurface != null)
-                        {
-                            _panelSurface.Effect = null;
-                            _panelSurface.Fill = Brushes.Transparent;
-                        }
-                    }
-                    catch { }
-                    try { _panelWake?.Set(); } catch { }
-                }
-            }
+            RefreshPanelMaterial(s);
         }
 
-        /// <summary>把胶囊矩形(DIP)换算成半分辨率捕获图像素坐标;几何变化时重编译着色器(几何烘焙进字面量)。</summary>
-        private static bool _liquidDiagLogged;
+        private static bool _liquidAttempted;
+        private static int _wallpaperGeneration;
+
+        internal readonly record struct GlassLook(double Blur, Color Tint, double TintOpacity,
+            double Refraction, double Rim, double Chroma, double Lift);
+
+        internal static double FrostLevel(AppSettings settings) => settings.GlassFrost ?? (settings.GlassStyle switch
+        {
+            1 => 0.75, 2 => 0.50, _ => 0.25
+        });
+
+        internal static GlassLook CurrentLook(AppSettings settings, double? frostPreview = null)
+        {
+            if (settings.PillMaterial != 4) return CustomLook(settings);
+
+            double frost = Math.Clamp(frostPreview ?? FrostLevel(settings), 0, 1);
+            if (settings.GlassStyle == 2)
+            {
+                var custom = CustomLook(settings);
+                // 50% 等于自定义面板里的基准模糊和染色；雾面不会改动折射参数。
+                double blur = frost <= 0.50 ? 2 + (custom.Blur - 2) * frost * 2
+                    : custom.Blur + (Math.Min(60, custom.Blur * 2) - custom.Blur) * (frost * 2 - 1);
+                return custom with { Blur = blur, TintOpacity = Math.Min(1, custom.TintOpacity * frost * 2) };
+            }
+
+            // 25% 和 75% 分别保留原清透与柔雾的强度。
+            double radius = frost <= 0.25 ? 2 + frost * 36 : 11 + (frost - 0.25) * 22;
+            double tint = frost <= 0.25 ? frost * 0.22 : 0.055 + (frost - 0.25) * 0.19;
+            return settings.GlassStyle == 1
+                ? new GlassLook(radius, Color.FromRgb(252, 246, 237), tint, 0.39, 0.46, 0, 0.21)
+                : new GlassLook(radius, Color.FromRgb(250, 244, 236), tint, 0.63, 0.60, 0, 0.24);
+        }
+
+        private static GlassLook CustomLook(AppSettings settings) =>
+            new GlassLook(settings.GlassBlurRadius, Ui.ParseColor(settings.GlassTint), settings.GlassTintOpacity,
+                settings.GlassRefraction, settings.GlassRim, settings.GlassChroma, 0);
+
+        internal static bool UsesAdaptiveInk(AppSettings settings) =>
+            settings?.PillMaterial is 3 or 4 && ThemeService.FollowsBackground(settings);
+
+        internal static void WallpaperChanged()
+        {
+            Interlocked.Increment(ref _wallpaperGeneration);
+            _wake.Set();
+        }
+
+        internal static int EffectiveFps(int configured, bool panel) => configured > 0 ? configured : panel ? 36 : 48;
+
+        private static void SetFallbackTint(AppSettings settings)
+        {
+            if (_tint == null) return;
+            var look = CurrentLook(settings);
+            var brush = new SolidColorBrush(look.Tint);
+            brush.Freeze();
+            _tint.Background = brush;
+            _tint.Opacity = look.TintOpacity;
+        }
+
+        private static readonly double[] LinearChannels = BuildLinearChannels();
+
+        private static double[] BuildLinearChannels()
+        {
+            var table = new double[256];
+            for (int i = 0; i < table.Length; i++)
+            {
+                double c = i / 255.0;
+                table[i] = c <= 0.04045 ? c / 12.92 : Math.Pow((c + 0.055) / 1.055, 2.4);
+            }
+            return table;
+        }
+
+        // 采样文字所在的胶囊中部，并在计算对比度前近似合成实际的提亮、染色和覆盖度。
+        internal static double SurfaceLightness(byte[] pixels, int width, int height, Rect area, GlassLook look, double opacity)
+        {
+            double total = 0;
+            double tint = look.TintOpacity * opacity;
+            double redTint = look.Tint.R * tint, greenTint = look.Tint.G * tint, blueTint = look.Tint.B * tint;
+            for (int row = 1; row <= 3; row++)
+            {
+                int y = Math.Clamp((int)((area.Y + area.Height * row / 4) * height), 0, height - 1);
+                for (int col = 1; col <= 5; col++)
+                {
+                    int x = Math.Clamp((int)((area.X + area.Width * col / 6) * width), 0, width - 1);
+                    int i = (y * width + x) * 4;
+                    byte r = pixels[i + 2], g = pixels[i + 1], b = pixels[i];
+                    double dark = 1 - (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+                    double lift = look.Lift * dark * dark * opacity * (1 - look.TintOpacity);
+                    double source = 1 - tint - lift;
+                    int rr = (int)(source * r + lift * 255 + redTint + 0.5);
+                    int gg = (int)(source * g + lift * 255 + greenTint + 0.5);
+                    int bb = (int)(source * b + lift * 255 + blueTint + 0.5);
+                    total += 0.2126 * LinearChannels[rr] + 0.7152 * LinearChannels[gg] + 0.0722 * LinearChannels[bb];
+                }
+            }
+            return total / 15;
+        }
+
+        private static void RefreshPillInk(byte[] body, int width, int height, GlassSpec spec)
+        {
+            var bar = MainWindow.Bar;
+            var settings = App.Settings;
+            if (bar == null || body == null || width == 0 || height == 0) return;
+            if (!UsesAdaptiveInk(settings)) return;
+            var look = CurrentLook(settings);
+            if (_image?.Effect == null) look = look with { Lift = 0 };
+            bar.UpdateGlassInk(body, width, height, spec.ImageHeightDip, look, settings.GlassOpacity);
+        }
+
         private static void UpdateLiquidConstants()
         {
-            if (_liquidDiagLogged == false)
-            {
-                _liquidDiagLogged = true;
-                App.Log(string.Format("液态玻璃:UpdateLiquidConstants 首次调用 image={0} spec={1} bar={2} 材质={3}",
-                    _image == null ? "null" : "ok", _spec == null ? "null" : "ok",
-                    MainWindow.Bar == null ? "null" : "ok", App.Settings == null ? -1 : App.Settings.PillMaterial));
-            }
-            if (_image == null) return;
             var s = App.Settings;
             var spec = _spec;
             var bar = MainWindow.Bar;
-            if (s == null || spec == null || bar == null) return;
-            if (s.PillMaterial != 4) return;   // 只有液态玻璃档挂着色器;普通玻璃(3)保持纯位图
-            // DIP→半分辨率像素:x 方向按"条带铺满窗口宽"换算;y 方向 ImageHeightDip 对应 HalfHeight。
-            double sx = spec.HalfWidth / Math.Max(1, bar.ActualWidth);
-            double sy = spec.HalfHeight / Math.Max(1, spec.ImageHeightDip);
-            var rects = _pillRectsDip;
-            int count = Math.Min(16, rects == null ? 0 : rects.Count);
-            var data = new float[count][];
-            var sig = new System.Text.StringBuilder();
-            for (int i = 0; i < count; i++)
+            if (_image == null || s == null || spec == null || bar == null) return;
+            if (s.PillMaterial == 4 && !_liquidAttempted)
             {
-                var r = rects[i];
-                data[i] = new[]
-                {
-                    (float)((r.X + r.Width * 0.5) * sx),
-                    (float)((r.Y + r.Height * 0.5) * sy),
-                    (float)Math.Max(1, r.Width * 0.5 * sx),
-                    (float)Math.Max(1, r.Height * 0.5 * sy)
-                };
-                sig.Append(data[i][0].ToString("F1")).Append(',').Append(data[i][1].ToString("F1"))
-                   .Append(',').Append(data[i][2].ToString("F1")).Append(',').Append(data[i][3].ToString("F1")).Append(';');
+                _liquidAttempted = true;
+                _liquid = LiquidGlassEffect.CreatePills(1, spec.HalfWidth, spec.HalfHeight);
+                App.Log(_liquid != null ? "液态玻璃:胶囊着色器已启用" : "液态玻璃:胶囊使用普通玻璃");
             }
-            double radiusPx = 19 * Ui.Scale * NativeMethods.SystemDpiScale() * 0.5;
-            sig.Append('|').Append(radiusPx.ToString("F1")).Append('|')
-               .Append(spec.HalfWidth).Append('x').Append(spec.HalfHeight);
-            string signature = sig.ToString();
-            if (signature != _liquidSignature)
+            var effect = s.PillMaterial == 4 ? _liquid : null;
+            if (!UsesAdaptiveInk(s)) bar.ResetGlassInk();
+            if (effect != null)
             {
-                // 编译失败也记下签名:下次几何真正变化才重试,避免每个布局事件都重编译
-                _liquidSignature = signature;
-                _liquid = LiquidGlassEffect.Create(data, count, radiusPx, spec.HalfWidth, spec.HalfHeight);
+                double sx = spec.HalfWidth / Math.Max(1, bar.ActualWidth);
+                double sy = spec.HalfHeight / Math.Max(1, spec.ImageHeightDip);
+                double radius = 19 * Ui.Scale * sy;
+                SetGeometry(effect, radius, spec.HalfWidth, spec.HalfHeight);
+                effect.SetPills(_pillRectsDip, sx, sy, EdgeWidth(radius));
+                SetOptics(effect, s);
                 SyncLiquidInput();
-                _image.Effect = _liquid;        // null = 降级普通玻璃
-                App.Log(_liquid != null
-                    ? "液态玻璃:着色器已启用(胶囊=" + count + " 半径=" + radiusPx.ToString("F1") + "px)"
-                    : "液态玻璃:着色器创建失败,已降级为普通玻璃");
             }
-            if (_liquid != null)
+            ShowGlassEffect(effect);
+            lock (Gate)
             {
-                _liquid.Refr = s.GlassRefraction;
-                _liquid.Rim = s.GlassRim;
-                _liquid.Chroma = s.GlassChroma;
-                _liquid.Sheen = LiquidSheen;
+                if (!_latestSlideBlending && SameCaptureSpec(spec, _latestSpec))
+                    RefreshPillInk(_latest, _latestW, _latestH, spec);
             }
         }
 
-        private static string _liquidSignature;
+        private static void ShowGlassEffect(LiquidGlassEffect effect)
+        {
+            var visible = _bodyReady ? effect : null;
+            if (_image.Effect != visible) _image.Effect = visible;
+            if (_tint != null) _tint.Visibility = visible == null ? Visibility.Visible : Visibility.Collapsed;
+        }
+
+        private static double EdgeWidth(double radius) => Math.Max(1, radius * 0.55);
+
+        private static void SetGeometry(LiquidGlassEffect effect, double radius, double width, double height)
+        {
+            effect.TexW = width;
+            effect.TexH = height;
+            effect.Radius = radius;
+            effect.EdgeWidth = EdgeWidth(radius);
+        }
+
+        internal static void SetOptics(LiquidGlassEffect effect, AppSettings settings) => SetOptics(effect, CurrentLook(settings));
+
+        internal static void SetOptics(LiquidGlassEffect effect, GlassLook look)
+        {
+            effect.Refr = look.Refraction;
+            effect.Rim = look.Rim;
+            effect.Chroma = look.Chroma;
+            effect.Sheen = LiquidSheen;
+            effect.Lift = look.Lift;
+            effect.Tint = new Point4D(look.Tint.R / 255.0, look.Tint.G / 255.0, look.Tint.B / 255.0, look.TintOpacity);
+        }
+
+        internal static BitmapSource BlurPreview(BitmapSource source, double radius)
+        {
+            int width = source.PixelWidth;
+            int height = source.PixelHeight;
+            var pixels = new byte[width * height * 4];
+            source.CopyPixels(pixels, width * 4, 0);
+            BoxBlur3(pixels, new byte[pixels.Length], width, height, BoxRadiusFor(radius, 2));
+            var blurred = BitmapSource.Create(width, height, 96, 96, PixelFormats.Bgra32, null, pixels, width * 4);
+            blurred.Freeze();
+            return blurred;
+        }
 
         /// <summary>把当前位图挂到着色器的显式采样源上(见 LiquidGlassEffect.Input 的注释)。</summary>
         private static void SyncLiquidInput()
@@ -456,12 +571,11 @@ namespace DesktopBar.Services
             if (_liquid == null || _wb == null) return;
             if (_liquidBrush == null || !ReferenceEquals(_liquidBrush.ImageSource, _wb))
                 _liquidBrush = new ImageBrush(_wb) { Stretch = Stretch.Fill };
-            // 每次都必须赋:着色器对象在几何变化时会被**整个重建**,新对象的 Input 是 null,
-            // 采样器未绑定 → 采样到全黑(踩过:只在新位图时赋值,结果液态玻璃一直是死黑)。
             if (!ReferenceEquals(_liquid.Input, _liquidBrush)) _liquid.Input = _liquidBrush;
             if (_wbSharp != null && (_sharpBrush == null || !ReferenceEquals(_sharpBrush.ImageSource, _wbSharp)))
                 _sharpBrush = new ImageBrush(_wbSharp) { Stretch = Stretch.Fill };
-            if (_sharpBrush != null && !ReferenceEquals(_liquid.Sharp, _sharpBrush)) _liquid.Sharp = _sharpBrush;
+            var sharp = _wbSharp == null ? _liquidBrush : _sharpBrush;
+            if (!ReferenceEquals(_liquid.Sharp, sharp)) _liquid.Sharp = sharp;
         }
 
         /// <summary>主窗/悬停面板注册:玻璃启用期间排除出屏幕捕获;未启用时先登记,启用时统一设置。</summary>
@@ -512,11 +626,11 @@ namespace DesktopBar.Services
         /// </summary>
         internal static void SetClip(Geometry clip, List<Rect> rects, double gapFill)
         {
-            _pillRectsDip = rects;
-            try { UpdateLiquidConstants(); } catch { }
             var ui = Application.Current?.Dispatcher;
-            if (ui == null || !ui.CheckAccess()) { ui?.BeginInvoke(new Action(() => { try { SetClip(clip, rects, gapFill); } catch { } })); return; }
+            if (ui == null || !ui.CheckAccess()) { ui?.BeginInvoke(new Action(() => SetClip(clip, rects, gapFill))); return; }
+            _pillRectsDip = rects;
             if (_host == null) return;
+            UpdateLiquidConstants();
             _host.Clip = clip;
             try { ApplyGapMask(gapFill, rects); } catch { }
             _host.Visibility = clip != null && _enabled ? Visibility.Visible : Visibility.Collapsed;
@@ -579,373 +693,461 @@ namespace DesktopBar.Services
         }
 
         // ---------- 展开页玻璃(实时) ----------
-        //
-        // 与顶栏胶囊完全同一条材质管线:展开页的玻璃就是一个挂着 LiquidGlassEffect 的 Rectangle,
-        // 折射/色散/rim/斜面明暗全由同一份 HLSL、同一组设置项算 —— 以前是 CPU 端把着色器数学手抄一遍
-        // 烘焙进位图,两边参数一有出入,肉眼就是「面板和胶囊不是一个质感」。
-        // 实时:抓图线程在展开页显示期间按「当前屏幕上看到的那块矩形」持续采样(缩放/位移动画期间也跟),
-        // 所以玻璃内容始终钉在桌面上,不会跟着面板一起被拉伸(那样看起来像贴纸而不是窗玻璃)。
-        // 静态画面靠差分门控压成 0 帧发布(UI 侧不重呈、不烧 CPU)。
 
-        private static Border _panelTarget;                 // 当前挂实时玻璃的展开页
-        private static Rectangle _panelSurface;             // 玻璃层(带 Effect),铺满整个展开页
+        private sealed record PanelOptions(bool Liquid, int Blur, Color Tint, double TintOpacity);
+        private enum PanelRead { Failed, Unchanged, Changed }
+        private sealed record PanelRequest(Int32Rect Bounds, double Dpi, int Session, PanelOptions Options);
+
+        private sealed class PanelFrame
+        {
+            public PanelRequest Request;
+            public Int32Rect Region;
+            public byte[] Body, Sharp;
+            public long Sequence, CaptureTick;
+        }
+
+        // 只有捕获线程访问 GDI 句柄、原始像素和差分基线。
+        private sealed class PanelCapture : IDisposable
+        {
+            private IntPtr _screenDc, _memoryDc, _dib, _bits;
+            private int _width, _height;
+            private byte[] _full, _previousFull;
+            private byte[] _raw, _previous, _blurScratch;
+            private PanelRequest _previousRequest;
+            private Int32Rect _previousRegion;
+
+            public PanelRead Read(PanelRequest request, Int32Rect region)
+            {
+                if (_dib == IntPtr.Zero || _width != region.Width || _height != region.Height)
+                {
+                    Dispose();
+                    _width = region.Width;
+                    _height = region.Height;
+                    if (!NativeMethods.CreateStripCapture(_width, _height, out _screenDc, out _memoryDc, out _dib, out _bits))
+                        return PanelRead.Failed;
+                    Resize(ref _full, _width * _height * 4);
+                    Resize(ref _previousFull, _full.Length);
+                    Resize(ref _raw, _width * _height);
+                    Resize(ref _previous, _width * _height);
+                    Resize(ref _blurScratch, _width * _height / 4);
+                    _previousRequest = null;
+                }
+                if (!NativeMethods.BlitStrip(_memoryDc, _width, _height, _screenDc, region.X, region.Y))
+                    return PanelRead.Failed;
+
+                Marshal.Copy(_bits, _full, 0, _full.Length);
+                bool needsFrame = !ReferenceEquals(request, _previousRequest) || region != _previousRegion;
+                if (!needsFrame && _full.AsSpan().SequenceEqual(_previousFull)) return PanelRead.Unchanged;
+
+                (_full, _previousFull) = (_previousFull, _full);
+                Downsample2x(_previousFull, _width, _height, _raw, _width / 2, _height / 2);
+                return needsFrame || !_raw.AsSpan().SequenceEqual(_previous) ? PanelRead.Changed : PanelRead.Unchanged;
+            }
+
+            public void Fill(PanelFrame frame, PanelRequest request, Int32Rect region)
+            {
+                Resize(ref frame.Body, _blurScratch.Length);
+                Downsample2x(_raw, _width / 2, _height / 2, frame.Body, _width / 4, _height / 4);
+                if (request.Options.Liquid)
+                {
+                    Resize(ref frame.Sharp, _raw.Length);
+                    Array.Copy(_raw, frame.Sharp, _raw.Length);
+                }
+                else frame.Sharp = null;
+
+                BoxBlur3(frame.Body, _blurScratch, _width / 4, _height / 4, request.Options.Blur);
+                if (!request.Options.Liquid)
+                {
+                    var tint = request.Options.Tint;
+                    BakeTint(frame.Body, tint.R, tint.G, tint.B, request.Options.TintOpacity);
+                }
+
+                (_raw, _previous) = (_previous, _raw);
+                _previousRequest = request;
+                _previousRegion = region;
+            }
+
+            private static void Resize(ref byte[] buffer, int length)
+            {
+                if (buffer == null || buffer.Length != length) buffer = new byte[length];
+            }
+
+            public void Dispose() => NativeMethods.DestroyStripCapture(ref _screenDc, ref _memoryDc, ref _dib);
+        }
+
+        private static Border _panelTarget;
+        private static Rectangle _panelSurface;
         private static LiquidGlassEffect _panelEffect;
         private static WriteableBitmap _panelBodyWb, _panelSharpWb;
         private static ImageBrush _panelBodyBrush, _panelSharpBrush;
-        private static readonly ManualResetEventSlim _panelWake = new ManualResetEventSlim(false);
+        private static readonly AutoResetEvent _panelWake = new AutoResetEvent(false);
         private static Thread _panelThread;
-        private static volatile bool _panelLive;
         private static volatile bool _panelThreadStop;
-        // 捕获线程当前停在哪个分支(诊断用):1=等待启用 2=WDA 等待 3=抓图暂停 4=建条带失败 5=被遮挡 6=BitBlt 失败 7=正常
+        private static volatile int _panelFps;
         private static volatile int _loopPhase;
-        private static volatile int[] _panelRect;            // 目标屏幕矩形(物理像素) x,y,w,h
-        private static double _panelScale = 1.0;             // 动画缩放系数(只影响圆角半径;模糊按真实屏幕强度算)
-        private static int[] _panelLastRect;
-        private static byte[] _panelPrevSharp;
-        private static byte[] _panelPendingBody, _panelPendingSharp;
-        private static int _panelPendingW, _panelPendingH, _panelPendingSeq, _panelConsumedSeq;
-        private static double _panelPendingRadius;
-        private static int _panelPumpQueued;
-        private static int _panelStaticRun;        // 连续没出帧的采样次数(用于静止降频)
-        private static bool _panelGlassDiag;
+        private static volatile PanelRequest _panelRequest;
+        private static PanelRequest _panelDisplayedRequest;
+        private static Int32Rect _panelDisplayedRegion, _panelVisibleRect;
+        private static long _panelDisplayedAt, _panelSequence, _panelConsumedSequence;
+        private static long _panelVerifiedAt, _panelVerifiedSequence;
+        private static double _panelScale = 1;
+        private static Point _panelAspect = new Point(1, 1);
+        private static int _panelSession, _panelPumpQueued;
+        private static PanelFrame _panelPending;
+        private static Action _panelReady;
 
-        /// <summary>
-        /// 启动时把展开页着色器编好(材质 4)。面板几何(半径/纹理尺寸)全部走寄存器,
-        /// 同一份字节码服务任意尺寸的展开页,所以这里创建一次,之后所有面板都复用它。
-        /// 好处:第一次悬停展开页不用在 UI 线程上现编译(约 100ms,期间面板是空窗)。
-        /// </summary>
         private static void PrewarmPanelEffect()
         {
-            try
-            {
-                if (_panelEffect != null) return;
-                var s = App.Settings;
-                if (s == null || s.PillMaterial != 4) return;
-                double rad = 16 * Ui.Scale * NativeMethods.SystemDpiScale() * 0.5;
-                _panelEffect = LiquidGlassEffect.CreatePanel(rad, 256, 128);
-                if (_panelEffect == null) App.Log("面板玻璃:展开页着色器预热失败,首次打开时会再尝试");
-            }
-            catch { }
+            if (_panelEffect == null && App.Settings?.PillMaterial == 4)
+                _panelEffect = LiquidGlassEffect.CreatePanel(1, 256, 128);
         }
 
-        /// <summary>
-        /// 展开页打开「之前」调用(此时窗口还完全不可见):立刻同步抓一帧并挂上玻璃层。
-        /// 关键顺序——必须「先出玻璃、再显形」:以前是 Show 之后异步抓图回填,面板会先以主题色出现、
-        /// 几十毫秒后才变成模糊贴图,肉眼就是「打开时闪一下才变模糊」。此刻面板不可见,抓图不会拍到面板自己。
-        /// </summary>
-        internal static void StartLivePanel(Border panel, Rectangle surface, double dipX, double dipY, double dipW, double dipH)
+        private static PanelOptions GetPanelOptions(AppSettings settings, double dpi)
         {
-            if (_stopped || panel == null || surface == null) return;
-            var s = App.Settings;
-            if (s == null || (s.PillMaterial != 3 && s.PillMaterial != 4))
+            bool liquid = settings.PillMaterial == 4 && _panelEffect != null;
+            var look = CurrentLook(settings);
+            return new PanelOptions(liquid, BoxRadiusFor(look.Blur * dpi, 4),
+                liquid ? Colors.Transparent : look.Tint, liquid ? 0 : look.TintOpacity);
+        }
+
+        internal static void StartLivePanel(Border panel, Rectangle surface, double dipX, double dipY,
+            double dipW, double dipH, Action ready)
+        {
+            if (_stopped || !IsGlass)
             {
-                StopLivePanel(panel);
+                ready();
                 return;
+            }
+            PrewarmPanelEffect();
+            if (_panelSurface != null)
+            {
+                _panelSurface.Effect = null;
+                _panelSurface.Fill = Brushes.Transparent;
             }
             _panelTarget = panel;
             _panelSurface = surface;
-            _panelScale = 1.0;
-            _panelPrevSharp = null;
-            _panelLastRect = null;
-            _panelRect = DipRectToPixels(panel, dipX, dipY, dipW, dipH);
-            _panelStaticRun = 0;
-            _panelLive = true;
-            if (_panelRect != null)
+            _panelReady = ready;
+            var dpi = VisualTreeHelper.GetDpi(panel);
+            var bounds = DipRectToPixels(dpi, dipX, dipY, dipW, dipH);
+            var request = new PanelRequest(bounds, dpi.DpiScaleX, ++_panelSession,
+                GetPanelOptions(App.Settings, dpi.DpiScaleX));
+            _panelVisibleRect = bounds;
+            _panelScale = 1;
+            _panelAspect = new Point(1, 1);
+            _panelFps = App.Settings.GlassMaxFps;
+            _panelRequest = request;
+            if (request.Options.Liquid) SetOptics(_panelEffect, App.Settings);
+            var fallback = panel.TryFindResource("ThemePanelBackground") as Brush;
+            surface.Fill = fallback ?? Ui.Brush(App.Settings.GlassTint);
+            surface.Opacity = App.Settings.GlassOpacity;
+
+            // 相同位置和材质的近期帧可以直接用于显形，后台仍会采一帧核对桌面。
+            long verified;
+            lock (Gate) verified = _panelVerifiedSequence == _panelConsumedSequence ? _panelVerifiedAt : _panelDisplayedAt;
+            if (_panelDisplayedRequest is PanelRequest shown && shown.Bounds == bounds && shown.Dpi == request.Dpi
+                && shown.Options == request.Options && Environment.TickCount64 - verified <= 250)
             {
-                try { PublishPanelFrame(_panelRect[0], _panelRect[1], _panelRect[2], _panelRect[3], 1.0); }
-                catch { }
-                // 首帧就地泵一次:展开页显形之前玻璃就必须在位,不能等 BeginInvoke
-                PanelPumpTick();
+                _panelDisplayedRequest = request;
+                PresentPanel(request);
+                Interlocked.Increment(ref StatPanelWarmOpens);
+                SignalPanelReady();
             }
             if (_panelThread == null)
             {
-                _panelThreadStop = false;
                 _panelThread = new Thread(PanelLoop) { IsBackground = true, Name = "YukiDesk.PanelGlass" };
                 _panelThread.Start();
             }
             _panelWake.Set();
         }
 
-        /// <summary>
-        /// 动画期间每帧由 UI 线程调用(CompositionTarget.Rendering):把「当前肉眼看到的那块」矩形告诉抓图线程。
-        /// 面板的打开/收起动画是 RenderTransform 缩放+位移,不是布局变化,窗口矩形与 ActualWidth 都不变,
-        /// 所以只能从变换矩阵反算当前可见包围盒。
-        /// </summary>
-        internal static void UpdateLivePanelRect(Border panel, double dipX, double dipY, double dipW, double dipH, double scale)
+        internal static void UpdateLivePanelRect(Border panel, double fullX, double fullY, double fullW, double fullH,
+            double dipX, double dipY, double dipW, double dipH, double scaleX, double scaleY)
         {
-            if (!_panelLive || !ReferenceEquals(_panelTarget, panel)) return;
-            if (dipW < 2 || dipH < 2) return;
-            var rect = DipRectToPixels(panel, dipX, dipY, dipW, dipH);
-            if (rect == null) return;
-            _panelRect = rect;
-            _panelScale = scale <= 0.05 ? 0.05 : (scale > 1.0 ? 1.0 : scale);
-            _panelWake.Set();
+            var request = _panelRequest;
+            if (request == null || !ReferenceEquals(_panelTarget, panel)) return;
+            var dpi = VisualTreeHelper.GetDpi(panel);
+            var bounds = DipRectToPixels(dpi, fullX, fullY, fullW, fullH);
+            _panelVisibleRect = DipRectToPixels(dpi, dipX, dipY, dipW, dipH);
+            scaleX = Math.Clamp(scaleX, 0.05, 1.10);
+            scaleY = Math.Clamp(scaleY, 0.05, 1.10);
+            _panelScale = Math.Min(scaleX, scaleY);
+            _panelAspect = new Point(scaleX / _panelScale, scaleY / _panelScale);
+            if (bounds != request.Bounds || dpi.DpiScaleX != request.Dpi)
+            {
+                request = request with { Bounds = bounds, Dpi = dpi.DpiScaleX, Options = GetPanelOptions(App.Settings, dpi.DpiScaleX) };
+                _panelRequest = request;
+                _panelWake.Set();
+            }
+            PresentPanel(request);
         }
 
-        /// <summary>取证用:展开页实时玻璃当前状态(一行)。</summary>
+        private static void RefreshPanelMaterial(AppSettings settings)
+        {
+            var request = _panelRequest;
+            if (request == null) return;
+            if (!IsGlass)
+            {
+                StopLivePanel(null);
+                return;
+            }
+            PrewarmPanelEffect();
+            var options = GetPanelOptions(settings, request.Dpi);
+            if (options.Liquid) SetOptics(_panelEffect, settings);
+            if (!UsesAdaptiveInk(settings)) ModuleBase.SetGlassInk(_panelTarget, null, panel: true);
+            if (_panelFps != settings.GlassMaxFps)
+            {
+                _panelFps = settings.GlassMaxFps;
+                _panelWake.Set();
+            }
+            if (options != request.Options)
+            {
+                request = request with { Options = options };
+                _panelRequest = request;
+                _panelWake.Set();
+            }
+            lock (Gate)
+            {
+                var frame = _panelPending;
+                if (frame != null && ReferenceEquals(frame.Request, request) && frame.Sequence == _panelConsumedSequence)
+                    RefreshPanelInk(request, frame);
+            }
+            PresentPanel(request);
+        }
+
         internal static string DiagnosticPanelState()
         {
-            var surf = _panelSurface;
-            var rect = _panelRect;
-            string fx = surf == null ? "无玻璃层" : (surf.Effect == null ? "无着色器" : surf.Effect.GetType().Name);
-            string fill = surf == null || surf.Fill == null ? "null" : surf.Fill.GetType().Name;
-            return string.Format("实时={0} 玻璃层Fill={1} Effect={2} 采样矩形={3}x{4} 缩放={5:F2} 位图={6}x{7}",
-                _panelLive ? "开" : "关", fill, fx,
-                rect == null ? 0 : rect[2], rect == null ? 0 : rect[3], _panelScale,
-                _panelBodyWb == null ? 0 : _panelBodyWb.PixelWidth, _panelBodyWb == null ? 0 : _panelBodyWb.PixelHeight);
+            var bounds = _panelRequest?.Bounds ?? Int32Rect.Empty;
+            return $"实时={(_panelRequest != null ? "开" : "关")} 玻璃层Fill={_panelSurface?.Fill?.GetType().Name}"
+                + $" Effect={_panelSurface?.Effect?.GetType().Name} 捕获矩形={bounds.Width}x{bounds.Height}"
+                + $" 缩放={_panelScale:F2} 位图={_panelBodyWb?.PixelWidth}x{_panelBodyWb?.PixelHeight}";
         }
 
-        /// <summary>展开页收起/模块销毁时调用:停采样(玻璃层留着最后一帧,窗口已隐藏,不会重呈)。</summary>
         internal static void StopLivePanel(Border panel)
         {
             if (panel != null && !ReferenceEquals(_panelTarget, panel)) return;
-            _panelLive = false;
-            _panelRect = null;
-            _panelLastRect = null;
-            _panelPrevSharp = null;
+            _panelRequest = null;
+            _panelReady = null;
+            if (_panelSurface != null)
+            {
+                _panelSurface.Effect = null;
+                _panelSurface.Fill = Brushes.Transparent;
+            }
             _panelTarget = null;
             _panelSurface = null;
-            try { _panelWake.Set(); } catch { }
+            _panelWake.Set();
         }
 
-        private static int[] DipRectToPixels(Border panel, double dipX, double dipY, double dipW, double dipH)
+        private static void SignalPanelReady()
         {
-            try
-            {
-                var dpi = VisualTreeHelper.GetDpi(panel);
-                int px = (int)Math.Floor(dipX * dpi.DpiScaleX);
-                int py = (int)Math.Floor(dipY * dpi.DpiScaleY);
-                int pw = (int)Math.Ceiling(dipW * dpi.DpiScaleX);
-                int ph = (int)Math.Ceiling(dipH * dpi.DpiScaleY);
-                if (pw < 4 || ph < 4) return null;
-                return new[] { px, py, pw, ph };
-            }
-            catch { return null; }
+            var ready = _panelReady;
+            _panelReady = null;
+            ready?.Invoke();
+        }
+
+        private static Int32Rect DipRectToPixels(DpiScale dpi, double x, double y, double width, double height)
+        {
+            int left = (int)Math.Floor(x * dpi.DpiScaleX);
+            int top = (int)Math.Floor(y * dpi.DpiScaleY);
+            int right = (int)Math.Ceiling((x + width) * dpi.DpiScaleX);
+            int bottom = (int)Math.Ceiling((y + height) * dpi.DpiScaleY);
+            return new Int32Rect(left, top, Math.Max(1, right - left), Math.Max(1, bottom - top));
+        }
+
+        private static Int32Rect PanelCaptureRegion(PanelRequest request)
+        {
+            var b = request.Bounds;
+            // 固定纹理覆盖整个开合过程，并给模糊核和外向折射保留屏幕像素。
+            int padding = (int)Math.Ceiling(Math.Max(b.Width, b.Height) * 0.05 + 16 * request.Dpi)
+                + request.Options.Blur * 8;
+            int x = Math.Max(0, b.X - padding) & ~3;
+            int y = Math.Max(0, b.Y - padding) & ~3;
+            int r = Math.Min(NativeMethods.ScreenWidth(), b.X + b.Width + padding);
+            int bottom = Math.Min(NativeMethods.ScreenHeight(), b.Y + b.Height + padding);
+            return new Int32Rect(x, y, Math.Max(0, r - x) & ~3, Math.Max(0, bottom - y) & ~3);
         }
 
         private static void PanelLoop()
         {
             GlassDiagnostics.TagThread("面板捕获");
+            using var capture = new PanelCapture();
+            var first = new PanelFrame();
+            var second = new PanelFrame();
+            long lastPublish = 0;
+            PanelRequest regionRequest = null;
+            Int32Rect region = Int32Rect.Empty;
             while (!_panelThreadStop)
             {
+                var request = _panelRequest;
+                if (request == null || _shotPause)
+                {
+                    _panelWake.WaitOne();
+                    continue;
+                }
+
+                long start = Stopwatch.GetTimestamp();
                 try
                 {
-                    var rect = _panelRect;
-                    if (!_panelLive || _shotPause || rect == null)
+                    if (!ReferenceEquals(regionRequest, request))
                     {
-                        // 没有展开页时彻底睡死,不占 CPU(只在 Start/动画帧/设置变更时被 Set 唤醒)
-                        _panelWake.Wait(750);
-                        _panelWake.Reset();
-                        continue;
+                        regionRequest = request;
+                        region = PanelCaptureRegion(request);
+                        lastPublish = Environment.TickCount64;
                     }
-                    long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
-                    bool published = PublishPanelFrame(rect[0], rect[1], rect[2], rect[3], _panelScale);
-                    // 静止降频:展开页背后没变化时每帧 BitBlt(固定约 2.4ms)纯属浪费。
-                    // 一帧没发布就退到 100ms,持续静止再退到 250ms;一旦有变化立刻回满帧率。
-                    if (published) _panelStaticRun = 0; else _panelStaticRun++;
-                    var s = App.Settings;
-                    // 0 = 不限制(与顶栏同一套语义):按 DWM 合成节拍抓,端到端只延迟一帧
-                    int fps = s == null ? 30 : Math.Max(0, Math.Min(300, s.GlassMaxFps));
-                    int budget = fps <= 0 ? 0 : 1000 / Math.Max(1, fps);
-                    // 面板玻璃同理:静止退避只影响"背后开始动时多久跟上",退太深同样是抽一下卡顿。
-                    if (_panelStaticRun > 40) budget = Math.Max(budget, 120);
-                    else if (_panelStaticRun > 12) budget = Math.Max(budget, 60);
-                    int spent = (int)((System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1000L / System.Diagnostics.Stopwatch.Frequency);
-                    if (budget <= 0)
+                    var read = region.Width >= 8 && region.Height >= 8 ? capture.Read(request, region) : PanelRead.Failed;
+                    if (read != PanelRead.Failed) Interlocked.Increment(ref StatPanelCaptures);
+                    if (read == PanelRead.Changed)
                     {
-                        if (!NativeMethods.WaitComposition()) _panelWake.Wait(15);
-                        _panelWake.Reset();
-                    }
-                    else
-                    {
-                        int wait = budget - spent;
-                        if (wait > 1)
+                        PanelFrame frame;
+                        lock (Gate) frame = ReferenceEquals(_panelPending, first) ? second : first;
+                        capture.Fill(frame, request, region);
+                        Interlocked.Increment(ref StatPanelBlurs);
+                        lock (Gate)
                         {
-                            _panelWake.Wait(wait - 1);
-                            _panelWake.Reset();
+                            if (!ReferenceEquals(_panelRequest, request)) continue;
+                            frame.Request = request;
+                            frame.Region = region;
+                            frame.CaptureTick = start;
+                            frame.Sequence = ++_panelSequence;
+                            _panelPending = frame;
+                            _panelVerifiedSequence = frame.Sequence;
+                            _panelVerifiedAt = Environment.TickCount64;
+                        }
+                        lastPublish = Environment.TickCount64;
+                        Interlocked.Increment(ref StatPanelFrames);
+                        SchedulePanelPump();
+                    }
+                    else if (read == PanelRead.Unchanged)
+                    {
+                        lock (Gate)
+                        {
+                            if (ReferenceEquals(_panelPending?.Request, request))
+                            {
+                                _panelVerifiedSequence = _panelPending.Sequence;
+                                _panelVerifiedAt = Environment.TickCount64;
+                            }
                         }
                     }
                 }
-                catch { try { Thread.Sleep(20); } catch { } }
-            }
-        }
-
-        /// <summary>
-        /// 抓「展开页当前屏幕矩形」→ 半分辨率 → 一份锐帧(折射用)+ 一份盒式模糊 → 染色 → 交给 UI 线程。
-        /// 静态画面(矩形与像素都没变)直接不发布:展开页窗口不重呈 = 静态零开销。
-        /// </summary>
-        private static bool PublishPanelFrame(int px, int py, int pw, int ph, double scale)
-        {
-            var s = App.Settings;
-            if (s == null || (s.PillMaterial != 3 && s.PillMaterial != 4)) return false;
-            if (pw < 8 || ph < 8) return false;
-            if (scale < 0.05) scale = 0.05;
-            double dsy = NativeMethods.SystemDpiScale();
-            // 模糊半径不乘 scale:抓到的纹理是「当前可见矩形」按 1:1 映射到元素上的
-            // (元素再被 RenderTransform 缩回同样大小),所以采样到的就是屏幕上真实的模糊强度;
-            // 乘 scale 反而会让动画中的玻璃比周围桌面更清晰。圆角才需要按 scale 缩。
-            int blurHalf = BoxHalfFor(s.GlassBlurRadius * dsy);
-            int bleed = Math.Min(220, blurHalf * 2 + 12);
-            int x = Math.Max(0, px - bleed), y = Math.Max(0, py - bleed);
-            int rx = Math.Min(NativeMethods.ScreenWidth(), px + pw + bleed);
-            int by = Math.Min(NativeMethods.ScreenHeight(), py + ph + bleed);
-            int cw = (rx - x) & ~1, ch = (by - y) & ~1;
-            if (cw < 8 || ch < 8) return false;
-            int hw = cw / 2, hh = ch / 2;
-            int ox = Math.Max(0, (px - x) / 2), oy = Math.Max(0, (py - y) / 2);
-            int ow = Math.Min(hw - ox, Math.Max(2, (pw / 2) & ~1));
-            int oh = Math.Min(hh - oy, Math.Max(2, (ph / 2) & ~1));
-            if (ow < 4 || oh < 4) return false;
-
-            byte tr = 20, tg = 20, tb = 28;
-            try
-            {
-                var c = (Color)ColorConverter.ConvertFromString(s.GlassTint);
-                tr = c.R; tg = c.G; tb = c.B;
-            }
-            catch { }
-            double tintA = Math.Max(0, Math.Min(1, s.GlassTintOpacity));
-
-            byte[] body = null, sharp = null;
-            long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
-            if (NativeMethods.CreateStripCapture(cw, ch, out var screenDc, out var memoryDc, out var dib, out var bits))
-            {
-                try
+                catch (Exception ex)
                 {
-                    if (NativeMethods.BlitStrip(memoryDc, cw, ch, screenDc, x, y))
-                    {
-                        var full = new byte[cw * ch * 4];
-                        Marshal.Copy(bits, full, 0, full.Length);
-                        var half = new byte[hw * hh * 4];
-                        Downsample2x(full, cw, ch, half, hw, hh);
-                        // 折射要「未模糊」的高频细节(与顶栏双采样源同一思路):先裁锐帧,再原地模糊后裁主体
-                        sharp = CropHalf(half, hw, ox, oy, ow, oh);
-                        var blurred = new byte[half.Length];
-                        Array.Copy(half, blurred, half.Length);
-                        BoxBlur3(blurred, half, hw, hh, blurHalf);
-                        body = CropHalf(blurred, hw, ox, oy, ow, oh);
-                        BakeTint(body, tr, tg, tb, tintA);
-                    }
+                    App.Log("面板玻璃:采样失败 " + ex.Message);
+                    _panelWake.WaitOne(100);
                 }
-                finally { NativeMethods.DestroyStripCapture(ref screenDc, ref memoryDc, ref dib); }
-            }
-            if (body == null || sharp == null) return false;
 
-            // 门控:矩形没变、画面也没变 → 完全不出帧
-            var last = _panelLastRect;
-            bool rectSame = last != null && last[0] == px && last[1] == py && last[2] == pw && last[3] == ph;
-            if (rectSame && _panelPrevSharp != null && _panelPrevSharp.Length == sharp.Length
-                && MeanAbsDiff(_panelPrevSharp, sharp, ow, oh, 8) < DiffThreshold)
-                return false;
-            _panelLastRect = new[] { px, py, pw, ph };
-            _panelPrevSharp = sharp;
-            double radiusPx = 16 * Ui.Scale * dsy * 0.5 * scale;   // 展开页圆角 → 半分辨率像素
-            lock (Gate)
-            {
-                _panelPendingBody = body;
-                _panelPendingSharp = sharp;
-                _panelPendingW = ow;
-                _panelPendingH = oh;
-                _panelPendingRadius = radiusPx;
-                _panelPendingSeq++;
+                int fps = EffectiveFps(_panelFps, panel: true);
+                int budget = (1000 + fps - 1) / fps;
+                long idle = Environment.TickCount64 - lastPublish;
+                if (idle > 350) budget = Math.Max(budget, idle > 1000 ? 100 : 55);
+                int spent = (int)Stopwatch.GetElapsedTime(start).TotalMilliseconds;
+                _panelWake.WaitOne(Math.Max(1, budget - spent));
             }
-            Interlocked.Increment(ref StatPanelFrames);
-            SchedulePanelPump();
-            if (!_panelGlassDiag)
-            {
-                _panelGlassDiag = true;
-                double ms = (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-                App.Log(string.Format("面板玻璃:实时采样 {0}x{1}(物理) 半分辨率 {2}x{3} 缩放={4:F2} 耗时={5:F1}ms",
-                    pw, ph, ow, oh, scale, ms));
-            }
-            return true;
         }
 
-        /// <summary>从半分辨率帧里裁出子矩形(按行 BlockCopy,帧很小,够用)。</summary>
-        private static byte[] CropHalf(byte[] src, int sw, int sx, int sy, int w, int h)
-        {
-            var dst = new byte[w * h * 4];
-            for (int y = 0; y < h; y++)
-                Buffer.BlockCopy(src, ((sy + y) * sw + sx) * 4, dst, y * w * 4, w * 4);
-            return dst;
-        }
-
-        /// <summary>有新帧才唤醒 UI 线程;静止/收起时 0 唤醒(与顶栏泵同一套合并去重)。</summary>
         private static void SchedulePanelPump()
         {
-            if (_stopped) return;
-            if (Interlocked.Exchange(ref _panelPumpQueued, 1) != 0) return;
-            try
+            if (_stopped || Interlocked.Exchange(ref _panelPumpQueued, 1) != 0) return;
+            var ui = Application.Current?.Dispatcher;
+            if (ui == null || ui.HasShutdownStarted)
             {
-                var d = Application.Current == null ? null : Application.Current.Dispatcher;
-                if (d == null || d.HasShutdownStarted) { Interlocked.Exchange(ref _panelPumpQueued, 0); return; }
-                d.BeginInvoke(DispatcherPriority.Render, new Action(() =>
-                {
-                    Interlocked.Exchange(ref _panelPumpQueued, 0);
-                    PanelPumpTick();
-                }));
+                Interlocked.Exchange(ref _panelPumpQueued, 0);
+                return;
             }
-            catch { Interlocked.Exchange(ref _panelPumpQueued, 0); }
+            ui.BeginInvoke(DispatcherPriority.Render, new Action(() =>
+            {
+                Interlocked.Exchange(ref _panelPumpQueued, 0);
+                PanelPumpTick();
+            }));
         }
 
-        /// <summary>UI 线程:写位图 → 挂/更新 LiquidGlassEffect(几何只改寄存器,不重编译)。</summary>
         private static void PanelPumpTick()
         {
-            if (_stopped) return;
-            var surface = _panelSurface;
-            if (surface == null) return;
-            byte[] body, sharp; int w, h, seq; double rad;
+            var request = _panelRequest;
+            if (_stopped || request == null || _panelSurface == null) return;
             lock (Gate)
             {
-                body = _panelPendingBody;
-                sharp = _panelPendingSharp;
-                w = _panelPendingW;
-                h = _panelPendingH;
-                seq = _panelPendingSeq;
-                rad = _panelPendingRadius;
-            }
-            if (body == null || sharp == null || w < 4 || h < 4 || seq == _panelConsumedSeq) return;
-            _panelConsumedSeq = seq;
-            var s = App.Settings;
-            if (s == null) return;
-            bool liquid = s.PillMaterial == 4;
-            if (_panelBodyWb == null || _panelBodyWb.PixelWidth != w || _panelBodyWb.PixelHeight != h)
-            {
-                _panelBodyWb = new WriteableBitmap(w, h, 96, 96, PixelFormats.Bgra32, null);
-                _panelSharpWb = new WriteableBitmap(w, h, 96, 96, PixelFormats.Bgra32, null);
-                _panelBodyBrush = new ImageBrush(_panelBodyWb) { Stretch = Stretch.Fill };
-                _panelSharpBrush = new ImageBrush(_panelSharpWb) { Stretch = Stretch.Fill };
-            }
-            _panelBodyWb.WritePixels(new Int32Rect(0, 0, w, h), body, w * 4, 0);
-            _panelSharpWb.WritePixels(new Int32Rect(0, 0, w, h), sharp, w * 4, 0);
-            if (liquid)
-            {
-                if (_panelEffect == null)
+                var frame = _panelPending;
+                if (frame == null || frame.Sequence == _panelConsumedSequence || !ReferenceEquals(frame.Request, request))
+                    return;
+
+                int width = frame.Region.Width / 4;
+                int height = frame.Region.Height / 4;
+                var bounds = new Int32Rect(0, 0, width, height);
+                if (_panelBodyWb == null || _panelBodyWb.PixelWidth != width || _panelBodyWb.PixelHeight != height)
                 {
-                    _panelEffect = LiquidGlassEffect.CreatePanel(rad, w, h);
-                    if (_panelEffect == null) App.Log("面板玻璃:液态着色器不可用,降级为普通模糊");
+                    _panelBodyWb = new WriteableBitmap(width, height, 96, 96, PixelFormats.Bgra32, null);
+                    _panelBodyBrush = new ImageBrush(_panelBodyWb) { Stretch = Stretch.Fill };
                 }
-                if (_panelEffect != null)
+                _panelBodyWb.WritePixels(bounds, frame.Body, width * 4, 0);
+                Interlocked.Increment(ref StatPanelWrites);
+                if (frame.Sharp != null)
                 {
-                    // 几何(半径/纹理尺寸)全走寄存器:动画期间每帧变尺寸也不用重编译
-                    _panelEffect.Radius = rad;
-                    _panelEffect.TexW = w;
-                    _panelEffect.TexH = h;
-                    _panelEffect.Refr = Math.Max(0, Math.Min(1, s.GlassRefraction));
-                    _panelEffect.Rim = Math.Max(0, Math.Min(1, s.GlassRim));
-                    _panelEffect.Chroma = Math.Max(0, Math.Min(1, s.GlassChroma));
-                    _panelEffect.Sheen = LiquidSheen;
-                    // 效果对象重建/位图换尺寸后必须重绑采样源(不重绑会采到全黑,顶栏踩过这个坑)
-                    if (!ReferenceEquals(_panelEffect.Input, _panelBodyBrush)) _panelEffect.Input = _panelBodyBrush;
-                    if (!ReferenceEquals(_panelEffect.Sharp, _panelSharpBrush)) _panelEffect.Sharp = _panelSharpBrush;
-                    if (!ReferenceEquals(surface.Effect, _panelEffect)) surface.Effect = _panelEffect;
+                    int sharpWidth = width * 2;
+                    int sharpHeight = height * 2;
+                    if (_panelSharpWb == null || _panelSharpWb.PixelWidth != sharpWidth || _panelSharpWb.PixelHeight != sharpHeight)
+                    {
+                        _panelSharpWb = new WriteableBitmap(sharpWidth, sharpHeight, 96, 96, PixelFormats.Bgra32, null);
+                        _panelSharpBrush = new ImageBrush(_panelSharpWb) { Stretch = Stretch.Fill };
+                    }
+                    _panelSharpWb.WritePixels(new Int32Rect(0, 0, sharpWidth, sharpHeight), frame.Sharp, sharpWidth * 4, 0);
+                    Interlocked.Increment(ref StatPanelSharpWrites);
                 }
+                Interlocked.Exchange(ref _panelWrittenCaptureTick, frame.CaptureTick);
+                _panelConsumedSequence = frame.Sequence;
+                _panelDisplayedRequest = request;
+                _panelDisplayedRegion = frame.Region;
+                _panelDisplayedAt = Environment.TickCount64;
+                RefreshPanelInk(request, frame);
             }
-            // 玻璃层的基础填充始终是「模糊位图」:着色器正常时它的输出会覆盖掉它;
-            // 着色器缺失/正在重建时看到的是模糊玻璃而不是黑底,任何一瞬间都不会露黑。
-            if (!ReferenceEquals(surface.Fill, _panelBodyBrush)) surface.Fill = _panelBodyBrush;
-            if (_panelEffect == null || !ReferenceEquals(surface.Effect, _panelEffect)) surface.Effect = null;
-            surface.Opacity = Math.Max(0.05, Math.Min(1, s.GlassOpacity));
+            PresentPanel(request);
+            SignalPanelReady();
+        }
+
+        private static void RefreshPanelInk(PanelRequest request, PanelFrame frame)
+        {
+            var settings = App.Settings;
+            if (!UsesAdaptiveInk(settings))
+            {
+                ModuleBase.SetGlassInk(_panelTarget, null, panel: true);
+                return;
+            }
+
+            var bounds = request.Bounds;
+            var region = frame.Region;
+            var area = new Rect((bounds.X - region.X) / (double)region.Width, (bounds.Y - region.Y) / (double)region.Height,
+                bounds.Width / (double)region.Width, bounds.Height / (double)region.Height);
+            // 普通玻璃在后台已经把染色烘焙进像素，只有液态玻璃需要模拟着色器。
+            var look = request.Options.Liquid ? CurrentLook(settings) : default;
+            var lightness = SurfaceLightness(frame.Body, region.Width / 4, region.Height / 4, area, look, settings.GlassOpacity);
+            ModuleBase.SetGlassInk(_panelTarget, lightness, panel: true);
+        }
+
+        private static void PresentPanel(PanelRequest request)
+        {
+            var surface = _panelSurface;
+            var shown = _panelDisplayedRequest;
+            if (surface == null || shown == null || shown.Session != request.Session) return;
+            var region = _panelDisplayedRegion;
+            var visible = _panelVisibleRect;
+            double width = Math.Min(visible.Width, region.Width);
+            double height = Math.Min(visible.Height, region.Height);
+            double x = Math.Clamp(visible.X - region.X, 0, region.Width - width);
+            double y = Math.Clamp(visible.Y - region.Y, 0, region.Height - height);
+            var viewbox = new Rect(x / region.Width, y / region.Height, width / region.Width, height / region.Height);
+            if (_panelBodyBrush.Viewbox != viewbox) _panelBodyBrush.Viewbox = viewbox;
+            if (surface.Fill != _panelBodyBrush) surface.Fill = _panelBodyBrush;
+            var settings = App.Settings;
+            surface.Opacity = settings.GlassOpacity;
+            var effect = request.Options.Liquid && shown.Options.Liquid ? _panelEffect : null;
+            if (effect != null)
+            {
+                double radius = 16 * Ui.Scale * request.Dpi * 0.5 * _panelScale;
+                SetGeometry(effect, radius, width * 0.5, height * 0.5);
+                effect.PanelAspect = _panelAspect;
+                effect.SharpUv = new Point4D(viewbox.Width, viewbox.Height, viewbox.X, viewbox.Y);
+                if (effect.Input != _panelBodyBrush) effect.Input = _panelBodyBrush;
+                if (effect.Sharp != _panelSharpBrush) effect.Sharp = _panelSharpBrush;
+            }
+            if (surface.Effect != effect) surface.Effect = effect;
         }
 
         // ---------- 内部:UI 侧 ----------
@@ -984,18 +1186,20 @@ namespace DesktopBar.Services
             int physW = NativeMethods.ScreenWidth();
             double barPhysH = 46.0 * Ui.Scale * dsy;
             // 条带从屏幕 y=0 抓到 barPhysH+下出血:真实屏幕没有负 y,上缘靠屏幕边界自然截断。
-            double blurPhys = Math.Max(1, (s == null ? 24 : s.GlassBlurRadius) * dsy);
+            double blurPhys = Math.Max(1, (s == null ? 24 : CurrentLook(s).Blur) * dsy);
             int bleed = (int)Math.Ceiling(blurPhys) + 8;
             int h = (int)Math.Ceiling(barPhysH) + bleed;
-            // 帧率上限 0 = 不限制:捕获按 DWM 合成节拍跑(等于屏幕刷新率),不设人为上限
-            int fps = s == null ? 30 : Math.Clamp(s.GlassMaxFps, 0, 300);
+            int fps = EffectiveFps(s?.GlassMaxFps ?? 0, panel: false);
             var spec = new GlassSpec
             {
-                Width = Math.Max(16, physW + 1) & ~1,
-                Height = Math.Max(8, h + 1) & ~1,
-                BlurHalf = BoxHalfFor((s == null ? 24 : s.GlassBlurRadius) * dsy),
-                FpsMs = fps <= 0 ? 0 : Math.Max(2, 1000 / fps),   // 0=不限制(按合成节拍跑)
+                Width = Math.Max(4, physW & ~3),
+                Height = Math.Max(4, Math.Min(NativeMethods.ScreenHeight(), h + 3) & ~3),
+                BlurQuarter = BoxRadiusFor(blurPhys, 4),
+                FpsMs = (1000 + fps - 1) / fps,
+                WallpaperFadeMs = SystemParameters.ClientAreaAnimation ? s?.WallpaperFadeDurationMs ?? 360 : 0,
                 MidY = Math.Max(4, (int)Math.Ceiling(barPhysH / 2)),
+                Liquid = s?.PillMaterial == 4,
+                DisplayGeneration = _displayGeneration,
             };
             spec.HalfWidth = spec.Width / 2;
             spec.HalfHeight = spec.Height / 2;
@@ -1003,12 +1207,13 @@ namespace DesktopBar.Services
             _spec = spec;
             if (_image != null)
             {
-                if (_wb == null || _wb.PixelWidth != spec.HalfWidth || _wb.PixelHeight != spec.HalfHeight)
+                if (_wb == null || _wb.PixelWidth != spec.BodyWidth || _wb.PixelHeight != spec.BodyHeight)
                 {
-                    _wb = new WriteableBitmap(spec.HalfWidth, spec.HalfHeight, 96, 96, PixelFormats.Bgra32, null);
+                    _wb = new WriteableBitmap(spec.BodyWidth, spec.BodyHeight, 96, 96, PixelFormats.Bgra32, null);
+                    _bodyReady = false;
                     _wbSharp = null;
                     _image.Source = _wb;
-                    _consumed = null;
+                    _consumedSequence = 0;
                     SyncLiquidInput();
                 }
                 _image.Height = spec.ImageHeightDip;
@@ -1017,11 +1222,12 @@ namespace DesktopBar.Services
             if (_testSrc && _wb != null)
             {
                 FillTestPattern(_wb.PixelWidth, _wb.PixelHeight);
+                _bodyReady = true;
                 // 合成图案模式也喂未模糊帧,否则轮廓折射采到空白(诊断时容易误判为"折射没生效")
                 if (_liquid != null)
                 {
-                    if (_wbSharp == null || _wbSharp.PixelWidth != _wb.PixelWidth || _wbSharp.PixelHeight != _wb.PixelHeight)
-                        _wbSharp = new WriteableBitmap(_wb.PixelWidth, _wb.PixelHeight, 96, 96, PixelFormats.Bgra32, null);
+                    if (_wbSharp == null || _wbSharp.PixelWidth != spec.HalfWidth || _wbSharp.PixelHeight != spec.HalfHeight)
+                        _wbSharp = new WriteableBitmap(spec.HalfWidth, spec.HalfHeight, 96, 96, PixelFormats.Bgra32, null);
                     FillTestPattern(_wbSharp.PixelWidth, _wbSharp.PixelHeight, _wbSharp);
                     SyncLiquidInput();
                 }
@@ -1049,11 +1255,9 @@ namespace DesktopBar.Services
             {
                 Interlocked.Exchange(ref _pumpQueued, 0);
                 // 玻璃关掉时展开页也停止实时采样(面板随即由主题色接管)
-                _panelLive = false;
-                _panelPrevSharp = null;
+                StopLivePanel(null);
                 RestoreExclusionAll();
                 _wake.Set();
-                try { _panelWake?.Set(); } catch { }
             }
         }
 
@@ -1132,41 +1336,47 @@ namespace DesktopBar.Services
             }
             try
             {
-                // WritePixels 也放进锁:发布数组来自轮换池,锁内拷贝(约 0.5ms)保证不与捕获线程复用打架。
+                long captureTick;
+                // 界面拷贝期间，捕获线程不会复用当前发布的槽位。
                 lock (Gate)
                 {
                     var f = _latest;
-                    if (f == null || ReferenceEquals(f, _consumed) || _image == null) return;
+                    if (f == null || _latestSequence == _consumedSequence || _image == null) return;
                     var spec = _spec;
-                    if (spec == null) return;
+                    if (!SameCaptureSpec(spec, _latestSpec)) return;
                     if (_wb == null || _wb.PixelWidth != _latestW || _wb.PixelHeight != _latestH)
                     {
                         _wb = new WriteableBitmap(_latestW, _latestH, 96, 96, PixelFormats.Bgra32, null);
                         _wbSharp = null;
                         _image.Source = _wb;
                         _image.Height = spec.ImageHeightDip;
-                        _consumed = null;
+                        _consumedSequence = 0;
                         SyncLiquidInput();
                     }
                     _wb.WritePixels(new Int32Rect(0, 0, _latestW, _latestH), f, _latestW * 4, 0);
+                    _bodyReady = true;
+                    ShowGlassEffect(App.Settings?.PillMaterial == 4 ? _liquid : null);
                     Interlocked.Increment(ref StatWrites);
                     var sf = _latestSharp;
                     if (sf != null && _liquid != null && f == _latest)
                     {
-                        if (_wbSharp == null || _wbSharp.PixelWidth != _latestW || _wbSharp.PixelHeight != _latestH)
+                        if (_wbSharp == null || _wbSharp.PixelWidth != spec.HalfWidth || _wbSharp.PixelHeight != spec.HalfHeight)
                         {
-                            _wbSharp = new WriteableBitmap(_latestW, _latestH, 96, 96, PixelFormats.Bgra32, null);
+                            _wbSharp = new WriteableBitmap(spec.HalfWidth, spec.HalfHeight, 96, 96, PixelFormats.Bgra32, null);
                             SyncLiquidInput();
                         }
-                        _wbSharp.WritePixels(new Int32Rect(0, 0, _latestW, _latestH), sf, _latestW * 4, 0);
+                        _wbSharp.WritePixels(new Int32Rect(0, 0, spec.HalfWidth, spec.HalfHeight), sf, spec.HalfWidth * 4, 0);
                         Interlocked.Increment(ref StatSharpWrites);
                     }
-                    _consumed = f;
+                    if (!_latestSlideBlending) RefreshPillInk(f, _latestW, _latestH, spec);
+                    _consumedSequence = _latestSequence;
+                    captureTick = _latestCaptureTick;
                     wroteFrame = true;
                 }
                 // 延迟样本只在"真的写了新帧"之后结算,并且丢弃 >500ms 的陈旧样本
                 // (静止很久后的第一帧会把整段静止时间也计入,那不是延迟)。
-                long ct = wroteFrame ? Interlocked.Read(ref _pubCaptureTick) : 0;
+                long ct = wroteFrame ? captureTick : 0;
+                Interlocked.Exchange(ref _pubCaptureTick, ct);
                 if (ct != 0)
                 {
                     double ms = (System.Diagnostics.Stopwatch.GetTimestamp() - ct) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
@@ -1235,7 +1445,14 @@ namespace DesktopBar.Services
                 if (_stopped || !_enabled) return;
                 try
                 {
+                    _displayGeneration++;
                     RefreshSpec();
+                    if (_panelRequest is PanelRequest request)
+                    {
+                        _panelDisplayedRequest = null;
+                        _panelRequest = request with { };
+                        _panelWake.Set();
+                    }
                     _holdUntil = Environment.TickCount64 + HoldMs;
                     App.Log("玻璃:显示设置变化,捕获条带已按新分辨率重建");
                 }
@@ -1245,14 +1462,6 @@ namespace DesktopBar.Services
 
         // ---------- 内部:捕获线程 ----------
 
-        /// <summary>
-        /// 懒建 GPU 捕获会话。失败只记一次日志并回退 GDI BitBlt。
-        /// </summary>
-        /// <summary>
-        /// 释放 GPU 捕获会话。Stop 只在进程退出时调用,而 DXGI 会话的 Release 偶尔会在驱动里
-        /// 卡住(实测卡死 12 秒以上,导致托盘"退出"后进程僵着、exe 被锁、下次启动失败),
-        /// 所以放到后台线程做:最多等 400ms,超时就丢下不管(进程马上结束,系统会回收)。
-        /// </summary>
         /// <summary>退出期追踪:直接追加到 %TEMP%\yuki-exit.txt,绕开共享日志互斥体(日志锁本身也可能卡住)。</summary>
         internal static void TraceStop(string what)
         {
@@ -1264,13 +1473,19 @@ namespace DesktopBar.Services
             catch { }
         }
 
-        private static void DisposeDxgiAsync(DxgiCapture dx)
+        // 只由顶栏捕获线程替换或释放会话。
+        private static void ResetDxgi(bool allowRetry)
         {
-            // 实测:在退出路径上 Release IDXGIOutputDuplication/ID3D11Device 有一半概率在显示驱动里
-            // 卡住十几秒甚至直接 AV(进程退出码 139)——这是驱动侧的行为,不是我们引用的生命周期错。
-            // Stop 只在进程退出时调用,所以最稳的做法是**不释放**:直接丢引用,交给系统在建进程销毁时回收。
-            // 唯一代价是退出瞬间多占约 8MB 显存,进程结束后消失。
-            TraceStop("跳过 GPU 显式释放(避免驱动卡死),引用已丢弃");
+            var previous = _dxgi;
+            _dxgi = null;
+            _dxgiTried = !allowRetry;
+            previous?.Dispose();
+        }
+
+        private static bool SameCaptureSpec(GlassSpec a, GlassSpec b)
+        {
+            return a != null && b != null && a.Width == b.Width && a.Height == b.Height
+                && a.BlurQuarter == b.BlurQuarter && a.Liquid == b.Liquid && a.DisplayGeneration == b.DisplayGeneration;
         }
 
         private static void EnsureDxgi()
@@ -1292,7 +1507,17 @@ namespace DesktopBar.Services
             IntPtr screenDc = IntPtr.Zero, memoryDc = IntPtr.Zero, dib = IntPtr.Zero, bits = IntPtr.Zero;
             int capW = 0, capH = 0, hw = 0, hh = 0;
             byte[] full = null, halfRaw = null, halfBase = null, workB = null;
-            bool hasBaseline = false, loggedSelf = false, loggedCapFail = false;
+            bool hasBaseline = false, hasDxgiPixels = false, deferredFrame = false, loggedSelf = false, loggedCapFail = false;
+            GlassSpec previousSpec = null;
+            int wallpaperGeneration = Volatile.Read(ref _wallpaperGeneration);
+            WallpaperMonitor.Snapshot renderedSlide = null;
+            WallpaperMonitor.Snapshot unreadableSlide = null;
+            byte[] fadeFrom = null, fadeTo = null;
+            long fadeStartedAt = 0;
+            int fadeDurationMs = 0;
+            long retrySlideAt = 0;
+            bool covered = false;
+            long nextCoverageCheck = 0;
             try
             {
                 while (!_stopThread)
@@ -1301,8 +1526,9 @@ namespace DesktopBar.Services
                     if (!_enabled || !_active || spec == null)
                     {
                         _loopPhase = 1;
-                        _wake.Wait(400);
-                        _wake.Reset();
+                        hasBaseline = false;
+                        deferredFrame = false;
+                        _wake.WaitOne(400);
                         continue;
                     }
                     if (Environment.TickCount64 < Volatile.Read(ref _holdUntil))
@@ -1319,216 +1545,291 @@ namespace DesktopBar.Services
                         Thread.Sleep(50);
                         continue;
                     }
-                    // 会话失效/首次进入时懒建 GPU 捕获(失败则永远走 GDI)。
-                    if (_dxgi == null && !_dxgiTried) EnsureDxgi();
+                    int wallpaper = Volatile.Read(ref _wallpaperGeneration);
+                    if (wallpaperGeneration != wallpaper || !SameCaptureSpec(spec, previousSpec))
+                    {
+                        wallpaperGeneration = wallpaper;
+                        hasBaseline = false;
+                        deferredFrame = false;
+                        nextCoverageCheck = 0;
+                    }
+                    if (previousSpec != null && spec.DisplayGeneration != previousSpec.DisplayGeneration)
+                    {
+                        ResetDxgi(true);
+                        hasDxgiPixels = false;
+                        renderedSlide = null;
+                        fadeFrom = fadeTo = null;
+                        NativeMethods.DestroyStripCapture(ref screenDc, ref memoryDc, ref dib);
+                    }
+                    previousSpec = spec;
 
                     if (capW != spec.Width || capH != spec.Height)
                     {
                         NativeMethods.DestroyStripCapture(ref screenDc, ref memoryDc, ref dib);
-                        bits = IntPtr.Zero;
-                        capW = capH = 0;
-                        hasBaseline = false;
-                        if (NativeMethods.CreateStripCapture(spec.Width, spec.Height,
-                            out screenDc, out memoryDc, out dib, out bits))
+                        capW = spec.Width;
+                        capH = spec.Height;
+                        hasDxgiPixels = false;
+                        renderedSlide = null;
+                        fadeFrom = fadeTo = null;
+                        hw = spec.HalfWidth;
+                        hh = spec.HalfHeight;
+                        full = new byte[capW * capH * 4];
+                        halfRaw = new byte[hw * hh * 4];
+                        halfBase = new byte[hw * hh * 4];
+                        workB = new byte[spec.BodyWidth * spec.BodyHeight * 4];
+                        lock (Gate)
                         {
-                            capW = spec.Width;
-                            capH = spec.Height;
-                            hw = spec.HalfWidth;
-                            hh = spec.HalfHeight;
-                            full = new byte[capW * capH * 4];
-                            halfRaw = new byte[hw * hh * 4];
-                            halfBase = new byte[hw * hh * 4];
-                            workB = new byte[hw * hh * 4];
-                            lock (Gate)
+                            for (int i = 0; i < _rotate.Length; i++) _rotate[i] = new byte[workB.Length];
+                            Array.Clear(_rotateSharp);
+                            _rotateIndex = 0;
+                            _latest = null;
+                            _latestSharp = null;
+                        }
+                    }
+
+                    var slide = ThemeService.CurrentWallpaper;
+                    bool useWallpaper = slide?.IsSlideshow == true;
+                    bool slideCompleted = false;
+                    if (useWallpaper)
+                    {
+                        if (slide != renderedSlide)
+                        {
+                            long now = Environment.TickCount64;
+                            if (slide != unreadableSlide || now >= retrySlideAt)
                             {
-                                for (int i = 0; i < _rotate.Length; i++) _rotate[i] = new byte[hw * hh * 4];
-                                for (int i = 0; i < _rotateSharp.Length; i++) _rotateSharp[i] = new byte[hw * hh * 4];
-                                _rotateIndex = 0;
-                                _latest = null;
-                                _latestSharp = null;
+                                var next = WallpaperMonitor.ReadSlideshowStrip(slide, hw, hh);
+                                if (next != null)
+                                {
+                                    if (renderedSlide != null && spec.WallpaperFadeMs > 0)
+                                    {
+                                        // 快速连续换图时从正在显示的混合画面继续，避免退回上一张。
+                                        fadeFrom = (byte[])halfRaw.Clone();
+                                        fadeTo = next;
+                                        fadeStartedAt = Environment.TickCount64;
+                                        fadeDurationMs = spec.WallpaperFadeMs;
+                                    }
+                                    else
+                                    {
+                                        halfRaw = next;
+                                        fadeFrom = fadeTo = null;
+                                        slideCompleted = true;
+                                    }
+                                    renderedSlide = slide;
+                                    unreadableSlide = null;
+                                    hasBaseline = false;
+                                    hasDxgiPixels = false;
+                                }
+                                else
+                                {
+                                    unreadableSlide = slide;
+                                    retrySlideAt = now + 750;
+                                }
+                            }
+                            if (slide != renderedSlide && fadeTo == null)
+                            {
+                                if (renderedSlide != null)
+                                {
+                                    _wake.WaitOne(300);
+                                    continue;
+                                }
+                                useWallpaper = false;
                             }
                         }
+                        if (fadeTo != null)
+                        {
+                            double progress = spec.WallpaperFadeMs > 0
+                                ? (Environment.TickCount64 - fadeStartedAt) / (double)fadeDurationMs
+                                : 1;
+                            if (progress >= 1)
+                            {
+                                halfRaw = fadeTo;
+                                fadeFrom = fadeTo = null;
+                                slideCompleted = true;
+                            }
+                            else BlendWallpaperStrip(fadeFrom, fadeTo, halfRaw, progress);
+                        }
+                        if (useWallpaper && hasBaseline && fadeTo == null && !slideCompleted)
+                        {
+                            _wake.WaitOne(300);
+                            continue;
+                        }
+                    }
+                    else if (renderedSlide != null)
+                    {
+                        renderedSlide = null;
+                        fadeFrom = fadeTo = null;
+                        hasBaseline = false;
+                        hasDxgiPixels = false;
+                    }
+
+                    long checkAt = Environment.TickCount64;
+                    if (!useWallpaper && checkAt >= nextCoverageCheck)
+                    {
+                        covered = IsCovered(spec);
+                        nextCoverageCheck = checkAt + 150;
+                    }
+                    if (!useWallpaper && covered)
+                    {
+                        hasBaseline = false;
+                        deferredFrame = false;
+                        _loopPhase = 5;
+                        _wake.WaitOne(160);
+                        continue;
+                    }
+
+                    if (!useWallpaper) EnsureDxgi();
+                    var dxgi = useWallpaper ? null : _dxgi;
+                    long iterationStart = Stopwatch.GetTimestamp();
+                    long busyStart = iterationStart;
+                    bool copied = false;
+                    bool reusePixels = useWallpaper;
+                    if (dxgi != null)
+                    {
+                        int waitMs = !hasBaseline ? 16 : spec.FpsMs == 0 ? 100 : Math.Min(100, spec.FpsMs);
+                        int acquired = dxgi.Acquire(waitMs);
+                        if (acquired == 1)
+                        {
+                            Interlocked.Increment(ref StatDxgiIdle);
+                            if (!hasDxgiPixels || (hasBaseline && !deferredFrame)) continue;
+                            // 等待超时不是采集失败。补发上一帧，避免混进缺少合成层的 GDI 画面。
+                            reusePixels = true;
+                        }
+                        else if (acquired != 0)
+                        {
+                            ResetDxgi(true);
+                            hasDxgiPixels = false;
+                            hasBaseline = false;
+                            _loopPhase = 8;
+                            Thread.Sleep(100);
+                            continue;
+                        }
                         else
+                        {
+                            bool skipped;
+                            try
+                            {
+                                skipped = hasDxgiPixels && !dxgi.BandDirty(0, 0, capW, capH);
+                                busyStart = Stopwatch.GetTimestamp();
+                                if (!skipped) copied = dxgi.CopyBand(0, 0, capW, capH, full);
+                            }
+                            finally { dxgi.ReleaseFrame(); }
+                            if (skipped && hasBaseline && !deferredFrame)
+                            {
+                                Interlocked.Increment(ref StatDxgiSkip);
+                                long idleSkip = Environment.TickCount64 - _lastPubTick;
+                                _wake.WaitOne(idleSkip > 1000 ? 70 : Math.Max(5, spec.FpsMs / 2));
+                                continue;
+                            }
+                            if (skipped) reusePixels = true;
+                            else if (!copied)
+                            {
+                                App.Log("玻璃:DXGI 条带读回失败，回退 GDI BitBlt");
+                                ResetDxgi(false);
+                                hasBaseline = false;
+                                hasDxgiPixels = false;
+                            }
+                            else hasDxgiPixels = true;
+                        }
+                    }
+
+                    if (!copied && !reusePixels)
+                    {
+                        busyStart = Stopwatch.GetTimestamp();
+                        if (dib == IntPtr.Zero && !NativeMethods.CreateStripCapture(capW, capH,
+                            out screenDc, out memoryDc, out dib, out bits))
                         {
                             if (!loggedCapFail)
                             {
                                 loggedCapFail = true;
-                                App.Log("玻璃:创建捕获条带失败 err=" + Marshal.GetLastWin32Error() + ",稍后重试");
+                                App.Log("玻璃:创建捕获条带失败 err=" + Marshal.GetLastWin32Error());
                             }
                             _loopPhase = 4;
-                            Thread.Sleep(1000);
+                            Thread.Sleep(250);
                             continue;
                         }
-                    }
-
-                    // 遮挡保护:顶栏被普通窗口大面积盖住时(全屏游戏/最大化窗口)跳过采样,
-                    // 反正玻璃也不可见——省 BitBlt 也避免独占全屏下抓到黑帧。
-                    if (IsCovered(spec))
-                    {
-                        _loopPhase = 5;
-                        Thread.Sleep(300);
-                        continue;
-                    }
-
-                    long busyStart;
-                    if (_dxgi != null)
-                    {
-                        // 等下一次桌面合成:静止时超时返回(完全不产生 CPU 负载),有变化时立刻返回。
-                        int waitMs = spec.FpsMs <= 0 ? 100 : Math.Min(100, Math.Max(1, spec.FpsMs));
-                        int acq = _dxgi.Acquire(waitMs);
-                        if (acq == 1)
-                        {
-                            Interlocked.Increment(ref StatDxgiIdle);
-                            continue;
-                        }
-                        if (acq != 0)
-                        {
-                            // 会话失效:切分辨率/全屏独占/安全桌面。丢掉重建,期间这一轮先跳过。
-                            try { _dxgi.Dispose(); } catch { }
-                            _dxgi = null;
-                            _dxgiTried = false;
-                            hasBaseline = false;
-                            _loopPhase = 8;
-                            Thread.Sleep(300);
-                            continue;
-                        }
-                        if (hasBaseline && !_dxgi.BandDirty(0, 0, capW, capH))
-                        {
-                            // 脏矩形不碰顶栏条带:这一帧与玻璃无关,连读回都省。
-                            _dxgi.ReleaseFrame();
-                            Interlocked.Increment(ref StatDxgiSkip);
-                            // 本机 DWM 是持续 300Hz 合成的,不睡觉就会每秒空转 300 次(实测常驻 3%+);
-                            // 退避到 33ms 后静止开销≈0,而"背后开始动"最多 33ms 就被发现。
-                            long idleSkip = Environment.TickCount64 - _lastPubTick;
-                            if (idleSkip > 400) Thread.Sleep(idleSkip > 1200 ? 33 : 8);
-                            continue;
-                        }
-                        Interlocked.Increment(ref StatFrames);
-                        Interlocked.Increment(ref StatBlits);
-                        long startD = System.Diagnostics.Stopwatch.GetTimestamp();
-                        bool copied = _dxgi.CopyBand(0, 0, capW, capH, full);
-                        _dxgi.ReleaseFrame();
-                        if (!copied)
-                        {
-                            _loopPhase = 6;
-                            Thread.Sleep(50);
-                            continue;
-                        }
-                        Interlocked.Add(ref StatBlitTicks, System.Diagnostics.Stopwatch.GetTimestamp() - startD);
-                        busyStart = startD;
-                    }
-                    else
-                    {
-                        busyStart = System.Diagnostics.Stopwatch.GetTimestamp();
-                        Interlocked.Increment(ref StatFrames);
                         if (!NativeMethods.BlitStrip(memoryDc, capW, capH, screenDc, 0, 0))
                         {
                             _loopPhase = 6;
                             Thread.Sleep(250);
                             continue;
                         }
-                        Interlocked.Increment(ref StatBlits);
-                        long tBlit = System.Diagnostics.Stopwatch.GetTimestamp();
                         Marshal.Copy(bits, full, 0, full.Length);
-                        Interlocked.Add(ref StatBlitTicks, System.Diagnostics.Stopwatch.GetTimestamp() - tBlit);
                     }
-                    long tDown = System.Diagnostics.Stopwatch.GetTimestamp();
-                    Downsample2x(full, capW, capH, halfRaw, hw, hh);
-                    Interlocked.Add(ref StatDownTicks, System.Diagnostics.Stopwatch.GetTimestamp() - tDown);
+                    if (!reusePixels)
+                    {
+                        Interlocked.Increment(ref StatFrames);
+                        Interlocked.Increment(ref StatBlits);
+                        Interlocked.Add(ref StatBlitTicks, Stopwatch.GetTimestamp() - busyStart);
+                        long tDown = Stopwatch.GetTimestamp();
+                        Downsample2x(full, capW, capH, halfRaw, hw, hh);
+                        Interlocked.Add(ref StatDownTicks, Stopwatch.GetTimestamp() - tDown);
+                    }
 
                     long tDiff = System.Diagnostics.Stopwatch.GetTimestamp();
                     double diff = hasBaseline ? MeanAbsDiff(halfBase, halfRaw, hw, hh, 16) : 1e9;
                     Interlocked.Add(ref StatDiffTicks, System.Diagnostics.Stopwatch.GetTimestamp() - tDiff);
                     long nowTick = Environment.TickCount64;
-                    bool publish = _alwaysPub || diff >= DiffThreshold;
+                    bool publish = slideCompleted || _alwaysPub || diff >= DiffThreshold;
                     // 小幅漂移(例如慢速滚动、小面积动画)不必按满帧率发布:每次发布都要整条窗口重呈。
                     // 但 100ms 的闸门(10fps)在液态玻璃下能看出卡顿,收到 50ms(20fps)——
                     // 折中:CPU 只多一半,肉眼基本连续。
                     // 闸门按帧率缩放(≈半速):30fps 时约 66ms,60fps 时 33ms,300fps 时 6ms。
-            int pubGateMs = Math.Max(2, spec.FpsMs * 2);
-            if (publish && !_alwaysPub && diff < SmallDiffThreshold && nowTick - _lastPubTick < pubGateMs) publish = false;
-                    if (publish)
+                    int pubGateMs = Math.Max(2, spec.FpsMs * 2);
+                    // 窗口或壁纸动画停在限流区间时，下一圈补取最后一帧，即使 DXGI 不再发脏区。
+                    deferredFrame = !useWallpaper && publish && !_alwaysPub
+                        && diff < SmallDiffThreshold && nowTick - _lastPubTick < pubGateMs;
+                    if (publish && !deferredFrame)
                     {
-                        _lastPubTick = nowTick;
                         byte[] workA, sharpA;
                         lock (Gate)
                         {
-                            int slot = _rotateIndex++ % _rotate.Length;
+                            int slot = _rotateIndex;
+                            if (ReferenceEquals(_rotate[slot], _latest)) slot = (slot + 1) % _rotate.Length;
+                            _rotateIndex = (slot + 1) % _rotate.Length;
                             workA = _rotate[slot];
-                            sharpA = _rotateSharp[slot % _rotateSharp.Length];
+                            sharpA = spec.Liquid ? _rotateSharp[slot] ??= new byte[halfRaw.Length] : null;
                         }
-                        Array.Copy(halfRaw, workA, workA.Length);
+                        Downsample2x(halfRaw, hw, hh, workA, spec.BodyWidth, spec.BodyHeight);
                         // 未模糊帧只做降采样拷贝(无模糊),供轮廓折射采样;与模糊帧同槽位轮换,杜绝撕裂。
                         if (sharpA != null) Array.Copy(halfRaw, sharpA, sharpA.Length);
                         long tBlur = System.Diagnostics.Stopwatch.GetTimestamp();
-                        BoxBlur3(workA, workB, hw, hh, spec.BlurHalf);
+                        BoxBlur3(workA, workB, spec.BodyWidth, spec.BodyHeight, spec.BlurQuarter);
                         Interlocked.Add(ref StatBlurTicks, System.Diagnostics.Stopwatch.GetTimestamp() - tBlur);
                         lock (Gate)
                         {
+                            if (_stopThread || !_enabled || !SameCaptureSpec(_spec, spec)) continue;
+                            _latestSpec = spec;
+                            _latestSequence++;
+                            _latestCaptureTick = reusePixels ? 0 : busyStart;
+                            _latestSlideBlending = fadeTo != null;
                             _latest = workA;
                             _latestSharp = sharpA;
-                            _latestW = hw;
-                            _latestH = hh;
+                            _latestW = spec.BodyWidth;
+                            _latestH = spec.BodyHeight;
                         }
+                        _lastPubTick = nowTick;
                         Array.Copy(halfRaw, halfBase, halfBase.Length);
                         hasBaseline = true;
                         Interlocked.Increment(ref StatPublishes);
-                        Interlocked.Exchange(ref _pubCaptureTick, busyStart);
                         SchedulePump();   // 有新帧才唤醒 UI 线程(静止时 0 唤醒)
+                        if (slideCompleted) App.Log("玻璃:已更新幻灯片底图");
                         if (!loggedSelf)
                         {
                             loggedSelf = true;
-                            SelfCheck(workA, hw, hh, out double m, out double sd, out long n);
-                            App.Log(string.Format("玻璃:首帧 {0}x{1}(半分辨率) 红通道均值={2:F1} 标准差={3:F1} 采样={4}",
-                                hw, hh, m, sd, n));
+                            SelfCheck(workA, spec.BodyWidth, spec.BodyHeight, out double m, out double sd, out long n);
+                            App.Log(string.Format("玻璃:首帧主体 {0}x{1} 红通道均值={2:F1} 标准差={3:F1} 采样={4}",
+                                spec.BodyWidth, spec.BodyHeight, m, sd, n));
                         }
                     }
                     Interlocked.Add(ref StatBusyTicks, System.Diagnostics.Stopwatch.GetTimestamp() - busyStart);
 
-                    // 自适应降频:连续静止就拉长采样间隔,静止桌面接近 0 开销;
-                    // 任何变化(或被唤醒)都会立刻回到满速。
-                    // 采样间隔就是「玻璃多久看一眼背后」= 用户感知的更新延迟上限,所以不能拉太长了:
-                    // 之前深静止档是 1000ms,桌面静止 22 秒后任何运动都要最多 1 秒才反映到玻璃上,
-                    // 观感就是"液态玻璃卡住了/很慢"。现在上限 250ms(深静止)/120ms(静止),
-                    // 一次 BitBlt 的固定成本约 2.5ms,深静止档常驻约 1%。20fps 的持续大动限帧也已取消,
-                    // 持续运动时直接跑满「帧率上限」设置(默认 30fps)。
                     _loopPhase = 7;
-                    if (_dxgi != null)
-                    {
-                        // GPU 捕获自带节拍(AcquireNextFrame 卡在合成上),但本机 DWM 是持续 300Hz 合成的,
-                        // 长时间没有东西要显示时每帧唤醒(脏矩形查询+同步)也要约 15% 单核,所以"无事发生"时要退避。
-                        // 但退避档位不能太深:静止时一次迭代只做「取帧+脏矩形判断」、不拷贝不模糊,
-                        // 代价不到 0.1ms,而采样间隔就是「玻璃多久看一眼背后」= 变化被发现前的最大延迟。
-                        // 实测 250ms 档(4fps)在"静止一会儿→内容突然开始动"时会被看成抽一下卡顿,
-                        // 所以深静止档收到 33ms(30fps)、中间档 8ms(120fps):静态开销几乎不变,起步延迟降 7 倍。
-                        long idleMsD = Environment.TickCount64 - _lastPubTick;
-                        if (idleMsD > 400)
-                        {
-                            Thread.Sleep(idleMsD > 1200 ? 33 : 8);
-                            continue;
-                        }
-                        long spentTicks = System.Diagnostics.Stopwatch.GetTimestamp() - busyStart;
-                        int spent = (int)(spentTicks * 1000L / System.Diagnostics.Stopwatch.Frequency);
-                        if (spec.FpsMs > spent) Thread.Sleep(spec.FpsMs - spent);
-                        continue;
-                    }
-                    int delay = spec.FpsMs;
-                    long idleMs = Environment.TickCount64 - _lastPubTick;
-                    if (delay <= 0)
-                    {
-                        // 不限制帧率:节拍交给合成器。DwmFlush 在下一次合成完成后返回,
-                        // 紧接着抓屏(约 5ms)→ 发布 → UI 线程写位图,仍赶得上这一轮渲染提交,
-                        // 所以端到端只延迟一帧(以前固定 Sleep 会和合成节拍错相,经常晚一帧)。
-                        // 背后完全静止时仍降频:60Hz 常驻 BitBlt 会白烧约 15% 单核。
-                        if (idleMs > 1200) Thread.Sleep(33);
-                        else if (idleMs > 400) Thread.Sleep(8);
-                        else if (!NativeMethods.WaitComposition()) Thread.Sleep(16);
-                        continue;
-                    }
-                    // 固定帧率档:静止也不用退到 250ms——那等于"静止 1 秒后任何变化都要 0.25 秒才反映"。
-                    if (idleMs > 1200) delay = Math.Max(delay, 33);
-                    else if (idleMs > 400) delay = Math.Max(delay, 8);
-                    Thread.Sleep(delay);
+                    long idle = Environment.TickCount64 - _lastPubTick;
+                    int delay = fadeTo != null ? Math.Max(spec.FpsMs, 16)
+                        : Math.Max(spec.FpsMs, idle > 1000 ? 70 : idle > 350 ? 40 : 0);
+                    // DXGI 的本轮等待也算在帧间隔内。
+                    int spent = (int)Stopwatch.GetElapsedTime(iterationStart).TotalMilliseconds;
+                    if (delay > spent) _wake.WaitOne(delay - spent);
                 }
             }
             catch (Exception ex)
@@ -1539,6 +1840,15 @@ namespace DesktopBar.Services
             {
                 NativeMethods.DestroyStripCapture(ref screenDc, ref memoryDc, ref dib);
             }
+        }
+
+        private static void BlendWallpaperStrip(byte[] from, byte[] to, byte[] pixels, double progress)
+        {
+            // 两端减速，只有中段产生明显变化。玻璃主体和清晰折射纹理使用同一权重。
+            int weight = (int)Math.Round(progress * progress * (3 - 2 * progress) * 256);
+            int keep = 256 - weight;
+            for (int i = 0; i < pixels.Length; i++)
+                pixels[i] = (byte)((from[i] * keep + to[i] * weight + 128) >> 8);
         }
 
         /// <summary>
@@ -1568,10 +1878,10 @@ namespace DesktopBar.Services
 
         // ---------- 像素处理(纯函数,捕获线程/线程池共用) ----------
 
-        /// <summary>全分辨率物理 σ(DIP 半径 × DPI)→ 半分辨率盒式半径。三趟盒式 h≈σ,取 0.45 稍锐。</summary>
-        private static int BoxHalfFor(double physSigma)
+        /// <summary>将物理模糊半径换算到处理位图的采样尺度，三趟盒式近似。</summary>
+        private static int BoxRadiusFor(double radius, int reduction)
         {
-            return Math.Max(1, Math.Min(96, (int)Math.Round(physSigma * 0.45)));
+            return Math.Clamp((int)Math.Round(radius * 0.9 / reduction), 1, 96);
         }
 
         /// <summary>2×2 平均降采样(只动 BGR,alpha 补 255)。半分辨率域做模糊,大半径下视觉无差。</summary>

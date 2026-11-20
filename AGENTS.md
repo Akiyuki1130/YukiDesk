@@ -43,10 +43,11 @@ Interop/NativeMethods.cs  全部 Win32 P/Invoke（窗口/Z 序/Shell/AppBar/电�
 Interop/DxgiCapture.cs    GPU 抓屏（DXGI Desktop Duplication，手写 COM 互操作、零 NuGet）：AcquireNextFrame 按合成节拍取帧 → CopySubresourceRegion 只拷顶栏条带 → Map 读回
 UI/ModuleBase.cs           模块基类：药丸选项卡 + 独立悬停弹出面板框架
 UI/Modules.cs              10 个具体模块 + IconCache + ItemTile + 自绘渲染面（2235 行，见 §5）
-UI/LiquidGlassEffect.cs    液态玻璃 ShaderEffect：HLSL 由 C# 拼接（胶囊几何烘焙成字面量；展开页几何全走寄存器，任意尺寸共用一份字节码），d3dcompiler_47 运行时编译 + 按源码 SHA-256 落盘缓存
+UI/LiquidGlassEffect.cs    液态玻璃 ShaderEffect：胶囊从布局纹理采样轮廓，展开页通过寄存器更新圆角几何；d3dcompiler_47 运行时编译 + 按源码 SHA-256 落盘缓存
+UI/PillGlassGeometry.cs    布局变化时生成全部可见胶囊的距离和法线纹理，着色器成本不随胶囊数量增长
 Services/GlassDiagnostics.cs 玻璃取证/性能自检（--glassshot / --glassperf / --glasssampler），见 §14
 UI/*.cs                    ColorEditor / ConfirmDialog / OperationProgressDialog / Prompt / FlyoutMenu / ShellOpen / Ui
-docs/                      README 引用的 6 张预览截图
+docs/                      README 引用的液态玻璃顶栏、展开面板和深浅色设置截图
 Assets/YukiDesk.ico        exe 图标 + 安装器 SetupIconFile
 ```
 
@@ -100,7 +101,7 @@ Assets/YukiDesk.ico        exe 图标 + 安装器 SetupIconFile
 | `RecycleBin` | 直接解析 `$Recycle.Bin\<SID>\$I` 元数据 | 纯托管 |
 | `ThemeService` | 主题色解析、壁纸明暗自动适配、系统偏好监听 | `SystemEvents` |
 | `MicaService` | 胶囊自绘材质烘焙（`PillMaterial`：1=云母 2=亚克力，**均已从设置 UI 下架**，仅遗留配置会落到烘焙；采样壁纸→盒式重模糊→压带/保色→染色→噪点→一张冻结位图，后台 STA 烘焙线程） | 注册表壁纸配置 |
-| `GlassService` | 实时背景玻璃（`PillMaterial`：3=高斯模糊 4=液态玻璃）。两条抓屏路径：**DXGI Desktop Duplication**（默认，`Interop/DxgiCapture.cs`，0.5ms/帧、按合成节拍取帧）与 GDI BitBlt 兜底（`YUKI_GLASS_GDI=1`，4ms/帧）。捕获线程半分辨率 + 三趟盒式模糊（O(n)）→ 差分门控（静止 0 写屏）→ 遮挡保护（全屏窗口盖住时 0 采样）→ 发布驱动 UI 泵 WritePixels → 胶囊挂 `LiquidGlassEffect`（模糊帧做主体、未模糊帧做轮廓折射）。悬停面板走**独立实时玻璃管线**（自己的捕获线程 + `Rectangle` 挂同一个 `LiquidGlassEffect`，动画期间每帧按当前可见矩形重采）。自家窗口全部 WDA_EXCLUDEFROMCAPTURE 排除自拍 | `IDXGIOutputDuplication`、`ID3D11Device`、`GetDC`/`BitBlt`、`SetWindowDisplayAffinity`、`WindowFromPoint` |
+| `GlassService` | 实时背景玻璃（`PillMaterial`：3=高斯模糊 4=液态玻璃）。两条抓屏路径：**DXGI Desktop Duplication**（默认，`Interop/DxgiCapture.cs`，0.5ms/帧、按合成节拍取帧）与 GDI BitBlt 兜底（`YUKI_GLASS_GDI=1`，4ms/帧）。捕获线程半分辨率保留锐帧，四分之一分辨率处理主体 + 三趟盒式模糊（O(n)）→ 差分门控（静止 0 写屏）→ 遮挡保护（全屏窗口盖住时 0 采样）→ 发布驱动 UI 泵 WritePixels → 胶囊挂 `LiquidGlassEffect`（模糊帧做主体、未模糊帧做轮廓折射）。悬停面板走**独立实时玻璃管线**（自己的捕获线程 + `Rectangle` 挂同一个 `LiquidGlassEffect`，复用固定捕获区域，动画只按当前可见矩形更新采样坐标）。自家窗口全部 WDA_EXCLUDEFROMCAPTURE 排除自拍 | `IDXGIOutputDuplication`、`ID3D11Device`、`GetDC`/`BitBlt`、`SetWindowDisplayAffinity`、`WindowFromPoint` |
 | `SettingsService` | 原子写 + 备份 + 损坏隔离 + 迁移/钳制 | `System.Text.Json` |
 | `UpdateService` | GitHub Releases 检查/下载/安装（可选 SHA-256 校验） | `HttpClient` |
 | `PawnIoTctl` / `TemperatureSlave` | 读 AMD 原生 Tctl 温度 / 提权从属进程 | `DeviceIoControl`、`MemoryMappedFile` |
@@ -113,9 +114,9 @@ Assets/YukiDesk.ico        exe 图标 + 安装器 SetupIconFile
 - **桌面层钉底**：不是 `WorkerW` 挂载（`计划书.md` 里的旧方案已废弃）。实际做法是 `SetWindowPos` 钉在桌面装饰层之上、普通窗口之下，`WS_EX_NOACTIVATE` 保证不抢焦点；**每 3 秒保底重钉**，钉底前会撤掉外部软件误加的置顶标志，遍历时跳过 DWM cloak 的窗口。顶栏被别的窗口盖住是**设计语义**，不是 bug。
 - **悬停面板是独立置顶窗口**，不在主窗口内；所以隐藏顶栏前必须 `ClosePanels()`，否则会留下可交互的孤儿窗口。
 - **点击穿透**：主窗口 `Background=null` 时鼠标事件穿透到桌面图标；顶栏背景条一旦设置不透明度才会拦截该区域。玻璃档（3/4）下胶囊并集之外 alpha=0（`MainWindow.UpdateGlassClip` 的 GeometryGroup Clip），穿透契约保持；**该函数必须做 Rect 集合比较防抖**——每次给 Clip 赋新 GeometryGroup 都会触发布局失效，不比较会和 LayoutUpdated 形成无限失效循环打满 UI 线程（实测 118%）。
-- **实时玻璃（PillMaterial 3/4）**：模糊全部在捕获线程 CPU 完成（半分辨率盒式三趟），WPF 侧不放 BlurEffect（满宽 BlurEffect 曾被打满一个核，虽有部分原因是上面的失效循环，CPU 模糊仍更可控）；主窗+面板 WDA_EXCLUDEFROMCAPTURE 后**任何外部截图/录屏都看不到顶栏**（取证用 `YUKI_GLASS_DUMP=<目录>` 环境变量，进程内转储发布帧+主窗 RTB）；顶栏被盖住时捕获自动暂停，这是设计不是卡死。
-- **GPU 抓屏（DXGI）的坑**：`ID3D11Device` 的 vtable 在这台机器上**不是规范顺序**（`CreateTexture2D` 在 slot 5 而非 9），所以 `DxgiCapture` 用 `DetectTextureSlot()` 实测探测后调 `QI` + 真 `Map` 验证，不硬编码；所有结构体出参一律用 `AllocHGlobal` 缓冲而不是 `out struct`（`out struct` 会让 `AcquireNextFrame` 直接 AV）；staging 纹理的 `CPUAccessFlags` 必须是 `D3D11_CPU_ACCESS_READ = 0x20000`（`0x10000` 是 WRITE，会让 `Map(READ)` 永远返回 E_INVALIDARG）；`Stop()` 里**不要显式释放** DXGI 会话——实测退出时 `Release` 有一半概率在显示驱动里卡十几秒甚至 AV（进程退出码 139），`Stop` 只在进程退出时调用，直接丢引用让系统回收最稳。
-- **玻璃节奏**：`GlassMaxFps` = 0 表示不限（按 `DwmFlush` 合成节拍抓，实测本机 300Hz 屏可到 284fps 更新、捕获→开始渲染 3.4ms）；静止由 `idleMs`（`TickCount64 - _lastPubTick`）按**时长**降频到 120/250ms，不用帧数计（帧数阈值在 60fps 下要等 0.5~1.5 秒才降频，期间白烧 CPU）。
+- **实时玻璃（PillMaterial 3/4）**：模糊在捕获线程 CPU 完成（四分之一分辨率盒式三趟），WPF 侧不放 BlurEffect（满宽 BlurEffect 曾被打满一个核，虽有部分原因是上面的失效循环，CPU 模糊仍更可控）；主窗+面板 WDA_EXCLUDEFROMCAPTURE 后**任何外部截图/录屏都看不到顶栏**（取证用 `YUKI_GLASS_DUMP=<目录>` 环境变量，进程内转储发布帧+主窗 RTB）；顶栏被盖住时捕获自动暂停，这是设计不是卡死。
+- **GPU 抓屏（DXGI）**：COM 方法按 SDK 定义的槽位和签名调用（例如 `ID3D11Device::CreateTexture2D` 为 slot 5，`IDXGIOutputDuplication::GetDesc` 返回 `void`）。结构体出参用按 `Marshal.SizeOf` 分配的原生缓冲，`DXGI_OUTDUPL_FRAME_INFO` 为 48 字节，`DXGI_OUTDUPL_DESC` 为 36 字节。暂存纹理的读权限为 `0x20000`。更新门控检查脏矩形和移动区域，切换显示设置重建会话。进程退出时由系统回收最后一个 DXGI 会话，避免驱动 Release 阻塞退出。
+- **玻璃节奏**：GlassMaxFps 为 0 时使用自动节奏，顶栏和面板上限分别为 48 / 36 fps。正数使用手动上限，静止继续按最近一次发布的时间降频。液态玻璃提供清透、柔雾和自定义外观；前两档会按采样背景选择前景颜色。
 - **主题**：`ModuleBase.ApplyTheme` 与 `ThemeService.Refresh` **都会重写** `Application.Current.Resources["ThemePanel*"]`，模块一多就有两个写入方；设置窗口/对话框另用一套冻结的 `Settings*` 键，不跟随运行时主题切换。
 - **线程模型**：Shell 图标提取在专用 STA 线程队列（`IconCache`），FDT/解码/文件 IO 全在后台线程，UI 线程只做布局与绘制。退出时必须等在途文件操作收尾，否则会留下半份文件。
 - **设置持久化**：`%AppData%\YukiDesk\settings.json`（Roaming），`settings.backup.json` + 随机 `.tmp-<guid>` + `File.Replace` 原子写；旧路径 `%AppData%\DesktopBar\settings.json` 会迁移。`SchemaVersion` 当前为 2。损坏时隔离为 `*.corrupt-<时间戳>` 并**拒绝**用默认值覆写。
@@ -216,7 +217,7 @@ YukiDesk.exe --glasstest
 
 - **这三个开关都排在单实例互斥体之后**——已经有 YukiDesk 在跑时会**静默退出、无产物**。先 `taskkill /F /IM YukiDesk.exe`。
 - **连续跑自检要间隔 ≥6 秒**，否则上一个实例还占着 exe/互斥体，后一次会以 `exit 127/139` 静默失败（127 是 bash 无法 exec，不是应用崩溃；事件日志里也查不到 Application Error）。
-- `--glassshot` 的产物：`shot-bar-original`/`shot-bar-test`（全屏截图）、`glass-input-test.png`（发布帧，半分辨率）、`rtb-*`（窗口内 RenderTargetBitmap，不含 DWM）、`shot-panel-<模块>`（每块面板）、`wallpaper-test.png`。
+- `--glassshot` 的产物：`shot-bar-original`/`shot-bar-test`（全屏截图）、`glass-input-test.png`（发布帧，四分之一分辨率）、`rtb-*`（窗口内 RenderTargetBitmap，不含 DWM）、`shot-panel-<模块>`（每块面板）、`wallpaper-test.png`。
 - **顶栏在外部截图里看不见是正常的**：主窗与面板都设了 `WDA_EXCLUDEFROMCAPTURE`，凡是从进程外抓屏都拍不到顶栏自己。要拍顶栏必须走进程内（`ShootAsync` 里的 `SaveRtb` 或 `YUKI_GLASS_DUMP` 转储）。
 
 ### 玻璃与面板相关的环境变量（都是诊断/兜底，正常运行时不需要）
@@ -239,7 +240,8 @@ YukiDesk.exe --glasstest
 
 ### 几件容易被误判的事
 
-- **「液态玻璃没效果」先看日志有没有 `液态玻璃:着色器已启用`**。HLSL 编不过会**静默降级成普通模糊**，C# 侧一切正常、只是没折射。死分支也会参与类型检查，改 HLSL 时任何一个分支写错整份着色器都编不过。
+- **「液态玻璃没效果」先看日志有没有 `液态玻璃:胶囊着色器已启用`**。HLSL 编不过会**静默降级成普通模糊**，C# 侧一切正常、只是没折射。死分支也会参与类型检查，改 HLSL 时任何一个分支写错整份着色器都编不过。
 - **胶囊/面板的折射靠「未模糊帧」做轮廓**：主体用模糊帧（保证"模糊其下一切"），只有轮廓那一圈从 `Sharp` 采样源取未模糊像素。所以"胶囊里看到的背景比面板更清楚"不是 bug。
 - **面板的不透明度必须接近 1**：`Panel` 的玻璃是 `ImageBrush(捕获糊图)` 叠在**真实桌面**上，`GlassOpacity` 调低会让背后清晰画面透上来，观感就是"面板什么也没有"。默认已改成 1.0。
+- **`--glassperf` 的延迟统计**：顶栏与面板分别记录从捕获开始到位图写入后的首次 WPF 渲染回调的 P50/P95，附样本数。面板区间另统计采样、模糊、位图上传和缓存显形次数。
 - **单次 `--glassperf 12` 的进程 CPU 抖动可达 2 倍**（同一配置两次能差一倍）。小于 1% 的差异不可信，只能靠「同一轮里逐部件剥离对比」或 30~40 秒长窗口下结论。

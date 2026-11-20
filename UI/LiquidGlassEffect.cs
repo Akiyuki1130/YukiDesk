@@ -1,29 +1,23 @@
 using System;
-using System.Globalization;
+using System.Collections.Generic;
 using System.IO;
 using System.Security.Cryptography;
 using System.Text;
 using System.Windows;
 using System.Windows.Media;
 using System.Windows.Media.Effects;
+using System.Windows.Media.Media3D;
 using DesktopBar.Interop;
 
 namespace DesktopBar.UI
 {
-    /// <summary>
-    /// 液态玻璃着色器:在已高斯模糊的捕获图上叠加"真实折射感"——
-    /// 沿胶囊圆角矩形的距离场(SDF)数值梯度做边缘位移采样(凸透镜收缩)、
-    /// RGB 三通道错位(色散)、轮廓内侧一圈亮边(rim light)。
-    ///
-    /// 兼容性取舍:WPF ShaderEffect 的常量寄存器只对标量(double→float1)有完备封送,
-    /// 数组映射各家实现不一;胶囊矩形干脆在生成 HLSL 时烘焙成字面量,
-    /// 几何变化(模块显隐/缩放/分辨率)才重编译一次(d3dcompiler_47 运行时编译,
-    /// 字节码按源码 SHA-256 落盘缓存——改几何/改源码都自动失效,lgsrc 库的教训)。
-    /// 可调参数(折射/边缘光/色散)走 6 个标量寄存器,滑杆实时改不触发重编译。
-    /// 编译失败返回 null,调用方降级为普通玻璃,顶栏不因此不可用。
-    /// </summary>
+    /// <summary>模糊帧绘制主体，锐帧绘制轮廓折射。胶囊共享一张布局纹理，面板使用圆角距离场。</summary>
     public sealed class LiquidGlassEffect : ShaderEffect
     {
+        private readonly PillGlassGeometry _pillGeometry;
+        private static PixelShader _pillsShader, _panelShader;
+        private static bool _pillsAttempted, _panelAttempted;
+
         // ---- 标量参数寄存器(滑杆可实时调) ----
         public static readonly DependencyProperty RefrProperty = DependencyProperty.Register(
             "Refr", typeof(double), typeof(LiquidGlassEffect),
@@ -47,16 +41,60 @@ namespace DesktopBar.UI
             new UIPropertyMetadata(1.0, PixelShaderConstantCallback(6)));
         public double Sheen { get { return (double)GetValue(SheenProperty); } set { SetValue(SheenProperty, value); } }
 
-        private LiquidGlassEffect(byte[] bytecode, double radiusPx, double texW, double texH)
+        private LiquidGlassEffect(PixelShader shader, double radiusPx, double texW, double texH, bool panel)
         {
-            var ps = new PixelShader();
-            using (var ms = new MemoryStream(bytecode))
-            {
-                ps.SetStreamSource(ms);
-            }
-            PixelShader = ps;
-            // 几何寄存器随构造固定(几何变了会整个重建效果对象)
-            Radius = radiusPx; TexW = texW; TexH = texH;
+            PixelShader = shader;
+            Radius = radiusPx;
+            TexW = texW;
+            TexH = texH;
+            UpdateShaderValue(RefrProperty);
+            UpdateShaderValue(RimProperty);
+            UpdateShaderValue(ChromaProperty);
+            UpdateShaderValue(SheenProperty);
+            UpdateShaderValue(LiftProperty);
+            UpdateShaderValue(TintProperty);
+            UpdateShaderValue(RadiusProperty);
+            UpdateShaderValue(TexWProperty);
+            UpdateShaderValue(TexHProperty);
+            UpdateShaderValue(SharpUvProperty);
+            UpdateShaderValue(EdgeWidthProperty);
+            if (panel) UpdateShaderValue(PanelAspectProperty);
+            else _pillGeometry = new PillGlassGeometry();
+        }
+
+        private static readonly DependencyProperty SharpUvProperty = DependencyProperty.Register(
+            "SharpUv", typeof(Point4D), typeof(LiquidGlassEffect),
+            new UIPropertyMetadata(new Point4D(1, 1, 0, 0), PixelShaderConstantCallback(7)));
+        private static readonly DependencyProperty TintProperty = DependencyProperty.Register(
+            "Tint", typeof(Point4D), typeof(LiquidGlassEffect),
+            new UIPropertyMetadata(new Point4D(), PixelShaderConstantCallback(8)));
+        private static readonly DependencyProperty EdgeWidthProperty = DependencyProperty.Register(
+            "EdgeWidth", typeof(double), typeof(LiquidGlassEffect),
+            new UIPropertyMetadata(6.0, PixelShaderConstantCallback(9)));
+
+        private static readonly DependencyProperty PanelAspectProperty = DependencyProperty.Register(
+            "PanelAspect", typeof(Point), typeof(LiquidGlassEffect),
+            new UIPropertyMetadata(new Point(1, 1), PixelShaderConstantCallback(10)));
+
+        private static readonly DependencyProperty LiftProperty = DependencyProperty.Register(
+            "Lift", typeof(double), typeof(LiquidGlassEffect),
+            new UIPropertyMetadata(0.0, PixelShaderConstantCallback(11)));
+
+        internal double Lift { set { SetValue(LiftProperty, value); } }
+        internal Point PanelAspect { set { SetValue(PanelAspectProperty, value); } }
+        internal Point4D SharpUv { set { SetValue(SharpUvProperty, value); } }
+        internal Point4D Tint { set { SetValue(TintProperty, value); } }
+        internal double EdgeWidth { set { SetValue(EdgeWidthProperty, value); } }
+
+        private static readonly DependencyProperty PillGeometryProperty = RegisterPixelShaderSamplerProperty(
+            "PillGeometry", typeof(LiquidGlassEffect), 3, SamplingMode.Bilinear);
+
+        internal void SetPills(IReadOnlyList<Rect> layout, double scaleX, double scaleY, double edgeWidth)
+        {
+            EdgeWidth = edgeWidth;
+            var brush = _pillGeometry.Update(layout, Math.Max(1, (int)TexW), Math.Max(1, (int)TexH),
+                scaleX, scaleY, Radius, edgeWidth);
+            if (!ReferenceEquals(GetValue(PillGeometryProperty), brush)) SetValue(PillGeometryProperty, brush);
         }
 
         public static readonly DependencyProperty RadiusProperty = DependencyProperty.Register(
@@ -92,100 +130,102 @@ namespace DesktopBar.UI
         public double TexW { get { return (double)GetValue(TexWProperty); } set { SetValue(TexWProperty, value); } }
         public double TexH { get { return (double)GetValue(TexHProperty); } set { SetValue(TexHProperty, value); } }
 
-        /// <summary>
-        /// 生成/编译着色器。rects 是胶囊在半分辨率捕获图像素坐标下的 (cx,cy,hx,hy)。
-        /// 几何不同生成的源码不同,缓存自动区分。失败返回 null。
-        /// </summary>
-        public static LiquidGlassEffect Create(float[][] rects, int count,
-            double radiusPx, double texW, double texH)
+        // 无界面自检传入的胶囊是纹理像素坐标 (cx, cy, hx, hy)。
+        public static LiquidGlassEffect Create(float[][] rects, int count, double radiusPx, double texW, double texH)
         {
-            return CreateCore(BuildHlsl(rects, Math.Max(0, count), false), radiusPx, texW, texH);
+            var effect = CreatePills(radiusPx, texW, texH);
+            if (effect == null) return null;
+            var layout = new List<Rect>();
+            int length = Math.Min(count, rects?.Length ?? 0);
+            for (int i = 0; i < length; i++)
+            {
+                var r = rects[i];
+                layout.Add(new Rect(r[0] - r[2], r[1] - r[3], r[2] * 2, r[3] * 2));
+            }
+            effect.SetPills(layout, 1, 1, Math.Max(1, radiusPx * 0.55));
+            return effect;
         }
 
-        /// <summary>
-        /// 展开页(整块圆角矩形)版本:与胶囊版共用同一份 main() 主体,只有距离场不同——
-        /// 展开页的距离场完全来自 pTexW/pTexH/pRadius 三个寄存器,不烘焙任何几何字面量,
-        /// 因此**任意尺寸、任意圆角的展开页共用同一份字节码**。
-        /// 这是"面板实时玻璃"的前提:动画期间面板每帧都在变尺寸,重编译着色器是不可接受的,
-        /// 而这里每帧只改寄存器(参数),编译一次就够。
-        /// 另外展开页窗口没有 GeometryGroup 裁剪,圆角/边缘柔化由着色器按距离场输出 alpha。
-        /// </summary>
+        internal static LiquidGlassEffect CreatePills(double radiusPx, double texW, double texH)
+            => CreateCore(false, radiusPx, texW, texH);
+
         public static LiquidGlassEffect CreatePanel(double radiusPx, double texW, double texH)
-        {
-            return CreateCore(BuildHlsl(null, 0, true), radiusPx, texW, texH);
-        }
+            => CreateCore(true, radiusPx, texW, texH);
 
-        private static LiquidGlassEffect CreateCore(string hlsl, double radiusPx, double texW, double texH)
+        private static LiquidGlassEffect CreateCore(bool panel, double radiusPx, double texW, double texH)
         {
+            ref PixelShader shader = ref (panel ? ref _panelShader : ref _pillsShader);
+            ref bool attempted = ref (panel ? ref _panelAttempted : ref _pillsAttempted);
             try
             {
-                try
+                if (!attempted)
                 {
-                    var dbgDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "YukiDesk");
-                    Directory.CreateDirectory(dbgDir);
-                    File.WriteAllText(Path.Combine(dbgDir, "liquid-debug.hlsl"), hlsl);
+                    attempted = true;
+                    string hlsl = BuildHlsl(panel);
+                    string target = Environment.GetEnvironmentVariable("YUKI_GLASS_SHADER_PS");
+                    if (string.IsNullOrWhiteSpace(target)) target = "ps_3_0";
+                    if (target == "ps_3_0" && (!RenderCapability.IsPixelShaderVersionSupported(3, 0)
+                        || RenderOptions.ProcessRenderMode == System.Windows.Interop.RenderMode.SoftwareOnly))
+                        throw new NotSupportedException("当前 WPF 渲染设备不支持 Pixel Shader 3.0");
+                    string path = CachePath(hlsl + "\n// target=" + target);
+                    byte[] bytecode = LoadCached(path, target);
+                    bool loadedFromCache = bytecode != null;
+                    bytecode ??= NativeMethods.CompilePs(hlsl, target);
+                    shader = CreateShader(bytecode);
+                    if (!loadedFromCache) SaveCached(path, bytecode);
                 }
-                catch { }
-                // 目标着色器版本可覆盖(实验用:ps_2_0 与 ps_3_0 在 WPF 里的支持面不一样)。
-                // 版本进缓存键,否则换版本会命中旧字节码。
-                string target = Environment.GetEnvironmentVariable("YUKI_GLASS_SHADER_PS");
-                if (string.IsNullOrWhiteSpace(target)) target = "ps_3_0";
-                byte[] bytecode = LoadCached(hlsl + "\n// target=" + target);
-                if (bytecode == null)
-                {
-                    bytecode = NativeMethods.CompilePs(hlsl, target);
-                    SaveCached(hlsl + "\n// target=" + target, bytecode);
-                }
-                return new LiquidGlassEffect(bytecode, radiusPx, texW, texH);
+                return shader == null ? null : new LiquidGlassEffect(shader, radiusPx, texW, texH, panel);
             }
             catch (Exception ex)
             {
+                shader = null;
                 App.Log("液态玻璃着色器不可用,降级为普通玻璃: " + ex);
                 return null;
             }
         }
 
-        // ---------- HLSL 生成与字节码缓存 ----------
-
-        private static string BuildHlsl(float[][] rects, int count, bool panel)
+        private static PixelShader CreateShader(byte[] bytecode)
         {
-            var inv = CultureInfo.InvariantCulture;
-            var sb = new StringBuilder();
-            sb.AppendLine("sampler2D Input : register(s1);");
-            sb.AppendLine("sampler2D Sharp : register(s2);");
-            sb.AppendLine("float pRefr : register(c0);");
-            sb.AppendLine("float pRim : register(c1);");
-            sb.AppendLine("float pChroma : register(c2);");
-            sb.AppendLine("float pRadius : register(c3);");
-            sb.AppendLine("float pTexW : register(c4);");
-            sb.AppendLine("float pTexH : register(c5);");
-            sb.AppendLine("float pSheen : register(c6);");
-            sb.AppendLine(@"
-float sd(float cx, float cy, float hx, float hy, float2 p)
-{
-    float2 q = abs(p - float2(cx, cy)) - float2(hx, hy) + pRadius;
-    return length(max(q, 0)) + min(max(q.x, q.y), 0) - pRadius;
-}
-float field(float2 p)
-{
-    float b = 1e9;");
+            var shader = new PixelShader();
+            using var stream = new MemoryStream(bytecode);
+            shader.SetStreamSource(stream);
+            shader.Freeze();
+            return shader;
+        }
+
+        private static string BuildHlsl(bool panel)
+        {
+            var sb = new StringBuilder(@"
+sampler2D Input : register(s1);
+sampler2D Sharp : register(s2);
+float pRefr : register(c0);
+float pRim : register(c1);
+float pChroma : register(c2);
+float pRadius : register(c3);
+float pTexW : register(c4);
+float pTexH : register(c5);
+float pSheen : register(c6);
+float4 pSharpUv : register(c7);
+float4 pTint : register(c8);
+float pEdgeWidth : register(c9);
+");
+            sb.AppendLine("float pLift : register(c11);");
             if (panel)
             {
-                // 展开页:整块圆角矩形,几何全部来自寄存器(texW/texH/radius),
-                // 所以同一份字节码能服务任意尺寸——实时面板每帧尺寸都在变,不能重编译。
-                sb.AppendLine("    b = min(b, sd(pTexW * 0.5, pTexH * 0.5, pTexW * 0.5, pTexH * 0.5, p));");
+                sb.AppendLine(@"
+float2 pPanelAspect : register(c10);
+float field(float2 p)
+{
+    float2 halfSize = float2(pTexW, pTexH) * 0.5 / pPanelAspect;
+    float radius = min(pRadius, min(halfSize.x, halfSize.y));
+    float2 q = abs(p / pPanelAspect - halfSize) - halfSize + radius;
+    return length(max(q, 0)) + min(max(q.x, q.y), 0) - radius;
+}");
             }
             else
             {
-                for (int i = 0; i < count && i < rects.Length; i++)
-                {
-                    // 胶囊几何烘焙成字面量:寄存器数组封送在各 WPF 版本上不可靠,字面量零风险
-                    sb.AppendLine(string.Format(inv, "    b = min(b, sd({0}, {1}, {2}, {3}, p));",
-                        Fmt(rects[i][0]), Fmt(rects[i][1]), Fmt(rects[i][2]), Fmt(rects[i][3])));
-                }
+                sb.AppendLine("sampler2D PillGeometry : register(s3);");
             }
-            sb.AppendLine(@"    return b;
-}");
             // 调试档(YUKI_GLASS_SHADER_DEBUG=1/2/3):把某一步单独输出成画面,便于截图定位问题
             string dbg = Environment.GetEnvironmentVariable("YUKI_GLASS_SHADER_DEBUG");
             if (dbg == "1")
@@ -217,38 +257,52 @@ float field(float2 p)
             sb.AppendLine(@"float4 main(float2 uv : TEXCOORD) : COLOR
 {
     float2 tex = float2(pTexW, pTexH);
-    float2 px = uv * tex;
+");
+            if (panel)
+            {
+                sb.AppendLine(@"    float2 px = uv * tex;
     float d = field(px);
-    // 数值梯度得到场的法线,只在轮廓附近有意义
-    float e = 2.0;
-    float2 g = float2(
-        field(px + float2(e, 0)) - field(px - float2(e, 0)),
-        field(px + float2(0, e)) - field(px - float2(0, e)));
-    float2 n = g / (length(g) + 1e-4);
-    // 折射带宽度(半分辨率像素)。带太宽会把整颗胶囊都变成未模糊+彩虹,带太窄看不见透镜感;
-    // 半径 12.8px 的胶囊上 6px 正好是一圈边,主体仍保持模糊。
-    float edge = 1.0 - saturate(abs(d) / 6.0);
-    float2 disp = n * pRefr * edge * edge * 14.0;
-    float ca = pChroma * edge * edge * 0.08;
-    // 主体:模糊帧(契约:顶栏之下的一切都被模糊)
+    // 按纹理像素校正屏幕导数，面板非等比缩放时法线仍在采样坐标系。
+    float2 stepPx = max(abs(float2(ddx(px.x), ddy(px.y))), 1e-4);
+    float2 g = float2(ddx(d), ddy(d)) / stepPx;
+    float2 n = g / (length(g) + 1e-4);");
+            }
+            else
+            {
+                sb.AppendLine(@"    float3 geometry = tex2D(PillGeometry, uv).rgb * 2.0 - 1.0;
+    float d = geometry.b * pEdgeWidth;
+    float2 n = geometry.rg / (length(geometry.rg) + 1e-4);");
+            }
+            sb.AppendLine(@"
+    float edge = 1.0 - saturate(abs(d) / pEdgeWidth);
+    float bevel = edge * edge;
+    float2 disp = n * pRefr * bevel * pEdgeWidth * 2.45;
+    float ca = pChroma * bevel * 0.055;
     float3 body = tex2D(Input, uv).rgb;
-    // 轮廓一圈:从未模糊帧折射采样,才有「透镜把背景压弯」的真实感(带 RGB 色散)
-    float3 lens;
-    lens.r = tex2D(Sharp, (px + disp * (1.0 + ca)) / tex).r;
-    lens.g = tex2D(Sharp, (px + disp) / tex).g;
-    lens.b = tex2D(Sharp, (px + disp * (1.0 - ca)) / tex).b;
-    float3 col = lerp(body, lens, saturate(edge * edge * 1.1) * 0.85);
-    // 轮廓内侧一圈亮边(压薄一点,否则远景看就是白描边)
-    float rim = pRim * edge * edge * saturate(-d / 6.0 + 0.5);
-    col += rim * 0.5;
-    // 方向光(左上)在斜面上打高光、右下侧压暗:玻璃厚板的体积感靠这一对比,
-    // 否则胶囊内部只是均匀半透明色,大块面板尤其像塑料片(与 CPU 烘焙面板同一口径)。
+    float2 sharpUv = uv * pSharpUv.xy + pSharpUv.zw;
+    float2 delta = disp / tex * pSharpUv.xy;
+    float3 col = body;
+
+    // 光学作用集中在边缘，居中的文字和控件由柔和的底图衬托。
+    [branch] if (bevel * pRefr > 0.005)
+    {
+        float3 lens = tex2Dlod(Sharp, float4(saturate(sharpUv + delta), 0.0, 0.0)).rgb;
+        [branch] if (pChroma > 0.001)
+        {
+            lens.r = tex2Dlod(Sharp, float4(saturate(sharpUv + delta * (1.0 + ca)), 0.0, 0.0)).r;
+            lens.b = tex2Dlod(Sharp, float4(saturate(sharpUv + delta * (1.0 - ca)), 0.0, 0.0)).b;
+        }
+        col = lerp(col, lens, bevel * saturate(pRefr * 1.55));
+    }
     float dotL = -(n.x * 0.55 + n.y * 0.83);
     float lit = max(dotL, 0.0);
-    float shade = max(-dotL, 0.0);
-    float sheen = pSheen * edge * edge * (lit - shade * 0.55);
-    col += sheen * 0.35;
-    col = saturate(col);
+    float back = max(-dotL, 0.0);
+    float rim = pRim * edge * bevel * saturate(-d / pEdgeWidth + 0.5);
+    float dark = 1.0 - dot(col, float3(0.2126, 0.7152, 0.0722));
+    col = lerp(col, 1.0, pLift * dark * dark);
+    col *= 1.0 - pSheen * bevel * back * 0.035;
+    col = lerp(col, 1.0, saturate(rim * (0.24 + 0.30 * lit) + pSheen * bevel * lit * 0.18));
+    col = lerp(col, pTint.rgb, pTint.a);
     // ---- 调试档(SM3 下构造函数/隐式转换很挑,统一用分量赋值,别用 float4(x,y,z,w) 混类型) ----
     if (DEBUG_MODE == 2) { float4 c0 = tex2D(Input, uv); c0.rgb = edge; c0.a = 1.0; return c0; }
     if (DEBUG_MODE == 3) { float4 c0 = tex2D(Input, uv); c0.r = uv.x; c0.g = uv.y; c0.b = 0.0; c0.a = 1.0; return c0; }
@@ -275,22 +329,10 @@ float field(float2 p)
             string mode = dbg == null ? "0" : dbg;
             switch (mode)
             {
-                case "2": case "3": case "4": case "5": case "6": case "7": break;
+                case "2": case "3": case "4": case "5": case "6": case "7": case "8": break;
                 default: mode = "0"; break;
             }
             return sb.ToString().Replace("DEBUG_MODE", mode);
-        }
-
-        /// <summary>
-        /// 把浮点数写成合法的 HLSL 字面量。Historic bug:直接用 "R" 格式会产出 "35f"/"1E-05f",
-        /// HLSL 要求小数点(35f 是语法错),所以固定 "0.0###" 且补足小数位。
-        /// </summary>
-        private static string Fmt(float v)
-        {
-            if (float.IsNaN(v) || float.IsInfinity(v)) v = 0f;
-            var s = v.ToString("0.0###", CultureInfo.InvariantCulture);
-            if (s == "-0.0") s = "0.0";
-            return s;
         }
 
         private static string CachePath(string hlsl)
@@ -306,25 +348,33 @@ float field(float2 p)
             }
         }
 
-        private static byte[] LoadCached(string hlsl)
+        private static byte[] LoadCached(string path, string target)
         {
             try
             {
-                var path = CachePath(hlsl);
-                return File.Exists(path) ? File.ReadAllBytes(path) : null;
+                if (!File.Exists(path)) return null;
+                var bytes = File.ReadAllBytes(path);
+                uint version = target == "ps_3_0" ? 0xFFFF0300u : 0xFFFF0200u;
+                return bytes.Length >= 8 && bytes.Length % 4 == 0 && BitConverter.ToUInt32(bytes, 0) == version
+                    && BitConverter.ToUInt32(bytes, bytes.Length - 4) == 0x0000FFFF ? bytes : null;
             }
             catch { return null; }
         }
 
-        private static void SaveCached(string hlsl, byte[] bytecode)
+        private static void SaveCached(string path, byte[] bytecode)
         {
+            var temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
             try
             {
-                var path = CachePath(hlsl);
                 Directory.CreateDirectory(Path.GetDirectoryName(path));
-                File.WriteAllBytes(path, bytecode);
+                File.WriteAllBytes(temporary, bytecode);
+                File.Move(temporary, path, overwrite: true);
             }
             catch { }
+            finally
+            {
+                try { File.Delete(temporary); } catch { }
+            }
         }
     }
 }

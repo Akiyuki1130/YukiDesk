@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
+using System.Windows.Documents;
 using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Threading;
@@ -40,12 +41,14 @@ namespace DesktopBar.UI
             double s = Ui.Scale;
 
             var sp = new StackPanel();
+            TextElement.SetFontFamily(sp, Ui.TextFont);
             if (!string.IsNullOrEmpty(caption))
             {
                 var captionText = new TextBlock
                 {
                     Text = caption,
-                    FontSize = 11 * s,
+                    FontSize = 12 * s,
+                    FontWeight = FontWeights.SemiBold,
                     Opacity = 0.65,
                     Margin = new Thickness(6 * s, 2 * s, 6 * s, 6 * s)
                 };
@@ -59,7 +62,8 @@ namespace DesktopBar.UI
                 var text = new TextBlock
                 {
                     Text = item.Text,
-                    FontSize = 12.5 * s,
+                    FontSize = 13.5 * s,
+                    FontWeight = FontWeights.SemiBold,
                     VerticalAlignment = VerticalAlignment.Center,
                     Opacity = item.Enabled ? 1 : 0.4
                 };

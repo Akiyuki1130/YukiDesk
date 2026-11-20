@@ -40,7 +40,7 @@ namespace DesktopBar.UI
         public ColorEditor(string hex)
         {
             Orientation = Orientation.Vertical;
-            MinWidth = 260;
+            MinWidth = 214;
 
             _spectrum = new SpectrumSurface { Width = 240, Height = 142, Cursor = Cursors.Cross };
             _spectrumMarker = new Ellipse
@@ -99,21 +99,23 @@ namespace DesktopBar.UI
             };
             _preview = new Border
             {
-                Width = 26,
-                Height = 26,
-                CornerRadius = new CornerRadius(7),
+                Width = 30,
+                Height = 30,
+                CornerRadius = new CornerRadius(15),
                 BorderThickness = new Thickness(1),
                 VerticalAlignment = VerticalAlignment.Center
             };
             _preview.SetResourceReference(Border.BorderBrushProperty, "SettingsControlBorder");
             _box = new TextBox
             {
-                Width = 112,
-                Margin = new Thickness(10, 0, 0, 0),
+                Width = 108,
+                Margin = new Thickness(8, 0, 0, 0),
                 Style = (Style)Application.Current.FindResource("DarkBox"),
                 VerticalAlignment = VerticalAlignment.Center,
-                FontSize = 12
+                FontFamily = Ui.TextFont,
+                FontSize = 13.5
             };
+            System.Windows.Automation.AutomationProperties.SetName(_box, "十六进制颜色");
             _box.TextChanged += (s, e) => { if (!_updating) ApplyHex(_box.Text, commit: false); };
             _box.LostKeyboardFocus += (s, e) => CommitHex();
             _box.KeyDown += (s, e) =>
@@ -122,21 +124,12 @@ namespace DesktopBar.UI
             };
             row.Children.Add(_preview);
             row.Children.Add(_box);
-            var hexLabel = new TextBlock
-            {
-                Text = "HEX",
-                FontSize = 11,
-                VerticalAlignment = VerticalAlignment.Center,
-                Margin = new Thickness(8, 0, 0, 0)
-            };
-            hexLabel.SetResourceReference(TextElement.ForegroundProperty, "SettingsSubTextBrush");
-            row.Children.Add(hexLabel);
             _togglePalette = new Button
             {
-                Content = "展开色盘",
+                Content = "色盘", MinWidth = 60,
                 Style = (Style)Application.Current.FindResource("Btn"),
-                Margin = new Thickness(10, 0, 0, 0),
-                Padding = new Thickness(10, 5, 10, 5),
+                Margin = new Thickness(8, 0, 0, 0),
+                Padding = new Thickness(11, 7, 11, 7),
                 VerticalAlignment = VerticalAlignment.Center,
                 ToolTip = "展开或收起 HSV 色盘"
             };
@@ -183,7 +176,7 @@ namespace DesktopBar.UI
                     _palette.Opacity = 1;
                 };
                 _paletteTimer.Start();
-                _togglePalette.Content = "收起色盘";
+                _togglePalette.Content = "收起";
             }
             else
             {
@@ -204,7 +197,7 @@ namespace DesktopBar.UI
                     _palette.Visibility = Visibility.Collapsed;
                 };
                 _paletteTimer.Start();
-                _togglePalette.Content = "展开色盘";
+                _togglePalette.Content = "色盘";
             }
         }
 

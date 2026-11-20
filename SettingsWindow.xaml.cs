@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
@@ -25,13 +26,15 @@ namespace DesktopBar
         private ListBox _folderList;
         private bool _updatingTheme;
         private string _currentPage;
-        private int _pageAnimationVersion;
+        private bool? _appliedLightTheme;
+        private readonly HashSet<Action> _pendingSliderCommits = new();
 
         public SettingsWindow()
         {
             InitializeComponent();
             // 先应用主题再创建动态控件，避免控件捕获初始化阶段的低对比度画刷。
             ApplyWindowTheme();
+            SettingsThemeHost.Content = BuildThemeModePicker();
             BuildAppearancePage();
             BuildTimePage();
             BuildFoldersPage();
@@ -40,16 +43,75 @@ namespace DesktopBar
             BuildAboutPage();
             ShowPage("Appearance");
             ThemeService.Changed += OnThemeChanged;
-            ApplyWindowTheme();
+            Microsoft.Win32.SystemEvents.UserPreferenceChanged += OnSystemThemeChanged;
+            Closing += (s, e) =>
+            {
+                foreach (var commit in _pendingSliderCommits.ToArray()) commit();
+            };
             Closed += (s, e) =>
             {
                 ThemeService.Changed -= OnThemeChanged;
+                Microsoft.Win32.SystemEvents.UserPreferenceChanged -= OnSystemThemeChanged;
                 _tempStatusTimer?.Stop();
                 _tempStatusTimer = null;
             };
         }
 
         // ---------- 导航 ----------
+        private static readonly Dictionary<string, string> PageKeywords = new(StringComparer.Ordinal)
+        {
+            ["Appearance"] = "外观 材质 胶囊 液态玻璃 雾面 壁纸换图过渡 壁纸过渡 幻灯片过渡 更新节奏 透明度 主题 配色 颜色 边框 缩放",
+            ["Time"] = "时间 时钟 日期 星期 秒数 农历 居中",
+            ["Folders"] = "小文件夹 文件 目录 位置 存储 创建 排序 重命名",
+            ["Modules"] = "模块显示 性能 监测 GPU CPU 内存 网络速率 CPU温度 GPU温度 音乐 音量 频谱 回收站",
+            ["General"] = "通用 开机自启 启动 登录 动画时长 悬停关闭 桌面空间 预留 数据 配置 日志",
+            ["About"] = "关于 版本 软件更新 检查更新 下载 GitHub"
+        };
+
+        private void Search_TextChanged(object sender, TextChangedEventArgs e)
+        {
+            if (NavigationItems == null || SearchEmpty == null) return;
+            string[] terms = SettingsSearchBox.Text.Split((char[])null, StringSplitOptions.RemoveEmptyEntries);
+            SearchPlaceholder.Visibility = SettingsSearchBox.Text.Length == 0 ? Visibility.Visible : Visibility.Collapsed;
+            bool any = false;
+            foreach (var nav in NavigationItems.Children.OfType<RadioButton>())
+            {
+                bool matches = PageKeywords.TryGetValue((string)nav.Tag, out var keywords)
+                    && terms.All(term => keywords.Contains(term, StringComparison.OrdinalIgnoreCase));
+                nav.Visibility = matches ? Visibility.Visible : Visibility.Collapsed;
+                any |= matches;
+            }
+            SearchEmpty.Visibility = any ? Visibility.Collapsed : Visibility.Visible;
+        }
+
+        private void Settings_PreviewKeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.Key == Key.F && Keyboard.Modifiers == ModifierKeys.Control)
+            {
+                SettingsSearchBox.Focus();
+                SettingsSearchBox.SelectAll();
+                e.Handled = true;
+            }
+            else if (SettingsSearchBox.IsKeyboardFocusWithin && e.Key == Key.Enter)
+            {
+                var match = NavigationItems.Children.OfType<RadioButton>()
+                    .FirstOrDefault(nav => nav.Visibility == Visibility.Visible);
+                if (match != null)
+                {
+                    match.IsChecked = true;
+                    match.Focus();
+                }
+                e.Handled = true;
+            }
+            else if (e.Key == Key.Escape && SettingsSearchBox.Text.Length > 0 &&
+                (SettingsSearchBox.IsKeyboardFocusWithin || NavigationItems.IsKeyboardFocusWithin))
+            {
+                SettingsSearchBox.Clear();
+                SettingsSearchBox.Focus();
+                e.Handled = true;
+            }
+        }
+
         private void Nav_Checked(object sender, RoutedEventArgs e)
         {
             if (PagesGrid == null) return;
@@ -58,63 +120,35 @@ namespace DesktopBar
 
         private void ShowPage(string tag)
         {
-            if (PagesGrid == null || string.IsNullOrEmpty(tag)) return;
-            var next = PagesGrid.Children.OfType<FrameworkElement>()
-                .FirstOrDefault(x => string.Equals((string)x.Tag, tag, StringComparison.Ordinal));
+            if (PagesGrid == null || string.IsNullOrEmpty(tag) || _currentPage == tag) return;
+            var pages = PagesGrid.Children.OfType<FrameworkElement>();
+            var next = pages.FirstOrDefault(page => string.Equals((string)page.Tag, tag, StringComparison.Ordinal));
             if (next == null) return;
-            if (string.Equals(_currentPage, tag, StringComparison.Ordinal)) return;
 
-            var previous = PagesGrid.Children.OfType<FrameworkElement>()
-                .FirstOrDefault(x => string.Equals((string)x.Tag, _currentPage, StringComparison.Ordinal));
-            double previousOpacity = previous?.Opacity ?? 1;
+            bool animate = _currentPage != null && SystemParameters.ClientAreaAnimation;
             _currentPage = tag;
-            int version = ++_pageAnimationVersion;
-            var duration = TimeSpan.FromMilliseconds(Math.Max(120, Math.Min(320, S.AnimationDurationMs)));
-            var ease = new CubicEase { EasingMode = EasingMode.EaseOut };
-
-            foreach (var child in PagesGrid.Children.OfType<FrameworkElement>())
+            PageTitle.Text = tag switch
             {
-                child.BeginAnimation(OpacityProperty, null);
-                child.RenderTransform = null;
-                child.IsHitTestVisible = ReferenceEquals(child, next);
-                Panel.SetZIndex(child, ReferenceEquals(child, next) ? 1 : 0);
-                if (!ReferenceEquals(child, next) && !ReferenceEquals(child, previous))
-                {
-                    child.Visibility = Visibility.Collapsed;
-                    child.Opacity = 0;
-                }
-            }
+                "Appearance" => "外观",
+                "Time" => "时间",
+                "Folders" => "小文件夹",
+                "Modules" => "模块显示",
+                "General" => "通用",
+                "About" => "关于",
+                _ => tag
+            };
 
-            next.Visibility = Visibility.Visible;
-            next.IsHitTestVisible = true;
-            next.Opacity = 0;
-            next.RenderTransformOrigin = new Point(0.5, 0.5);
-            next.RenderTransform = new TranslateTransform(16, 0);
-            var fadeIn = new DoubleAnimation(0, 1, duration) { EasingFunction = ease };
-            var slideIn = new DoubleAnimation(16, 0, duration) { EasingFunction = ease };
-            next.BeginAnimation(OpacityProperty, fadeIn);
-            ((TranslateTransform)next.RenderTransform).BeginAnimation(TranslateTransform.XProperty, slideIn);
-
-            if (previous != null && !ReferenceEquals(previous, next))
+            foreach (var page in pages)
             {
-                previous.Visibility = Visibility.Visible;
-                previous.IsHitTestVisible = false;
-                double currentOpacity = Math.Clamp(previous.Opacity, 0, 1);
-                previous.Opacity = currentOpacity;
-                var fadeOut = new DoubleAnimation(currentOpacity, 0, duration) { EasingFunction = ease };
-                fadeOut.Completed += (s, e) =>
-                {
-                    if (version == _pageAnimationVersion && !ReferenceEquals(previous, next))
-                    {
-                        previous.Visibility = Visibility.Collapsed;
-                        previous.RenderTransform = null;
-                        previous.BeginAnimation(OpacityProperty, null);
-                        previous.Opacity = 0;
-                        Panel.SetZIndex(previous, 0);
-                    }
-                };
-                previous.BeginAnimation(OpacityProperty, fadeOut);
+                bool current = ReferenceEquals(page, next);
+                page.BeginAnimation(OpacityProperty, null);
+                page.Opacity = 1;
+                page.Visibility = current ? Visibility.Visible : Visibility.Collapsed;
+                page.IsHitTestVisible = current;
             }
+            if (animate)
+                next.BeginAnimation(OpacityProperty, new DoubleAnimation(0.64, 1,
+                    TimeSpan.FromMilliseconds(130)) { FillBehavior = FillBehavior.Stop });
         }
 
         private void Close_Click(object sender, RoutedEventArgs e) => Close();
@@ -148,7 +182,17 @@ namespace DesktopBar
             return null;
         }
 
-        private void OnThemeChanged() => Dispatcher.BeginInvoke(new Action(ApplyWindowTheme));
+        private void OnThemeChanged() => Dispatcher.BeginInvoke(new Action(() =>
+        {
+            ApplyWindowTheme();
+            _glassPreview?.Refresh(S);
+        }));
+
+        private void OnSystemThemeChanged(object sender, Microsoft.Win32.UserPreferenceChangedEventArgs e)
+        {
+            if (S?.SettingsThemeMode == 0 && !Dispatcher.HasShutdownStarted)
+                Dispatcher.BeginInvoke(new Action(ApplyWindowTheme));
+        }
 
         private static bool SystemUsesLightTheme()
         {
@@ -160,43 +204,57 @@ namespace DesktopBar
             catch { return false; }
         }
 
+        private static readonly (string Key, string Light, string Dark)[] SettingsPalette =
+        {
+            ("SettingsWindowBackground", "#FAF9F7", "#20201F"),
+            ("SettingsSidebarBackground", "#F0EFEC", "#1B1B1A"),
+            ("SettingsWindowBorder", "#D1CECA", "#40403E"),
+            ("SettingsDivider", "#DFDCD7", "#363634"),
+            ("SettingsTextBrush", "#242321", "#F0EEEA"),
+            ("SettingsSubTextBrush", "#635F5A", "#B2AFAA"),
+            ("SettingsLabelBrush", "#3B3936", "#DEDBD6"),
+            ("SettingsHoverBackground", "#EEECE8", "#2B2B29"),
+            ("SettingsControlBackground", "#FFFFFF", "#262625"),
+            ("SettingsControlBorder", "#CFCCC7", "#51514E"),
+            ("SettingsButtonBackground", "#EFEEEB", "#2B2B29"),
+            ("SettingsButtonHover", "#E6E4DF", "#333332"),
+            ("SettingsButtonPressed", "#DEDBD6", "#272726"),
+            ("SettingsAccent", "#8F462F", "#F2B89B"),
+            ("SettingsAccentFill", "#914A33", "#F2B89B"),
+            ("SettingsAccentHover", "#7D3C27", "#F8C6AD"),
+            ("SettingsAccentPressed", "#6E3220", "#E4A68A"),
+            ("SettingsAccentInk", "#FFFFFF", "#211D1B"),
+            ("SettingsSwitchTrack", "#DBD8D3", "#454542"),
+            ("SettingsSwitchThumb", "#FFFFFF", "#F4F1ED"),
+            ("SettingsSwitchThumbBorder", "#98948F", "#6C6965"),
+            ("SettingsTrack", "#DFDDD9", "#444441"),
+            ("SettingsNavHover", "#E8E6E2", "#282827"),
+            ("SettingsNavSelected", "#E5E3DF", "#30302E"),
+            ("SettingsSelected", "#F2E8E3", "#493B34"),
+            ("SettingsSelectedBorder", "#C49A88", "#A97E6B"),
+            ("SettingsListHover", "#EDEBE7", "#2F2F2D"),
+            ("SettingsPopupBackground", "#FFFFFF", "#292928"),
+            ("SettingsScrollThumb", "#9B9792", "#696762"),
+            ("SettingsCloseHover", "#F4E5E1", "#432E2B"),
+            ("SettingsCloseInk", "#903B31", "#FFBDB4"),
+        };
+
         private void ApplyWindowTheme()
         {
             if (_updatingTheme || WindowRoot == null) return;
+            bool light = S.SettingsThemeMode == 1 || (S.SettingsThemeMode == 0 && SystemUsesLightTheme());
+            if (_appliedLightTheme == light) return;
+
             _updatingTheme = true;
-            bool light = S.SettingsThemeMode == 1
-                || (S.SettingsThemeMode == 0 && SystemUsesLightTheme());
-            var resources = Application.Current.Resources;
-            // 跟随系统:浅色模式用干净的白色纸面,深色模式用灰黑底白字(带一点冷调,避免纯黑发闷)。
-            resources["SettingsWindowBackground"] = Ui.Brush(light ? "#F5F6F8" : "#1A1B21");
-            resources["SettingsTitleBackground"] = Ui.Brush(light ? "#FFFFFF" : "#202129");
-            resources["SettingsWindowBorder"] = Ui.Brush(light ? "#DDDFE6" : "#3A3C46");
-            resources["SettingsTextBrush"] = Ui.Brush(light ? "#1A1B22" : "#FFFFFF");
-            resources["SettingsSubTextBrush"] = Ui.Brush(light ? "#494E5C" : "#E4E4E4");
-            resources["SettingsLabelBrush"] = Ui.Brush(light ? "#101218" : "#FFFFFF");
-            resources["SettingsHoverBackground"] = Ui.Brush(light ? "#EBEDF2" : "#2F313A");
-            resources["SettingsCardBackground"] = Ui.Brush(light ? "#FFFFFF" : "#23242C");
-            resources["SettingsCardBorder"] = Ui.Brush(light ? "#E3E5EC" : "#393B44");
-            resources["SettingsControlBackground"] = Ui.Brush(light ? "#FFFFFF" : "#2C2D35");
-            resources["SettingsControlBorder"] = Ui.Brush(light ? "#C9CDD8" : "#464850");
-            resources["SettingsButtonBackground"] = Ui.Brush(light ? "#EDEFF4" : "#31323B");
-            resources["SettingsButtonHover"] = Ui.Brush(light ? "#E0E3EB" : "#3C3E47");
-            resources["SettingsButtonPressed"] = Ui.Brush(light ? "#D4D8E2" : "#26272E");
-            resources["SettingsAccent"] = Ui.Brush(light ? "#5575E8" : "#6C8CFF");
-            resources["SettingsAccentHover"] = Ui.Brush(light ? "#6786F0" : "#7D9BFF");
-            resources["SettingsAccentPressed"] = Ui.Brush(light ? "#4564D0" : "#5A78E6");
-            resources["SettingsSwitchTrack"] = Ui.Brush(light ? "#6D84D8" : "#465A9D", 0.62);
-            resources["SettingsSwitchThumb"] = Ui.Brush(light ? "#FFFFFF" : "#F5F5F5");
-            resources["SettingsSwitchThumbBorder"] = Ui.Brush(light ? "#B9BFCF" : "#5D5F68");
-            resources["SettingsTrack"] = Ui.Brush(light ? "#DBDEE6" : "#3A3C46");
-            resources["SettingsNavHover"] = Ui.Brush(light ? "#ECEDF2" : "#2F313A");
-            resources["SettingsNavSelected"] = Ui.Brush(light ? "#5575E8" : "#6C8CFF");
-            resources["SettingsSelected"] = Ui.Brush(light ? "#E2E7F6" : "#3C3E47");
-            resources["SettingsListHover"] = Ui.Brush(light ? "#E8EAF0" : "#464850");
-            resources["SettingsPopupBackground"] = Ui.Brush(light ? "#FFFFFF" : "#272830");
-            resources["SettingsScrollThumb"] = Ui.Brush(light ? "#B9BFCC" : "#565861");
-            _dropLine?.InvalidateVisual();
-            _updatingTheme = false;
+            try
+            {
+                var resources = Application.Current.Resources;
+                foreach (var (key, lightColor, darkColor) in SettingsPalette)
+                    resources[key] = Ui.Brush(light ? lightColor : darkColor);
+                _appliedLightTheme = light;
+                _dropLine?.InvalidateVisual();
+            }
+            finally { _updatingTheme = false; }
         }
 
         private void Save() => App.ApplyAndSave();
@@ -211,8 +269,8 @@ namespace DesktopBar
             var titleTb = new TextBlock
             {
                 Text = title,
-                FontSize = 14,
-                FontWeight = FontWeights.SemiBold
+                FontSize = 16,
+                FontWeight = FontWeights.Medium
             };
             titleTb.SetResourceReference(TextElement.ForegroundProperty, "SettingsTextBrush");
             sp.Children.Add(titleTb);
@@ -221,15 +279,15 @@ namespace DesktopBar
                 var subTb = new TextBlock
                 {
                     Text = subtitle,
-                    FontSize = 11.5,
-                    Margin = new Thickness(0, 4, 0, 0),
+                    FontSize = 13,
+                    Margin = new Thickness(0, 5, 0, 0),
                     TextWrapping = TextWrapping.Wrap
                 };
                 subTb.SetResourceReference(TextElement.ForegroundProperty, "SettingsSubTextBrush");
                 sp.Children.Add(subTb);
             }
             body = sp;
-            return new Border { Style = (Style)FindResource("Card"), Child = sp };
+            return new Border { Style = (Style)FindResource("SettingsSection"), Child = sp };
         }
 
         /// <summary>动态主题色的说明文字(顶部间距 12,可自定义)。</summary>
@@ -238,7 +296,7 @@ namespace DesktopBar
             var tb = new TextBlock
             {
                 Text = text,
-                FontSize = 11.5,
+                FontSize = 13,
                 Margin = new Thickness(0, topMargin, 0, 0),
                 TextWrapping = TextWrapping.Wrap
             };
@@ -248,18 +306,21 @@ namespace DesktopBar
 
         private FrameworkElement Row(string label, FrameworkElement control)
         {
-            var g = new Grid { Margin = new Thickness(0, 12, 0, 0) };
-            g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(178) });
+            var g = new Grid { Margin = new Thickness(0, 10, 0, 0), MinHeight = 32 };
+            g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(146) });
             g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             var l = new TextBlock
             {
                 Text = label,
-                FontSize = 12.5,
+                FontSize = 14,
                 VerticalAlignment = VerticalAlignment.Center,
-                Margin = new Thickness(0, 0, 18, 0),
+                Margin = new Thickness(0, 0, 15, 0),
                 TextWrapping = TextWrapping.Wrap
             };
             l.SetResourceReference(TextElement.ForegroundProperty, "SettingsLabelBrush");
+            System.Windows.Automation.AutomationProperties.SetLabeledBy(control, l);
+            if (control is Grid sliderRow && sliderRow.Children.Count > 0 && sliderRow.Children[0] is Slider slider)
+                System.Windows.Automation.AutomationProperties.SetLabeledBy(slider, l);
             Grid.SetColumn(l, 0);
             Grid.SetColumn(control, 1);
             g.Children.Add(l);
@@ -267,7 +328,8 @@ namespace DesktopBar
             return g;
         }
 
-        private FrameworkElement NumberSlider(double min, double max, double val, string suffix, Action<double> changed)
+        private FrameworkElement NumberSlider(double min, double max, double val, string suffix, Action<double> changed,
+            Action<double> preview = null, string name = null)
         {
             var s = new Slider
             {
@@ -276,48 +338,65 @@ namespace DesktopBar
                 Value = Math.Max(min, Math.Min(max, val)),
                 IsSnapToTickEnabled = true,
                 TickFrequency = 1,
-                Style = (Style)FindResource("SliderDark"),
-                Margin = new Thickness(0, 0, 56, 0)
+                SmallChange = 1,
+                LargeChange = Math.Max(1, Math.Round((max - min) / 10)),
+                Style = (Style)FindResource("CapsuleSlider")
             };
+            if (name != null) System.Windows.Automation.AutomationProperties.SetName(s, name);
+            string unit = suffix == "%" ? suffix : " " + suffix.Trim();
             var t = new TextBlock
             {
-                Text = Math.Round(val) + suffix,
-                FontSize = 12,
-                HorizontalAlignment = HorizontalAlignment.Right,
-                VerticalAlignment = VerticalAlignment.Center
+                Text = Math.Round(s.Value) + unit,
+                FontSize = 14,
+                FontWeight = FontWeights.Bold
             };
-            t.SetResourceReference(TextElement.ForegroundProperty, "SettingsLabelBrush");
-            var g = new Grid();
-            g.Children.Add(s);
-            g.Children.Add(t);
-            // 提交策略:回调可能触发顶栏全量重建(如改缩放/主题),不能在 ValueChanged 里实时执行,
-            // 否则拖动时每帧重建可视树会卡死。改为 250ms 防抖提交:拖动/点轨道/方向键/PageUp
-            // 改值全部覆盖,停手后提交一次;Thumb.DragCompleted 再立即提交,保证松手即生效。
-            s.ValueChanged += (o, e) => t.Text = Math.Round(e.NewValue) + suffix;
-            DispatcherTimer debounce = null;
-            void ScheduleCommit()
+            t.SetResourceReference(TextElement.ForegroundProperty, "SettingsTextBrush");
+
+            // 数值和预览随拖动更新；松手提交，连续的键盘或轨道点击合并写入。
+            double committed = Math.Round(s.Value);
+            bool dragging = false;
+            var debounce = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(200) };
+            void Commit()
             {
-                if (debounce == null)
-                {
-                    debounce = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(250) };
-                    debounce.Tick += (o2, e2) =>
-                    {
-                        debounce.Stop();
-                        changed(Math.Round(s.Value));
-                    };
-                }
                 debounce.Stop();
-                debounce.Start();
+                _pendingSliderCommits.Remove(Commit);
+                double value = Math.Round(s.Value);
+                if (value == committed) return;
+                committed = value;
+                changed(value);
             }
-            s.ValueChanged += (o, e) => ScheduleCommit();
-            // 模板在样式应用后才实例化,Loaded 时 Thumb 才能被找到。
-            s.Loaded += (o, e) =>
+            debounce.Tick += (o, e) => Commit();
+            s.ValueChanged += (o, e) =>
             {
-                var thumb = s.Template?.FindName("thumb", s) as Thumb;
-                if (thumb != null)
-                    thumb.DragCompleted += (o2, e2) => { debounce?.Stop(); changed(Math.Round(s.Value)); };
+                double value = Math.Round(e.NewValue);
+                t.Text = value + unit;
+                preview?.Invoke(value);
+                debounce.Stop();
+                if (value == committed)
+                {
+                    _pendingSliderCommits.Remove(Commit);
+                    return;
+                }
+                _pendingSliderCommits.Add(Commit);
+                if (!dragging) debounce.Start();
             };
-            return g;
+            s.AddHandler(Thumb.DragStartedEvent, new DragStartedEventHandler((o, e) =>
+            {
+                dragging = true;
+                debounce.Stop();
+            }), handledEventsToo: true);
+            s.AddHandler(Thumb.DragCompletedEvent, new DragCompletedEventHandler((o, e) =>
+            {
+                dragging = false;
+                Commit();
+            }), handledEventsToo: true);
+            s.LostKeyboardFocus += (o, e) => { if (!dragging) Commit(); };
+            s.Unloaded += (o, e) =>
+            {
+                debounce.Stop();
+                _pendingSliderCommits.Remove(Commit);
+            };
+            return Ui.SliderWithValue(s, t, 84);
         }
 
         private FrameworkElement ToggleRow(string label, bool val, Action<bool> changed, Action<ToggleButton> onCreated = null)
@@ -346,25 +425,26 @@ namespace DesktopBar
             return Card(title, null, out var body);
         }
 
-        /// <summary>设置窗口主题三选:跟随系统(默认)/浅色/深色。</summary>
         private FrameworkElement BuildThemeModePicker()
         {
-            var panel = new StackPanel { Orientation = Orientation.Horizontal };
-            var options = new (string Label, int Mode)[]
-            {
-                ("跟随系统", 0), ("浅色", 1), ("深色", 2)
-            };
+            var panel = new UniformGrid { Columns = 3 };
+            var options = new[] { ("系统", 0), ("浅色", 1), ("深色", 2) };
             foreach (var (label, mode) in options)
             {
                 var rb = new RadioButton
                 {
-                    Content = label,
-                    GroupName = "thememode",
-                    IsChecked = S.SettingsThemeMode == mode,
-                    Style = (Style)FindResource("NavRadio")
+                    Content = label, GroupName = "SettingsThemeMode", IsChecked = S.SettingsThemeMode == mode,
+                    Style = (Style)FindResource("SettingsChoice"),
+                    FontSize = 13, MinWidth = 0, Padding = new Thickness(4, 6, 4, 6),
+                    Margin = new Thickness(0, 0, mode == 2 ? 0 : 4, 0),
+                    ToolTip = mode == 0 ? "跟随系统主题" : label
                 };
-                rb.SetResourceReference(TextElement.ForegroundProperty, "SettingsTextBrush");
-                rb.Checked += (s, e) => { S.SettingsThemeMode = mode; ApplyWindowTheme(); Save(); };
+                rb.Checked += (s, e) =>
+                {
+                    S.SettingsThemeMode = mode;
+                    ApplyWindowTheme();
+                    App.Save();
+                };
                 panel.Children.Add(rb);
             }
             return panel;
@@ -374,172 +454,244 @@ namespace DesktopBar
         private void BuildAppearancePage()
         {
             AppearanceHost.Children.Clear();
-            var theme = Card("统一选项卡与展开页", "所有药丸和展开背景使用同一套颜色与透明度。", out var body);
-            body.Children.Add(Row("主题色盘", NewColorEditor(S.ThemeColor, h => { S.ThemeColor = h; S.AutoTheme = false; ThemeService.Refresh(); Save(); })));
-            // 顶栏文字与矢量图标的颜色；手动指定后关闭壁纸明暗自动适配，避免自动黑白文字覆盖自定义色。
-            body.Children.Add(Row("文字与图标颜色", NewColorEditor(S.ThemeTextColor, h => { S.ThemeTextColor = h; S.AutoTheme = false; ThemeService.Refresh(); Save(); })));
+            var theme = Card("桌面配色", null, out var body);
+            _manualColorRows = new StackPanel();
+            _solidColorRow = Row("胶囊底色", NewColorEditor(S.ThemeColor, h => { S.ThemeColor = h; SaveDesktopColors(); }));
+            _manualColorRows.Children.Add(_solidColorRow);
+            _manualColorRows.Children.Add(Row("文字与图标颜色", NewColorEditor(S.ThemeTextColor, h => { S.ThemeTextColor = h; SaveDesktopColors(); })));
+            body.Children.Add(_manualColorRows);
             // 透明度允许域是 0.05..1(Normalize 钳制),滑块下限对齐 5%,避免显示 0% 实际 5% 的偏差。
-            body.Children.Add(Row("透明度", NumberSlider(5, 100, S.ThemeOpacity * 100, "%", v => { S.ThemeOpacity = Math.Max(0.05, Math.Round(v) / 100); ThemeService.Refresh(); Save(); })));
+            _solidOpacityRow = Row("纯色透明度", NumberSlider(5, 100, S.ThemeOpacity * 100, "%", v => { S.ThemeOpacity = v / 100; SaveDesktopColors(); }));
+            body.Children.Add(_solidOpacityRow);
             body.Children.Add(Row("缩放", NumberSlider(75, 150, S.Scale * 100, "%", v => { S.Scale = Math.Round(v) / 100; Save(); })));
-            body.Children.Add(ToggleRow("自动适配壁纸明暗", S.AutoTheme, v => { S.AutoTheme = v; ThemeService.Refresh(); Save(); }));
-            body.Children.Add(Row("设置窗口主题", BuildThemeModePicker()));
-            body.Children.Add(ToggleRow("显示统一边框", S.BorderEnabled, v => { S.BorderEnabled = v; ThemeService.Refresh(); Save(); }));
-            body.Children.Add(Row("边框颜色", NewColorEditor(S.BorderColor, h => { S.BorderColor = h; ThemeService.Refresh(); Save(); })));
-            body.Children.Add(Row("边框透明度", NumberSlider(0, 100, S.BorderOpacity * 100, "%", v => { S.BorderOpacity = Math.Round(v) / 100; ThemeService.Refresh(); Save(); })));
+            body.Children.Add(ToggleRow("显示统一边框", S.BorderEnabled, v => { S.BorderEnabled = v; SaveDesktopColors(); }));
+            body.Children.Add(Row("边框颜色", NewColorEditor(S.BorderColor, h => { S.BorderColor = h; SaveDesktopColors(); })));
+            body.Children.Add(Row("边框透明度", NumberSlider(0, 100, S.BorderOpacity * 100, "%", v => { S.BorderOpacity = v / 100; SaveDesktopColors(); })));
             AppearanceHost.Children.Add(theme);
 
             var barCard = Card("顶栏背景", "默认完全透明，不拦截桌面点击。", out var barBody);
             barBody.Children.Add(Row("颜色", NewColorEditor(S.BarBgColor, h => { S.BarBgColor = h; Save(); })));
             barBody.Children.Add(Row("不透明度", NumberSlider(0, 100, S.BarBgOpacity * 100, "%", v => { S.BarBgOpacity = Math.Round(v) / 100; Save(); })));
             AppearanceHost.Children.Add(barCard);
-
-            BuildMicaCard();
+            BuildMaterialCard();
         }
 
-        /// <summary>胶囊材质卡片当前实例;切换材质时整体重建,让滑条显示对应材质的参数。</summary>
         private Border _materialCard;
+        private GlassPreview _glassPreview;
+        private bool _glassAdvanced;
+        private StackPanel _manualColorRows;
+        private FrameworkElement _solidColorRow, _solidOpacityRow;
 
-        /// <summary>
-        /// 胶囊材质卡片。玻璃(3) = 实时捕获顶栏背后屏幕 + 高斯模糊,Apple/小米式真·毛玻璃;
-        /// 云母/亚克力 = 壁纸烘焙管线(已从界面下架,存量配置自动迁移到玻璃,后端保留可回滚)。
-        /// 玻璃的参数改动只调 GlassService.ApplyLive,不触发顶栏全量重建。
-        /// </summary>
-        private void BuildMicaCard()
+        private void UpdateDesktopColorControls()
+        {
+            bool glass = S.PillMaterial is 3 or 4;
+            _manualColorRows.Visibility = ThemeService.FollowsBackground(S) ? Visibility.Collapsed : Visibility.Visible;
+            _solidColorRow.Visibility = _solidOpacityRow.Visibility = glass ? Visibility.Collapsed : Visibility.Visible;
+        }
+
+        private void SaveDesktopColors()
+        {
+            App.Save();
+            ThemeService.Refresh();
+            _glassPreview?.Refresh(S);
+        }
+
+        private void BuildMaterialCard()
         {
             if (_materialCard != null) AppearanceHost.Children.Remove(_materialCard);
+            if (_glassPreview?.Parent is Panel previousPreviewHost)
+                previousPreviewHost.Children.Remove(_glassPreview);
             bool liquid = S.PillMaterial == 4;
-            bool glass = S.PillMaterial == 3 || liquid;
-            bool acrylic = S.PillMaterial == 2;
-            string name = S.PillMaterial == 0 ? "纯色" : liquid ? "液态玻璃" : glass ? "高斯模糊" : acrylic ? "亚克力" : "云母";
-            string subtitle = liquid
-                ? "液态玻璃：实时捕获背后屏幕 → 高斯模糊 → 着色器叠加折射/色散/边缘光（iOS 26 式凸透镜边缘收缩）。"
-                  + "胶囊轮廓有真实折射感；参数见下方,静止桌面自动降到近零开销。"
-                : glass
-                ? "高斯模糊：捕获顶栏背后的真实屏幕（窗口+图标+壁纸）→ 高斯模糊 → 染色，铺进胶囊。"
-                  + "静止桌面自动降到近零开销；云母/亚克力已下架（旧配置自动迁移到高斯模糊）。"
-                : acrylic
-                ? "自绘亚克力：采样壁纸 → 磨砂重模糊 → 保留色彩 → 随明暗主题提亮/压暗 → 噪点，烘焙成一张位图。"
-                  + "比云母更通透、更“彩色”，是磨砂玻璃质感；零屏幕捕获、零每帧开销，每个胶囊按自己在屏幕上的位置取对应一段。"
-                : "自绘 Mica：采样壁纸 → 重模糊 → 亮度压带 → 主题染色 → 细噪点，烘焙成一张位图。"
-                  + "零屏幕捕获、零每帧开销，静止时不重绘；每个胶囊按自己在屏幕上的位置取对应一段。";
-            var card = Card("胶囊材质 · " + name, subtitle, out var body);
-            body.Children.Add(Row("材质", BuildPillMaterialPicker()));
-            if (S.PillMaterial == 0)
-            {
-                body.Children.Add(MakeHint("当前为纯色：胶囊沿用上方「主题」卡片的外观设置。选择「高斯模糊」后，这里会显示模糊与染色的参数。", 12));
-            }
-            else if (glass)
-            {
-                body.Children.Add(Row("不透明度", NumberSlider(5, 100, S.GlassOpacity * 100, "%",
-                    v => { S.GlassOpacity = Math.Max(0.05, Math.Round(v) / 100); App.Save(); Services.GlassService.ApplyLive(); })));
-                body.Children.Add(MakeHint("不透明度 100%：玻璃层完全盖住背后的画面（推荐，模糊/折射/色散最清楚）。"
-                    + "调低会让背后清晰的画面直接透上来，观感变淡、模糊感随之消失。", 12));
-                body.Children.Add(Row("模糊半径", NumberSlider(4, 60, S.GlassBlurRadius, " px",
-                    v => { S.GlassBlurRadius = Math.Round(v); App.Save(); Services.GlassService.ApplyLive(); })));
-                body.Children.Add(Row("染色颜色", NewColorEditor(S.GlassTint,
-                    h => { S.GlassTint = h; App.Save(); Services.GlassService.ApplyLive(); })));
-                body.Children.Add(Row("染色浓度", NumberSlider(0, 100, S.GlassTintOpacity * 100, "%",
-                    v => { S.GlassTintOpacity = Math.Round(v) / 100; App.Save(); Services.GlassService.ApplyLive(); })));
-                body.Children.Add(Row("帧率上限", NumberSlider(0, 300, S.GlassMaxFps, " fps",
-                    v => { S.GlassMaxFps = (int)Math.Round(v); App.Save(); Services.GlassService.ApplyLive(); })));
-                body.Children.Add(MakeHint("帧率上限 = 每秒最多抓几次屏幕，它决定「背后变化 → 玻璃更新」的延迟上限。"
-                    + "填 0 = 不限制：捕获直接按屏幕合成节拍跑（合成一结束就抓，抓完还赶得上这一轮的渲染提交，"
-                    + "端到端只延迟一帧）；填具体值时仍会按该帧率节流。"
-                    + "注意单次抓屏约 4.5ms，绘制节奏还受屏幕刷新率限制（本机 " + Interop.NativeMethods.ScreenRefreshHz() + " Hz），"
-                    + "填得比刷新率更高不会更快，只会多烧 CPU（背后完全静止时两种模式都会自动降频，不额外耗电）。", 12));
-                body.Children.Add(Row("间隙玻璃", NumberSlider(0, 100, S.GlassGapFill * 100, "%",
-                    v => { S.GlassGapFill = Math.Round(v) / 100; App.Save(); Services.GlassService.ApplyLive(); })));
-                body.Children.Add(MakeHint("间隙玻璃 0%：只有胶囊是玻璃，胶囊之间完全透明，点击可穿透到桌面图标。"
-                    + "调高后整条顶栏都模糊其下内容，但这条不再点击穿透（系统按像素透明度判定穿透）。", 12));
-                if (liquid)
-                {
-                    body.Children.Add(Row("折射强度", NumberSlider(0, 100, S.GlassRefraction * 100, "%",
-                        v => { S.GlassRefraction = Math.Round(v) / 100; App.Save(); Services.GlassService.ApplyLive(); })));
-                    body.Children.Add(Row("边缘光", NumberSlider(0, 100, S.GlassRim * 100, "%",
-                        v => { S.GlassRim = Math.Round(v) / 100; App.Save(); Services.GlassService.ApplyLive(); })));
-                    body.Children.Add(Row("色散", NumberSlider(0, 100, S.GlassChroma * 100, "%",
-                        v => { S.GlassChroma = Math.Round(v) / 100; App.Save(); Services.GlassService.ApplyLive(); })));
-                }
-                body.Children.Add(MakeHint("高斯模糊/液态玻璃会实时捕获顶栏背后的屏幕。注意：捕获期间用截图/录屏/OBS 看不到顶栏本身"
-                    + "（系统级排除，防止玻璃把自己拍进去）；顶栏被全屏窗口盖住时自动暂停捕获。", 12));
-            }
-            else
-            {
-                double op = acrylic ? S.AcrylicOpacity : S.MicaOpacity;
-                double blur = acrylic ? S.AcrylicBlurRadius : S.MicaBlurRadius;
-                double contrast = acrylic ? S.AcrylicContrast : S.MicaContrast;
-                double sat = acrylic ? S.AcrylicSaturation : S.MicaSaturation;
-                double tint = acrylic ? S.AcrylicTint : S.MicaTint;
-                double noise = acrylic ? S.AcrylicNoise : S.MicaNoise;
-                body.Children.Add(Row("不透明度", NumberSlider(5, 100, op * 100, "%",
-                    v => { if (acrylic) S.AcrylicOpacity = Math.Max(0.05, Math.Round(v) / 100); else S.MicaOpacity = Math.Max(0.05, Math.Round(v) / 100); ApplyMica(); })));
-                body.Children.Add(Row("模糊半径", NumberSlider(4, 80, blur, " px",
-                    v => { if (acrylic) S.AcrylicBlurRadius = Math.Round(v); else S.MicaBlurRadius = Math.Round(v); ApplyMica(); })));
-                body.Children.Add(Row("细节对比", NumberSlider(0, 100, contrast * 100, "%",
-                    v => { var x = Math.Round(v) / 100; if (acrylic) S.AcrylicContrast = x; else S.MicaContrast = x; ApplyMica(); })));
-                body.Children.Add(Row("彩度", NumberSlider(0, 100, sat * 100, "%",
-                    v => { var x = Math.Round(v) / 100; if (acrylic) S.AcrylicSaturation = x; else S.MicaSaturation = x; ApplyMica(); })));
-                body.Children.Add(Row("主题染色", NumberSlider(0, 100, tint * 100, "%",
-                    v => { var x = Math.Round(v) / 100; if (acrylic) S.AcrylicTint = x; else S.MicaTint = x; ApplyMica(); })));
-                body.Children.Add(Row("细噪点", NumberSlider(0, 20, noise * 100, "%",
-                    v => { var x = Math.Round(v) / 100; if (acrylic) S.AcrylicNoise = x; else S.MicaNoise = x; ApplyMica(); })));
-                body.Children.Add(MakeHint("「模糊半径/细节对比/彩度/主题染色/细噪点」改动会重新烘焙位图（后台线程约 0.3 秒）；"
-                    + "「不透明度」改立即生效。壁纸或系统主题变化时会自动重算。", 12));
-            }
+            bool glass = S.PillMaterial is 3 or 4;
+            var card = Card("胶囊与展开页", null, out var body);
             _materialCard = card;
-            AppearanceHost.Children.Add(card);
-        }
 
-        /// <summary>胶囊材质选择：纯色（默认）/ 高斯模糊（实时背景高斯）/ 液态玻璃（折射+色散+边缘光）。云母/亚克力已下架。</summary>
-        private FrameworkElement BuildPillMaterialPicker()
-        {
-            var panel = new StackPanel { Orientation = Orientation.Horizontal };
-            var options = new (string Label, int Mode)[]
+            body.Children.Add(Row("材质", BuildChoices("pillmaterial", S.PillMaterial, new[]
             {
                 ("纯色", 0), ("高斯模糊", 3), ("液态玻璃", 4)
-            };
+            }, mode =>
+            {
+                S.PillMaterial = mode;
+                Save();
+                GlassService.ApplyLive();
+                Dispatcher.BeginInvoke(new Action(BuildMaterialCard), DispatcherPriority.Background);
+            })));
+
+            bool follows = ThemeService.FollowsBackground(S);
+            var colorHint = MakeHint("", 3);
+            void UpdateColorHint()
+            {
+                bool auto = ThemeService.FollowsBackground(S);
+                colorHint.Text = auto
+                    ? (glass ? "各胶囊的文字和图标随背后画面切换明暗，支持壁纸幻灯片。"
+                        : "随主屏壁纸顶端的明暗切换，支持壁纸幻灯片。")
+                    : (glass ? "文字和图标使用下方「桌面配色」中的固定颜色。"
+                        : "胶囊底色及文字和图标使用下方「桌面配色」中的固定颜色。");
+            }
+            body.Children.Add(Row("胶囊配色", BuildChoices("capsuleColors", follows ? 1 : 0, new[]
+            {
+                ("跟随背景", 1), ("固定配色", 0)
+            }, mode =>
+            {
+                S.FollowCapsuleBackground = S.AutoTheme = mode == 1;
+                SaveDesktopColors();
+                GlassService.ApplyLive();
+                UpdateDesktopColorControls();
+                UpdateColorHint();
+            })));
+            UpdateDesktopColorControls();
+            UpdateColorHint();
+            body.Children.Add(colorHint);
+
+            if (liquid)
+            {
+                body.Children.Add(Row("玻璃外观", BuildChoices("glassStyle", S.GlassStyle, new[]
+                {
+                    ("清透", 0), ("柔雾", 1), ("自定义", 2)
+                }, style =>
+                {
+                    S.GlassStyle = style;
+                    S.GlassFrost = null;
+                    ApplyGlassSetting();
+                    Dispatcher.BeginInvoke(new Action(BuildMaterialCard), DispatcherPriority.Background);
+                })));
+                var frostSlider = NumberSlider(0, 100, GlassService.FrostLevel(S) * 100, "%", value =>
+                {
+                    if (!ReferenceEquals(_materialCard, card) || S.PillMaterial != 4) return;
+                    S.GlassFrost = value / 100;
+                    ApplyGlassSetting();
+                }, value =>
+                {
+                    if (ReferenceEquals(_materialCard, card) && S.PillMaterial == 4)
+                        _glassPreview?.Refresh(S, value / 100);
+                }, name: "雾面强度");
+                body.Children.Add(Row("雾面强度", frostSlider));
+            }
+            _glassPreview ??= new GlassPreview();
+            _glassPreview.Refresh(S);
+            body.Children.Add(_glassPreview);
+            if (glass)
+            {
+                var pacePicker = BuildGlassPacePicker();
+                body.Children.Add(Row("更新节奏", pacePicker));
+                body.Children.Add(MakeHint("自动模式会在画面静止时降低刷新频率。", 3));
+                var advanced = new StackPanel();
+                void AddSlider(string label, int min, int max, double value, string suffix, Action<double> set)
+                {
+                    advanced.Children.Add(Row(label, NumberSlider(min, max, value, suffix, v =>
+                    {
+                        if (!ReferenceEquals(card, _materialCard)) return;
+                        set(v);
+                        ApplyGlassSetting();
+                    })));
+                }
+                AddSlider("玻璃覆盖度", 5, 100, S.GlassOpacity * 100, "%", v => S.GlassOpacity = v / 100);
+                AddSlider("壁纸换图过渡", 0, 1200, S.WallpaperFadeDurationMs, " ms", v => S.WallpaperFadeDurationMs = (int)v);
+                advanced.Children.Add(MakeHint("用于 Windows 壁纸幻灯片。设为 0 毫秒时立即换图，动画跟随 Windows 的动画效果开关。", 3));
+                AddSlider("胶囊间隙覆盖度", 0, 100, S.GlassGapFill * 100, "%", v => S.GlassGapFill = v / 100);
+                AddSlider("自定更新上限", 1, 300, S.GlassMaxFps > 0 ? S.GlassMaxFps : 48, " fps", v =>
+                {
+                    S.GlassMaxFps = (int)v;
+                    SetGlassPaceSelection(pacePicker, S.GlassMaxFps);
+                });
+                if (!liquid || S.GlassStyle == 2)
+                {
+                    AddSlider("模糊半径", 4, 60, S.GlassBlurRadius, " px", v => S.GlassBlurRadius = v);
+                    advanced.Children.Add(Row("染色颜色", NewColorEditor(S.GlassTint, color =>
+                    {
+                        S.GlassTint = color;
+                        ApplyGlassSetting();
+                    })));
+                    AddSlider("染色强度", 0, 100, S.GlassTintOpacity * 100, "%", v => S.GlassTintOpacity = v / 100);
+                    if (liquid)
+                    {
+                        AddSlider("折射", 0, 100, S.GlassRefraction * 100, "%", v => S.GlassRefraction = v / 100);
+                        AddSlider("边缘高光", 0, 100, S.GlassRim * 100, "%", v => S.GlassRim = v / 100);
+                        AddSlider("色散", 0, 100, S.GlassChroma * 100, "%", v => S.GlassChroma = v / 100);
+                    }
+                }
+                var expander = new Expander
+                {
+                    Header = "高级调节", Content = advanced, IsExpanded = _glassAdvanced,
+                    Style = (Style)FindResource("SettingsExpander"),
+                    Margin = new Thickness(0, 12, 0, 0)
+                };
+                expander.SetResourceReference(Control.ForegroundProperty, "SettingsLabelBrush");
+                expander.Expanded += (s, e) => _glassAdvanced = true;
+                expander.Collapsed += (s, e) => _glassAdvanced = false;
+                body.Children.Add(expander);
+            }
+            AppearanceHost.Children.Insert(0, card);
+        }
+
+        private FrameworkElement BuildChoices(string group, int value, (string Label, int Mode)[] options, Action<int> changed)
+        {
+            var panel = new WrapPanel();
             foreach (var (label, mode) in options)
             {
-                var rb = new RadioButton
+                var button = new RadioButton
                 {
-                    Content = label,
-                    GroupName = "pillmaterial",
-                    IsChecked = S.PillMaterial == mode,
-                    Style = (Style)FindResource("NavRadio"),
-                    Margin = new Thickness(0, 0, 14, 0)
+                    Content = label, GroupName = group, IsChecked = value == mode, Style = (Style)FindResource("SettingsChoice")
                 };
-                int captured = mode;
-                rb.Checked += (s, e) =>
-                {
-                    S.PillMaterial = captured;
-                    ApplyMica();
-                    // 重建卡片让滑条显示新材质的参数。放到 Background 优先级执行:
-                    // 此刻 Checked 路由事件还在派发中,立刻拆掉正参与派发的可视化树不稳。
-                    Dispatcher.BeginInvoke(new Action(BuildMicaCard), DispatcherPriority.Background);
-                };
-                panel.Children.Add(rb);
+                button.Checked += (s, e) => changed(mode);
+                panel.Children.Add(button);
             }
             return panel;
         }
 
-        /// <summary>
-        /// 材质参数变更：写盘 + 触发重算。玻璃档走顶栏全量重建(Save→ApplySettings→BuildLayout
-        /// 里挂/摘玻璃层),云母首次开启时位图还不存在,同步算一次避免先闪纯色。
-        /// </summary>
-        private void ApplyMica()
+        private static readonly (int Fps, string Label)[] GlassPaces =
         {
-            if (S.PillMaterial == 3 || S.PillMaterial == 4)
+            (0, "自动"), (24, "省电 · 24 fps"), (60, "流畅 · 60 fps"), (120, "高刷 · 120 fps")
+        };
+
+        private bool _settingGlassPace;
+
+        private ComboBox BuildGlassPacePicker()
+        {
+            var picker = new ComboBox
             {
-                Save();
-                Services.GlassService.ApplyLive();
-                return;
+                Style = (Style)FindResource("DarkCombo"),
+                HorizontalAlignment = HorizontalAlignment.Left,
+                MinWidth = 150
+            };
+            SetGlassPaceSelection(picker, S.GlassMaxFps);
+            picker.SelectionChanged += (s, e) =>
+            {
+                if (_settingGlassPace || picker.SelectedItem is not ComboBoxItem selected || selected.Tag is not int fps) return;
+                S.GlassMaxFps = fps;
+                ApplyGlassSetting();
+                Dispatcher.BeginInvoke(new Action(BuildMaterialCard), DispatcherPriority.Background);
+            };
+            return picker;
+        }
+
+        private void SetGlassPaceSelection(ComboBox picker, int fps)
+        {
+            _settingGlassPace = true;
+            try
+            {
+                picker.Items.Clear();
+                foreach (var option in GlassPaces)
+                    picker.Items.Add(new ComboBoxItem { Content = option.Label, Tag = option.Fps });
+                var match = picker.Items.OfType<ComboBoxItem>().FirstOrDefault(item => Equals(item.Tag, fps));
+                if (match == null)
+                {
+                    match = new ComboBoxItem { Content = $"自定 · {fps} fps", Tag = fps };
+                    picker.Items.Add(match);
+                }
+                picker.SelectedItem = match;
             }
-            Save();
-            if (S.PillMaterial != 0 && Services.MicaService.Backdrop == null)
-                Services.MicaService.BakeOnce();
-            else
-                Services.MicaService.Invalidate();
-            Services.ThemeService.Refresh();
+            finally { _settingGlassPace = false; }
+        }
+
+        private void ApplyGlassSetting()
+        {
+            if (!_updatingTheme)
+            {
+                App.Save();
+                GlassService.ApplyLive();
+                _glassPreview?.Refresh(S);
+            }
         }
 
         // ---------- 时间 ----------
@@ -554,14 +706,14 @@ namespace DesktopBar
                 Content = "靠右",
                 GroupName = "timepos",
                 IsChecked = S.TimeOnRight,
-                Style = (Style)FindResource("NavRadio")
+                Style = (Style)FindResource("SettingsChoice")
             };
             var r2 = new RadioButton
             {
                 Content = "居中",
                 GroupName = "timepos",
                 IsChecked = !S.TimeOnRight,
-                Style = (Style)FindResource("NavRadio")
+                Style = (Style)FindResource("SettingsChoice")
             };
             r1.Checked += (s, e) => { S.TimeOnRight = true; Save(); };
             r2.Checked += (s, e) => { S.TimeOnRight = false; Save(); };
@@ -646,7 +798,7 @@ namespace DesktopBar
                 Style = (Style)FindResource("DarkBox"),
                 Text = S.StorageRoot,
                 VerticalAlignment = VerticalAlignment.Center,
-                FontSize = 12,
+                FontSize = 13,
                 IsReadOnly = true
             };
             var browse = new Button { Content = "浏览…", Style = (Style)FindResource("Btn"), Margin = new Thickness(8, 0, 0, 0) };
@@ -693,7 +845,7 @@ namespace DesktopBar
                 Style = (Style)FindResource("DarkList"),
                 Height = 210,
                 Margin = new Thickness(0, 8, 0, 0),
-                FontSize = 12.5,
+                FontSize = 14,
                 AllowDrop = true,
                 ItemTemplate = MakeFolderItemTemplate()
             };
@@ -845,7 +997,7 @@ namespace DesktopBar
             // "打开"按钮(右侧)
             var open = new FrameworkElementFactory(typeof(Button));
             open.SetValue(ContentControl.ContentProperty, "打开");
-            open.SetValue(Control.FontSizeProperty, 11.0);
+            open.SetValue(Control.FontSizeProperty, 13.0);
             open.SetValue(Control.PaddingProperty, new Thickness(8, 3, 8, 3));
             open.SetValue(FrameworkElement.VerticalAlignmentProperty, VerticalAlignment.Center);
             open.SetValue(ToolTipProperty, "在资源管理器中打开该文件夹");
@@ -864,6 +1016,7 @@ namespace DesktopBar
             var grip = new FrameworkElementFactory(typeof(Button));
             grip.SetValue(ContentControl.ContentProperty, "≡");
             grip.SetValue(Control.FontSizeProperty, 14.0);
+            grip.SetValue(FrameworkElement.WidthProperty, 36.0);
             grip.SetValue(Control.PaddingProperty, new Thickness(7, 2, 7, 2));
             grip.SetValue(FrameworkElement.VerticalAlignmentProperty, VerticalAlignment.Center);
             grip.SetValue(FrameworkElement.MarginProperty, new Thickness(6, 0, 0, 0));
@@ -1096,7 +1249,7 @@ namespace DesktopBar
                 _nativeTempStatus = new TextBlock
                 {
                     Text = "未启用",
-                    FontSize = 12.5,
+                    FontSize = 13,
                     VerticalAlignment = VerticalAlignment.Center
                 };
                 _nativeTempStatus.SetResourceReference(TextElement.ForegroundProperty, "SettingsLabelBrush");
@@ -1467,8 +1620,10 @@ namespace DesktopBar
                 "一款常驻 Windows 桌面层的顶栏小工具:小文件夹、音乐播放器、音量、回收站、音频频谱,外观全部可自定义。", out var ab);
             var verTb = new TextBlock
             {
-                Text = "v" + UpdateService.CurrentVersion.ToString(3),
-                FontSize = 12.5,
+                Text = "v" + (typeof(SettingsWindow).Assembly
+                    .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion.Split('+')[0]
+                    ?? UpdateService.CurrentVersion.ToString(3)),
+                FontSize = 14,
                 VerticalAlignment = VerticalAlignment.Center
             };
             verTb.SetResourceReference(TextElement.ForegroundProperty, "SettingsSubTextBrush");
@@ -1495,7 +1650,7 @@ namespace DesktopBar
             _updateStatus = new TextBlock
             {
                 Text = "",
-                FontSize = 11.5,
+                FontSize = 12.5,
                 Margin = new Thickness(0, 10, 0, 0),
                 TextWrapping = TextWrapping.Wrap
             };

@@ -39,6 +39,8 @@ namespace DesktopBar.UI
             applyToAll = false;
             var win = new Window
             {
+                FontFamily = Ui.TextFont,
+                FontWeight = FontWeights.SemiBold,
                 WindowStyle = WindowStyle.None,
                 AllowsTransparency = true,
                 Background = Brushes.Transparent,
@@ -54,8 +56,8 @@ namespace DesktopBar.UI
             var msg = new TextBlock
             {
                 Text = message,
-                FontSize = 13,
-                LineHeight = 20,
+                FontSize = 14,
+                LineHeight = 21,
                 TextWrapping = TextWrapping.Wrap,
                 Opacity = 0.78,
                 Margin = new Thickness(0, 10, 0, 0)
@@ -94,7 +96,7 @@ namespace DesktopBar.UI
             var checkLabel = new TextBlock
             {
                 Text = "为全部文件执行此操作",
-                FontSize = 12,
+                FontSize = 13,
                 Opacity = 0.78,
                 VerticalAlignment = VerticalAlignment.Center,
                 Margin = new Thickness(9, 0, 0, 0)
@@ -151,8 +153,8 @@ namespace DesktopBar.UI
             var titleText = new TextBlock
             {
                 Text = title,
-                FontSize = 15,
-                FontWeight = FontWeights.SemiBold
+                FontSize = 16,
+                FontWeight = FontWeights.Bold
             };
             titleText.SetResourceReference(TextBlock.ForegroundProperty, "ThemePanelText");
             content.Children.Add(titleText);
@@ -202,6 +204,8 @@ namespace DesktopBar.UI
             bool result = false;
             var win = new Window
             {
+                FontFamily = Ui.TextFont,
+                FontWeight = FontWeights.SemiBold,
                 WindowStyle = WindowStyle.None,
                 AllowsTransparency = true,
                 Background = Brushes.Transparent,
@@ -217,15 +221,15 @@ namespace DesktopBar.UI
             var titleTb = new TextBlock
             {
                 Text = title,
-                FontSize = 15,
-                FontWeight = FontWeights.SemiBold
+                FontSize = 16,
+                FontWeight = FontWeights.Bold
             };
             titleTb.SetResourceReference(TextBlock.ForegroundProperty, "ThemePanelText");
             var msg = new TextBlock
             {
                 Text = message,
-                FontSize = 13,
-                LineHeight = 20,
+                FontSize = 14,
+                LineHeight = 21,
                 TextWrapping = TextWrapping.Wrap,
                 Opacity = 0.78,
                 Margin = new Thickness(0, 10, 0, 0)

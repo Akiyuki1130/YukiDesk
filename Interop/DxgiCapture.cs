@@ -3,23 +3,7 @@ using System.Runtime.InteropServices;
 
 namespace DesktopBar.Interop
 {
-    /// <summary>
-    /// DXGI Desktop Duplication 抓屏(手写 COM 互操作,零第三方依赖)。
-    ///
-    /// 相比 GDI BitBlt 的三个决定性优势:
-    ///  1) 抓一帧约 0.35ms —— BitBlt 是 3.5~6ms,其中约 2.4ms 是与尺寸无关的驱动往返,降分辨率也省不掉;
-    ///  2) AcquireNextFrame 天然阻塞到「下一次桌面合成」,所以采样节拍自动等于显示器刷新率(本机 300Hz),
-    ///     并且抓到的永远是刚合成完的那一帧 → 端到端只延迟一帧,不需要 Sleep 去凑节拍;
-    ///  3) 桌面没有任何变化时 AcquireNextFrame 直接超时,静止场景零 CPU(以前靠帧数/时长启发式降频)。
-    ///
-    /// 坑(踩过,务必保留这段说明):
-    ///  - 所有结构体出参**不能**用 \`out SomeStruct\` 的委托签名,必须传原生缓冲(AllocHGlobal + IntPtr),
-    ///    否则 AcquireNextFrame 会把进程打崩、Map 会报 E_INVALIDARG;
-    ///  - 暂存纹理的 CPUAccessFlags 必须是 0x20000(D3D11_CPU_ACCESS_READ);0x10000 是 WRITE,
-    ///    写成 0x10000 会得到一张「只能写」的纹理,Map(READ) 永远 E_INVALIDARG;
-    ///  - ID3D11Device 的 vtable 槽位在不同设备上并不总是规范顺序(本机 CreateTexture2D 在 slot 5,
-    ///    规范顺序本该是 9),所以槽位靠 TryCreateTexture 实测探测,不硬编码。
-    /// </summary>
+    /// <summary>DXGI Desktop Duplication 抓屏，COM 签名与结构布局以 Windows SDK 为准。</summary>
     internal sealed class DxgiCapture : IDisposable
     {
         private const int DXGI_FORMAT_B8G8R8A8_UNORM = 87;
@@ -27,12 +11,60 @@ namespace DesktopBar.Interop
         private const uint D3D11_CPU_ACCESS_READ = 0x20000;
         private const uint D3D11_MAP_READ = 1;
         private const int DXGI_ERROR_WAIT_TIMEOUT = unchecked((int)0x887A0027);
-        private const int DXGI_ERROR_ACCESS_LOST = unchecked((int)0x887A0026);
         private const int DXGI_ERROR_MORE_DATA = unchecked((int)0x887A0003);
 
         private static readonly Guid IID_IDXGIDevice = new Guid("54ec77fa-1377-44e6-8c32-88fd5f44c84c");
         private static readonly Guid IID_IDXGIOutput1 = new Guid("00cddea8-939b-4b83-a340-a685226666cc");
         private static readonly Guid IID_ID3D11Texture2D = new Guid("6f15aaf2-d208-4e89-9ab4-489535d34f9c");
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct Rect
+        {
+            public int Left, Top, Right, Bottom;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct OutputDesc
+        {
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+            public string DeviceName;
+            public Rect DesktopCoordinates;
+            public int AttachedToDesktop, Rotation;
+            public IntPtr Monitor;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct DuplicationDesc
+        {
+            public int Width, Height, RefreshNumerator, RefreshDenominator, Format, ScanlineOrdering, Scaling;
+            public int Rotation, DesktopImageInSystemMemory;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FrameInfo
+        {
+            public long LastPresentTime, LastMouseUpdateTime;
+            public int AccumulatedFrames, RectsCoalesced, ProtectedContentMaskedOut;
+            public int PointerX, PointerY, PointerVisible;
+            public uint TotalMetadataBufferSize, PointerShapeBufferSize;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct TextureDesc
+        {
+            public int Width, Height, MipLevels, ArraySize, Format, SampleCount, SampleQuality;
+            public int Usage, BindFlags;
+            public uint CpuAccessFlags, MiscFlags;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MappedResource
+        {
+            public IntPtr Data;
+            public int RowPitch, DepthPitch;
+        }
+
+        private static readonly int RectSize = Marshal.SizeOf<Rect>();
 
         [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int QueryInterfaceFn(IntPtr self, ref Guid riid, out IntPtr ppv);
         [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate uint ReleaseFn(IntPtr self);
@@ -40,8 +72,9 @@ namespace DesktopBar.Interop
         [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int EnumOutputsFn(IntPtr self, uint index, out IntPtr output);
         [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int DuplicateOutputFn(IntPtr self, IntPtr device, out IntPtr duplication);
         [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int GetOutputDescFn(IntPtr self, IntPtr desc);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate void GetDuplicationDescFn(IntPtr self, IntPtr desc);
         [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int AcquireNextFrameFn(IntPtr self, uint timeoutMs, IntPtr frameInfo, out IntPtr resource);
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int GetFrameDirtyRectsFn(IntPtr self, uint bufSize, IntPtr rects, IntPtr required);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int GetFrameRectsFn(IntPtr self, uint bufSize, IntPtr rects, out uint required);
         [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int ReleaseFrameFn(IntPtr self);
         [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int CreateTexture2DFn(IntPtr self, IntPtr desc, IntPtr initialData, out IntPtr texture);
         [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int MapFn(IntPtr self, IntPtr resource, uint sub, uint mapType, uint flags, IntPtr mapped);
@@ -56,19 +89,14 @@ namespace DesktopBar.Interop
             int[] featureLevels, uint featureLevelCount, uint sdkVersion, out IntPtr device, out int featureLevel, out IntPtr context);
 
         private IntPtr _device, _context, _duplication, _resource;
-        private int _texSlot = -1;
-        private byte[] _descBuf;
         private int _stageW, _stageH;
         private IntPtr _stage, _stageDesc;
-        private IntPtr _frameInfo, _mapBuf, _boxBuf, _dirtyBuf, _dirtyReq;
+        private IntPtr _frameInfo, _mapBuf, _boxBuf, _dirtyBuf;
         private uint _dirtyBufSize;
         private bool _hasFrame;
-        // 热路径(静止时每 33ms 一次、跟随时每帧一次)上反复用到的几个方法指针:
-        // Fn<T>() 每次 Marshal.GetDelegateForFunctionPointer 都要分配一个托管委托,
-        // 加上脏矩形查询每次都 AllocHGlobal(4) 再 Free,静止时每秒几十次、跟随时每秒几百次,
-        // 全部提到字段里缓存,避免持续 GC 压力。
+        // 热路径复用委托和元数据缓冲，避免每帧封送函数指针或分配缓冲。
         private AcquireNextFrameFn _acquire;
-        private GetFrameDirtyRectsFn _dirtyRects;
+        private GetFrameRectsFn _dirtyRects, _moveRects;
         private ReleaseFrameFn _idupReleaseFrame;
         private CreateTexture2DFn _createTexture;
         private CopyFn _copyRegion;
@@ -88,9 +116,11 @@ namespace DesktopBar.Interop
         public static DxgiCapture TryCreate()
         {
             DxgiCapture cap = new DxgiCapture();
-            string why = cap.Init();
+            string why;
+            try { why = cap.Init(); }
+            catch (Exception ex) { why = ex.Message; }
             if (why == null) return cap;
-            try { App.Log("玻璃:GPU 捕获初始化失败(" + why + "),回退 GDI BitBlt"); } catch { }
+            App.Log("玻璃:GPU 捕获初始化失败(" + why + "),回退 GDI BitBlt");
             cap.Dispose();
             return null;
         }
@@ -109,122 +139,84 @@ namespace DesktopBar.Interop
             Release(dxgiDevice);
             if (hr < 0 || adapter == IntPtr.Zero) return "GetAdapter hr=0x" + ((uint)hr).ToString("X8");
 
-            // 选包含桌面左上角(顶栏所在位置)的那个输出;拿不到就退回 0 号输出。
+            // 顶栏固定在主屏。适配器上找不到原点所属输出时交给 GDI，避免抓到副屏。
             IntPtr output = IntPtr.Zero;
-            IntPtr fallback = IntPtr.Zero;
-            var enumOutputs = Fn<EnumOutputsFn>(adapter, 7);
-            for (uint i = 0; i < 8; i++)
-            {
-                IntPtr o;
-                if (enumOutputs(adapter, i, out o) < 0 || o == IntPtr.Zero) break;
-                if (fallback == IntPtr.Zero) fallback = o;
-                else if (ContainsTopLeft(o)) { Release(fallback); fallback = IntPtr.Zero; output = o; break; }
-                if (output == IntPtr.Zero) { output = o; break; }
-            }
-            Release(adapter);
-            if (output == IntPtr.Zero) output = fallback;
-            if (output == IntPtr.Zero) return "找不到显示器输出";
+            try { output = FindPrimaryOutput(adapter); }
+            finally { Release(adapter); }
+            if (output == IntPtr.Zero) return "适配器上找不到主显示器输出";
 
             IntPtr output1 = QueryInterface(output, IID_IDXGIOutput1);
-            if (output1 == IntPtr.Zero) { Release(output); return "QI IDXGIOutput1 失败(系统太旧)"; }
             Release(output);
-            hr = Fn<DuplicateOutputFn>(output1, 22)(output1, _device, out _duplication);
-            Release(output1);
+            if (output1 == IntPtr.Zero) return "QI IDXGIOutput1 失败";
+            try { hr = Fn<DuplicateOutputFn>(output1, 22)(output1, _device, out _duplication); }
+            finally { Release(output1); }
             if (hr < 0 || _duplication == IntPtr.Zero)
-                return "DuplicateOutput hr=0x" + ((uint)hr).ToString("X8") + "(别的进程已占用/受保护内容)";
+                return "DuplicateOutput hr=0x" + ((uint)hr).ToString("X8");
 
-            IntPtr desc = Alloc(32, out _descBuf);
-            hr = Fn<GetOutputDescFn>(_duplication, 7)(_duplication, desc);
-            if (hr < 0) return "idup GetDesc hr=0x" + ((uint)hr).ToString("X8");
-            // DXGI_OUTDUPL_DESC = { DXGI_MODE_DESC ModeDesc; DXGI_MODE_ROTATION Rotation; BOOL DesktopImageInSystemMemory; }
-            // DXGI_MODE_DESC = Width(0) Height(4) RefreshRate.Num(8) RefreshRate.Denom(12) Format(16) ScanlineOrdering(20) Scaling(24)
-            Width = Marshal.ReadInt32(desc, 0);
-            Height = Marshal.ReadInt32(desc, 4);
-            int format = Marshal.ReadInt32(desc, 16);
-            int rotation = Marshal.ReadInt32(desc, 28);
-            if (rotation != 1) return "显示器旋转 " + rotation + "(只支持不旋转)";
-            if (format != DXGI_FORMAT_B8G8R8A8_UNORM) return "桌面格式 " + format + "(只支持 87 B8G8R8A8)";
+            var descBuffer = Marshal.AllocHGlobal(Marshal.SizeOf<DuplicationDesc>());
+            try
+            {
+                Fn<GetDuplicationDescFn>(_duplication, 7)(_duplication, descBuffer);
+                var desc = Marshal.PtrToStructure<DuplicationDesc>(descBuffer);
+                Width = desc.Width;
+                Height = desc.Height;
+                if (Width <= 0 || Height <= 0) return "输出尺寸无效";
+                if (desc.Rotation != 1) return "显示器旋转 " + desc.Rotation;
+                if (desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM) return "桌面格式 " + desc.Format;
+            }
+            finally { Marshal.FreeHGlobal(descBuffer); }
 
-            _descBuf = new byte[68];
-            _stageDesc = Marshal.AllocHGlobal(68);
-            _frameInfo = Marshal.AllocHGlobal(24);
-            _mapBuf = Marshal.AllocHGlobal(24);
-            _boxBuf = Marshal.AllocHGlobal(24);
-            _dirtyReq = Marshal.AllocHGlobal(4);
-            // 脏矩形缓冲预分配 512 个矩形(8KB):静止时一次脏矩形查询就够,省掉"先问大小再取"的往返。
-            _dirtyBufSize = 512 * 16;
+            _stageDesc = Marshal.AllocHGlobal(Marshal.SizeOf<TextureDesc>());
+            _frameInfo = Marshal.AllocHGlobal(Marshal.SizeOf<FrameInfo>());
+            _mapBuf = Marshal.AllocHGlobal(Marshal.SizeOf<MappedResource>());
+            _boxBuf = Marshal.AllocHGlobal(6 * sizeof(uint));   // D3D11_BOX
+            _dirtyBufSize = 8192;
             _dirtyBuf = Marshal.AllocHGlobal((int)_dirtyBufSize);
-            _texSlot = DetectTextureSlot();
-            if (_texSlot < 0) return "探测 CreateTexture2D 槽位失败";
             _acquire = Fn<AcquireNextFrameFn>(_duplication, 8);
-            _dirtyRects = Fn<GetFrameDirtyRectsFn>(_duplication, 9);
+            _dirtyRects = Fn<GetFrameRectsFn>(_duplication, 9);
+            _moveRects = Fn<GetFrameRectsFn>(_duplication, 10);
             _idupReleaseFrame = Fn<ReleaseFrameFn>(_duplication, 14);
-            _createTexture = Fn<CreateTexture2DFn>(_device, _texSlot);
+            _createTexture = Fn<CreateTexture2DFn>(_device, 5);
             _copyRegion = Fn<CopyFn>(_context, 46);
             _map = Fn<MapFn>(_context, 14);
             _unmap = Fn<UnmapFn>(_context, 15);
             return null;
         }
 
-        private static bool ContainsTopLeft(IntPtr output)
+        private static IntPtr FindPrimaryOutput(IntPtr adapter)
         {
-            IntPtr buf = Marshal.AllocHGlobal(96);
+            var buffer = Marshal.AllocHGlobal(Marshal.SizeOf<OutputDesc>());
             try
             {
-                if (Fn<GetOutputDescFn>(output, 6)(output, buf) < 0) return false;
-                // DXGI_OUTPUT_DESC.DesktopCoordinates = RECT,紧跟 MONITORINFOEXW 之后?
-                // 实际布局:Monitor(MONITORINFOEXW 104 字节)在前,DesktopCoordinates 在偏移 104。
-                int left = Marshal.ReadInt32(buf, 104);
-                int top = Marshal.ReadInt32(buf, 108);
-                int right = Marshal.ReadInt32(buf, 112);
-                int bottom = Marshal.ReadInt32(buf, 116);
-                return left <= 0 && top <= 0 && right > 0 && bottom > 0;
-            }
-            catch { return false; }
-            finally { Marshal.FreeHGlobal(buf); }
-        }
-
-        /// <summary>
-        /// 探测「在这台机器上」CreateTexture2D 的 vtable 槽位:建一张暂存纹理,QI 确认是 2D 纹理,
-        /// 再真的 Map 一次确认可读。规范顺序是 9,但本机实测是 5。
-        /// </summary>
-        private int DetectTextureSlot()
-        {
-            int[] candidates = new int[] { 5, 9 };
-            for (int i = 0; i < candidates.Length; i++)
-            {
-                int slot = candidates[i];
-                FillTextureDesc(2560, 108);
-                IntPtr tex;
-                int hr;
-                try { hr = Fn<CreateTexture2DFn>(_device, slot)(_device, _stageDesc, IntPtr.Zero, out tex); }
-                catch { continue; }
-                if (hr < 0 || tex == IntPtr.Zero) continue;
-                bool ok = false;
-                if (QueryInterface(tex, IID_ID3D11Texture2D) != IntPtr.Zero)
+                var enumerate = Fn<EnumOutputsFn>(adapter, 7);
+                for (uint i = 0; enumerate(adapter, i, out IntPtr output) >= 0 && output != IntPtr.Zero; i++)
                 {
-                    IntPtr map = Marshal.AllocHGlobal(24);
-                    try { ok = Fn<MapFn>(_context, 14)(_context, tex, 0, D3D11_MAP_READ, 0, map) == 0; if (ok) Fn<UnmapFn>(_context, 15)(_context, tex, 0); }
-                    catch { ok = false; }
-                    finally { Marshal.FreeHGlobal(map); }
+                    bool found = false;
+                    try
+                    {
+                        if (Fn<GetOutputDescFn>(output, 7)(output, buffer) < 0) continue;
+                        var desc = Marshal.PtrToStructure<OutputDesc>(buffer);
+                        var rect = desc.DesktopCoordinates;
+                        found = desc.AttachedToDesktop != 0 && rect.Left <= 0 && rect.Top <= 0
+                            && rect.Right > 0 && rect.Bottom > 0;
+                        if (found) return output;
+                    }
+                    finally { if (!found) Release(output); }
                 }
-                Release(tex);
-                if (ok) return slot;
+                return IntPtr.Zero;
             }
-            return -1;
+            finally { Marshal.FreeHGlobal(buffer); }
         }
 
         private void FillTextureDesc(int width, int height)
         {
-            for (int i = 0; i < 44; i++) Marshal.WriteByte(_stageDesc, i, 0);
-            Marshal.WriteInt32(_stageDesc, 0, width);
-            Marshal.WriteInt32(_stageDesc, 4, height);
-            Marshal.WriteInt32(_stageDesc, 8, 1);                     // MipLevels
-            Marshal.WriteInt32(_stageDesc, 12, 1);                    // ArraySize
-            Marshal.WriteInt32(_stageDesc, 16, DXGI_FORMAT_B8G8R8A8_UNORM);
-            Marshal.WriteInt32(_stageDesc, 20, 1);                    // SampleDesc.Count
-            Marshal.WriteInt32(_stageDesc, 28, D3D11_USAGE_STAGING);
-            Marshal.WriteInt32(_stageDesc, 36, (int)D3D11_CPU_ACCESS_READ);
+            var desc = new TextureDesc
+            {
+                Width = width, Height = height, MipLevels = 1, ArraySize = 1,
+                Format = DXGI_FORMAT_B8G8R8A8_UNORM, SampleCount = 1,
+                Usage = D3D11_USAGE_STAGING, CpuAccessFlags = D3D11_CPU_ACCESS_READ
+            };
+            Marshal.StructureToPtr(desc, _stageDesc, false);
         }
 
         /// <summary>等一帧。返回 0=拿到帧(调用方随后 CopyBand 并释放) 1=超时(桌面没变化) 2=会话失效需重建。</summary>
@@ -236,7 +228,12 @@ namespace DesktopBar.Interop
             if (_acquire == null) return 2;
             try { hr = _acquire(_duplication, (uint)Math.Max(0, timeoutMs), _frameInfo, out _resource); }
             catch { return 2; }
-            if (hr == 0 && _resource != IntPtr.Zero) { _hasFrame = true; return 0; }
+            if (hr == 0)
+            {
+                _hasFrame = true;
+                if (_resource != IntPtr.Zero) return 0;
+                ReleaseFrame();
+            }
             if (hr == DXGI_ERROR_WAIT_TIMEOUT) return 1;
             return 2;
         }
@@ -254,15 +251,13 @@ namespace DesktopBar.Interop
         public bool CopyBand(int x, int y, int width, int height, byte[] dst)
         {
             if (!_hasFrame || _resource == IntPtr.Zero || dst == null) return false;
-            if (width <= 0 || height <= 0 || width > Width || height > Height) return false;
-            if (x < 0) x = 0;
-            if (y < 0) y = 0;
-            if (x + width > Width) width = Width - x;
-            if (y + height > Height) height = Height - y;
+            if (x < 0 || y < 0 || width <= 0 || height <= 0 || x > Width - width || y > Height - height)
+                return false;
+            int rowBytes = width * 4;
+            if (dst.Length < (long)rowBytes * height) return false;
 
             IntPtr src = ResourceToTexture(_resource);
             if (src == IntPtr.Zero) { Diag("ResourceToTexture 失败"); return false; }
-            bool ok = false;
             try
             {
                 if (_stage == IntPtr.Zero || _stageW != width || _stageH != height)
@@ -289,72 +284,72 @@ namespace DesktopBar.Interop
                 Marshal.WriteInt32(_boxBuf, 20, 1);             // back
                 _copyRegion(_context, _stage, 0, 0, 0, 0, src, 0, _boxBuf);
 
-                for (int i = 0; i < 24; i++) Marshal.WriteByte(_mapBuf, i, 0);
                 int hr = _map(_context, _stage, 0, D3D11_MAP_READ, 0, _mapBuf);
                 if (hr < 0) { Diag("Map 失败 hr=0x" + hr.ToString("X8")); return false; }
-                IntPtr data = Marshal.ReadIntPtr(_mapBuf);
-                int pitch = Marshal.ReadInt32(_mapBuf, 8);
-                int rowBytes = width * 4;
-                if (dst.Length < rowBytes * height) { Diag("目标缓冲太小 dst=" + dst.Length + " 需要=" + (rowBytes * height)); return false; }
-                if (pitch == rowBytes)
+                try
                 {
-                    Marshal.Copy(data, dst, 0, rowBytes * height);
-                }
-                else
-                {
+                    var mapped = Marshal.PtrToStructure<MappedResource>(_mapBuf);
+                    if (mapped.Data == IntPtr.Zero || mapped.RowPitch < rowBytes) return false;
+                    if (mapped.RowPitch == rowBytes)
+                    {
+                        Marshal.Copy(mapped.Data, dst, 0, rowBytes * height);
+                        return true;
+                    }
                     for (int row = 0; row < height; row++)
-                        Marshal.Copy(new IntPtr(data.ToInt64() + (long)row * pitch), dst, row * rowBytes, rowBytes);
+                        Marshal.Copy(IntPtr.Add(mapped.Data, row * mapped.RowPitch), dst, row * rowBytes, rowBytes);
+                    return true;
                 }
-                _unmap(_context, _stage, 0);
-                ok = true;
+                finally { _unmap(_context, _stage, 0); }
             }
-            finally
-            {
-                try { if (_relTexture != null) _relTexture(src); } catch { }
-            }
-            return ok;
+            finally { _relTexture(src); }
         }
 
-        /// <summary>矩形区域是否在本帧的脏矩形里(桌面没动就返回 false,可整帧跳过)。</summary>
+        /// <summary>脏矩形或移动区域的目标与条带相交时，从当前桌面纹理读回整条带。</summary>
         public bool BandDirty(int x, int y, int width, int height)
         {
-            if (!_hasFrame || _duplication == IntPtr.Zero || _dirtyRects == null) return true;
-            try
+            if (!_hasFrame) return true;
+            // 只有鼠标指针变动时，桌面纹理本身没有变化。
+            if (Marshal.ReadInt64(_frameInfo) == 0) return false;
+            return RectsIntersect(_dirtyRects, 0, x, y, width, height)
+                || RectsIntersect(_moveRects, 2 * sizeof(int), x, y, width, height);
+        }
+
+        private bool RectsIntersect(GetFrameRectsFn getRects, int rectOffset, int x, int y, int width, int height)
+        {
+            int hr = getRects(_duplication, _dirtyBufSize, _dirtyBuf, out uint length);
+            if (hr == DXGI_ERROR_MORE_DATA && length > _dirtyBufSize && length <= int.MaxValue)
             {
-                Marshal.WriteInt32(_dirtyReq, 0);
-                int hr = _dirtyRects(_duplication, _dirtyBufSize, _dirtyBuf, _dirtyReq);
-                if (hr == DXGI_ERROR_MORE_DATA)
-                {
-                    // 脏矩形比预分配的多(整屏在动),扩容后重试一次
-                    int need = Marshal.ReadInt32(_dirtyReq);
-                    if (need <= 0) return true;
-                    if (_dirtyBuf != IntPtr.Zero) Marshal.FreeHGlobal(_dirtyBuf);
-                    _dirtyBufSize = (uint)need;
-                    _dirtyBuf = Marshal.AllocHGlobal(need);
-                    Marshal.WriteInt32(_dirtyReq, 0);
-                    hr = _dirtyRects(_duplication, _dirtyBufSize, _dirtyBuf, _dirtyReq);
-                }
-                if (hr < 0) return true;
-                int count = Marshal.ReadInt32(_dirtyReq) / 16;
-                for (int i = 0; i < count; i++)
-                {
-                    int left = Marshal.ReadInt32(_dirtyBuf, i * 16);
-                    int top = Marshal.ReadInt32(_dirtyBuf, i * 16 + 4);
-                    int right = Marshal.ReadInt32(_dirtyBuf, i * 16 + 8);
-                    int bottom = Marshal.ReadInt32(_dirtyBuf, i * 16 + 12);
-                    if (left < x + width && right > x && top < y + height && bottom > y) return true;
-                }
-                return false;
+                _dirtyBuf = Marshal.ReAllocHGlobal(_dirtyBuf, (IntPtr)length);
+                _dirtyBufSize = length;
+                hr = getRects(_duplication, _dirtyBufSize, _dirtyBuf, out length);
             }
-            catch { return true; }
+            int stride = RectSize + rectOffset;
+            if (hr < 0 || length > _dirtyBufSize || length % stride != 0) return true;
+            for (int i = rectOffset; i < length; i += stride)
+            {
+                var rect = Marshal.PtrToStructure<Rect>(IntPtr.Add(_dirtyBuf, i));
+                if (rect.Left < x + width && rect.Right > x && rect.Top < y + height && rect.Bottom > y)
+                    return true;
+            }
+            return false;
         }
 
         public void ReleaseFrame()
         {
             if (!_hasFrame) return;
             _hasFrame = false;
-            if (_resource != IntPtr.Zero) { try { _relResource(_resource); } catch { } _resource = IntPtr.Zero; }
-            try { if (_idupReleaseFrame != null) _idupReleaseFrame(_duplication); } catch { }
+            try
+            {
+                if (_resource == IntPtr.Zero) return;
+                IntPtr vtable = Marshal.ReadIntPtr(_resource);
+                if (_relResource != null && vtable == _resVtbl) _relResource(_resource);
+                else Release(_resource);
+            }
+            finally
+            {
+                _resource = IntPtr.Zero;
+                _idupReleaseFrame(_duplication);
+            }
         }
 
         public void Dispose()
@@ -369,7 +364,6 @@ namespace DesktopBar.Interop
             if (_mapBuf != IntPtr.Zero) { Marshal.FreeHGlobal(_mapBuf); _mapBuf = IntPtr.Zero; }
             if (_boxBuf != IntPtr.Zero) { Marshal.FreeHGlobal(_boxBuf); _boxBuf = IntPtr.Zero; }
             if (_dirtyBuf != IntPtr.Zero) { Marshal.FreeHGlobal(_dirtyBuf); _dirtyBuf = IntPtr.Zero; }
-            if (_dirtyReq != IntPtr.Zero) { Marshal.FreeHGlobal(_dirtyReq); _dirtyReq = IntPtr.Zero; }
         }
 
         /// <summary>
@@ -398,12 +392,6 @@ namespace DesktopBar.Interop
                 _relTexture = Fn<ReleaseFn>(ppv, 2);
             }
             return ppv;
-        }
-
-        private static IntPtr Alloc(int bytes, out byte[] keep)
-        {
-            keep = new byte[bytes];
-            return Marshal.AllocHGlobal(bytes);
         }
 
         private IntPtr QueryInterface(IntPtr obj, Guid iid)

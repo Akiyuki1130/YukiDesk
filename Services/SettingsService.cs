@@ -136,11 +136,23 @@ namespace DesktopBar.Services
             s.GlassBlurRadius = Clamp(s.GlassBlurRadius, 4, 60, 24);
             s.GlassTint = NormalizeColor(s.GlassTint, "#14141C");
             s.GlassTintOpacity = Clamp(s.GlassTintOpacity, 0, 1, 0.18);
-            s.GlassMaxFps = Math.Clamp(s.GlassMaxFps, 0, 300);   // 0 = 不限制(捕获按屏幕合成节拍跑)
+            s.GlassMaxFps = Math.Clamp(s.GlassMaxFps, 0, 300);
+            s.WallpaperFadeDurationMs = Math.Clamp(s.WallpaperFadeDurationMs, 0, 1200);
             s.GlassGapFill = Clamp(s.GlassGapFill, 0, 1, 0);
             s.GlassRefraction = Clamp(s.GlassRefraction, 0, 1, 0.45);
             s.GlassRim = Clamp(s.GlassRim, 0, 1, 0.5);
             s.GlassChroma = Clamp(s.GlassChroma, 0, 1, 0.35);
+            if (s.GlassStyle < 0 || s.GlassStyle > 2)
+            {
+                // 沿用修改过的材质参数；使用旧默认配方的配置可直接体验清透外观。
+                bool custom = s.GlassBlurRadius != 24 || s.GlassTintOpacity != 0.18
+                    || !string.Equals(s.GlassTint, "#14141C", StringComparison.OrdinalIgnoreCase)
+                    || s.GlassRefraction != 0.45 || s.GlassRim != 0.50 || s.GlassChroma != 0.35;
+                s.GlassStyle = custom ? 2 : 0;
+            }
+            s.FollowCapsuleBackground ??= ThemeService.FollowsBackground(s);
+            if (s.GlassFrost is double frost)
+                s.GlassFrost = double.IsFinite(frost) ? Math.Clamp(frost, 0, 1) : null;
             return s;
         }
 

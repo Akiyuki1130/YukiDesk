@@ -593,7 +593,7 @@ namespace DesktopBar.Services
         }
 
         /// <summary>壁纸适配方式 → 屏幕物理坐标反查壁纸像素坐标。</summary>
-        private static bool MapWallpaper(int style, bool tile, int ox, int oy,
+        internal static bool MapWallpaper(int style, bool tile, int ox, int oy,
             double sw, double sh, int ww, int wh, double sx, double sy,
             out double wx, out double wy)
         {

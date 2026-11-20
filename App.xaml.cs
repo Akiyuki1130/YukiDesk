@@ -424,6 +424,7 @@ namespace DesktopBar
                 Visible = true
             };
             var menu = new Forms.ContextMenuStrip();
+            UI.Ui.ApplyTrayFont(menu);
             menu.Items.Add("打开设置", null, (s, e) => Dispatcher.BeginInvoke(new Action(ShowSettings)));
             menu.Items.Add("显示/隐藏顶栏", null, (s, e) => Dispatcher.BeginInvoke(new Action(() =>
             {
@@ -432,7 +433,7 @@ namespace DesktopBar
             })));
             menu.Items.Add("打开数据目录", null, (s, e) => Dispatcher.BeginInvoke(new Action(() => UI.ShellOpen.OpenPath(Settings.StorageRoot))));
             menu.Items.Add(new Forms.ToolStripSeparator());
-            menu.Items.Add("退出 YukiDesk", null, (s, e) => Dispatcher.BeginInvoke(new Action(Shutdown)));
+            menu.Items.Add("退出", null, (s, e) => Dispatcher.BeginInvoke(new Action(Shutdown)));
             _tray.ContextMenuStrip = menu;
             _tray.MouseClick += (s, e) => { if (e.Button == Forms.MouseButtons.Left) Dispatcher.BeginInvoke(new Action(ShowSettings)); };
         }
@@ -458,7 +459,7 @@ namespace DesktopBar
             // 玻璃捕获线程引用主窗几何与位图,必须在主窗 Close 之前停(下一位就是 Restore/Close)。
             step("玻璃服务", () => Services.GlassService.Stop());
             step("AppBar还原", () => DesktopSpaceService.Restore());
-            try { if (_tray != null) { _tray.Visible = false; _tray.Dispose(); } } catch { }
+            try { if (_tray != null) { _tray.Visible = false; _tray.ContextMenuStrip?.Dispose(); _tray.Dispose(); } } catch { }
             try { _trayIcon?.Dispose(); } catch { }
             try { Bar?.ClosePanels(); } catch { }
             try { Bar?.Close(); } catch { }

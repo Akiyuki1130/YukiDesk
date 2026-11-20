@@ -139,6 +139,7 @@ namespace DesktopBar.Services
                 long dt0 = System.Threading.Interlocked.Read(ref GlassService.StatDownTicks);
                 long ft0 = System.Threading.Interlocked.Read(ref GlassService.StatDiffTicks);
                 long bl0 = System.Threading.Interlocked.Read(ref GlassService.StatBlurTicks);
+                var panel0 = PanelCounters();
                 // 诊断开关:隐藏顶栏再测,用来判断"空闲 CPU 是不是窗口合成/渲染本身吃掉的"。
                 bool hideBar = Environment.GetEnvironmentVariable("YUKI_PERF_HIDE") == "1";
                 var probeBar = MainWindow.Bar;
@@ -367,18 +368,31 @@ namespace DesktopBar.Services
                     msOf(bl0, System.Threading.Interlocked.Read(ref GlassService.StatBlurTicks), s1 - s0)));
                 Note("性能[布局] LayoutUpdated=" + System.Threading.Interlocked.Read(ref layout0) + " 次/" + secs + "s");
                 if (openPanel != null) { try { Note("性能[面板] 状态 " + GlassService.DiagnosticPanelState() + " 动画属性=" + openPanel.DiagnosticPanelAnimated + " " + openPanel.DiagnosticPanelTransform); openPanel.ClosePanelImmediately(); } catch { } }
-                // 端到端延迟:捕获开始 → WPF 开始渲染含这帧的绘制(1 帧 ≈ 一个刷新周期 ≈ 16.7ms)
+                var panel1 = PanelCounters();
+                Note($"性能[面板区间] 采样={panel1.Captures - panel0.Captures} 模糊={panel1.Blurs - panel0.Blurs}"
+                    + $" 发布={panel1.Publishes - panel0.Publishes} 写帧={panel1.Writes - panel0.Writes}"
+                    + $" 写锐帧={panel1.SharpWrites - panel0.SharpWrites} 缓存显形={panel1.WarmOpens - panel0.WarmOpens}");
                 Note("性能[延迟] " + GlassService.RenderLatencyReport());
-                GlassService.SetRenderLatencyProbe(false);
             if (hideBar && probeBar != null) { try { probeBar.Show(); } catch { } }
                 Note("性能[终点] " + GlassService.DiagnosticSnapshot());
             }
             catch (Exception ex) { Note("性能自检异常: " + ex); }
             finally
             {
+                GlassService.SetRenderLatencyProbe(false);
                 try { File.WriteAllLines(Path.Combine(_dir, "perf.txt"), _log); } catch { }
                 try { Application.Current.Shutdown(); } catch { }
             }
+        }
+
+        private static (long Captures, long Blurs, long Publishes, long Writes, long SharpWrites, long WarmOpens) PanelCounters()
+        {
+            return (System.Threading.Interlocked.Read(ref GlassService.StatPanelCaptures),
+                System.Threading.Interlocked.Read(ref GlassService.StatPanelBlurs),
+                System.Threading.Interlocked.Read(ref GlassService.StatPanelFrames),
+                System.Threading.Interlocked.Read(ref GlassService.StatPanelWrites),
+                System.Threading.Interlocked.Read(ref GlassService.StatPanelSharpWrites),
+                System.Threading.Interlocked.Read(ref GlassService.StatPanelWarmOpens));
         }
 
         private static async Task RunAsync()

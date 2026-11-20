@@ -1,7 +1,10 @@
 using System;
-using System.Drawing;
-using System.IO;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Media;
+using System.Windows.Threading;
 using Microsoft.Win32;
+using DesktopBar.Interop;
 using DesktopBar.Models;
 using DesktopBar.UI;
 
@@ -10,27 +13,38 @@ namespace DesktopBar.Services
     public static class ThemeService
     {
         public static event Action Changed;
-        private static bool _started;
-        private static bool _stopped;
-        private static UserPreferenceChangedEventHandler _preferenceChanged;
-        private static string _background = "#14141C";
-        private static string _text = "#FFFFFF";
-        // 壁纸亮度缓存与后台计算:解码整张壁纸并采样是重活,不能在 UI 线程同步做,
-        // 否则换壁纸/改系统主题色瞬间顶栏卡顿(4K 壁纸可达数百毫秒)。
-        private static volatile bool _wallpaperBright;
-        private static long _wallpaperComputedAt = -1;
-        private static int _wallpaperComputing;
+        private static bool _started, _stopped, _checkingWallpaper, _wallpaperBright;
+        private static DispatcherTimer _wallpaperTimer;
+        private static volatile WallpaperMonitor.Snapshot _wallpaper;
+        internal static WallpaperMonitor.Snapshot CurrentWallpaper => _wallpaper;
+        private static double _wallpaperBarHeight;
+        private static Appearance _appearance;
 
-        public static string Background => _background;
-        public static string Text => _text;
+        private sealed record Appearance(string Background, string Text, double Opacity,
+            string Border, double BorderOpacity, double BorderThickness, bool Automatic);
+
+        public static string Background => _appearance?.Background ?? "#14141C";
+        public static string Text => _appearance?.Text ?? "#FFFFFF";
         public static string Border => App.Settings?.BorderColor ?? "#FFFFFF";
+
+        internal static bool FollowsBackground(AppSettings settings) => settings != null
+            && (settings.FollowCapsuleBackground
+                ?? (settings.AutoTheme || (settings.PillMaterial == 4 && settings.GlassStyle < 2)));
+
+        private static bool NeedsWallpaper(AppSettings settings) =>
+            FollowsBackground(settings) || settings?.PillMaterial is 3 or 4;
+
+        internal static (string Background, string Text) WallpaperTheme(bool bright) =>
+            bright ? ("#111118", "#FFFFFF") : ("#F6F7FB", "#171821");
 
         public static void Start()
         {
             if (_started || _stopped) return;
             _started = true;
-            _preferenceChanged = (s, e) => Refresh();
-            SystemEvents.UserPreferenceChanged += _preferenceChanged;
+            _wallpaperTimer = new DispatcherTimer(DispatcherPriority.Background) { Interval = TimeSpan.FromSeconds(2) };
+            _wallpaperTimer.Tick += (sender, args) => CheckWallpaper();
+            SystemEvents.UserPreferenceChanged += OnUserPreferenceChanged;
+            SystemEvents.DisplaySettingsChanged += OnDisplaySettingsChanged;
             Refresh();
         }
 
@@ -38,119 +52,105 @@ namespace DesktopBar.Services
         {
             if (!_started) return;
             _stopped = true;
-            if (_preferenceChanged != null)
-            {
-                try { SystemEvents.UserPreferenceChanged -= _preferenceChanged; }
-                catch { }
-                _preferenceChanged = null;
-            }
+            _wallpaperTimer.Stop();
+            SystemEvents.UserPreferenceChanged -= OnUserPreferenceChanged;
+            SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;
             Changed = null;
+        }
+
+        private static void OnUserPreferenceChanged(object sender, UserPreferenceChangedEventArgs e)
+        {
+            if (e.Category is UserPreferenceCategory.Desktop or UserPreferenceCategory.Color or UserPreferenceCategory.General)
+                RequestWallpaperCheck();
+        }
+
+        private static void OnDisplaySettingsChanged(object sender, EventArgs e) => RequestWallpaperCheck();
+
+        private static void RequestWallpaperCheck()
+        {
+            var dispatcher = Application.Current?.Dispatcher;
+            if (dispatcher == null || dispatcher.HasShutdownStarted) return;
+            dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(CheckWallpaper));
+        }
+
+        private static async void CheckWallpaper()
+        {
+            if (_stopped || _checkingWallpaper || !NeedsWallpaper(App.Settings)) return;
+            _checkingWallpaper = true;
+            try
+            {
+                var previous = _wallpaper;
+                double barHeight = 46 * Ui.Scale * NativeMethods.SystemDpiScale();
+                bool resized = barHeight != _wallpaperBarHeight;
+                var (state, lightness) = await Task.Run(() =>
+                {
+                    var current = WallpaperMonitor.Read();
+                    return (current, resized || current != previous ? WallpaperMonitor.SampleTop(current, barHeight) : null);
+                });
+                if (_stopped || !NeedsWallpaper(App.Settings)) return;
+                bool wallpaperChanged = state != _wallpaper;
+                _wallpaper = state;
+                _wallpaperBarHeight = barHeight;
+                if (lightness.HasValue)
+                {
+                    _wallpaperBright = lightness.Value > (_wallpaperBright ? 0.50 : 0.56);
+                    Refresh();
+                }
+                if (wallpaperChanged)
+                {
+                    GlassService.WallpaperChanged();
+                    App.Log("主题:主屏壁纸已更新");
+                }
+            }
+            catch (Exception ex) when (ex is System.IO.IOException or UnauthorizedAccessException
+                or System.Runtime.InteropServices.ExternalException or ArgumentException) { }
+            finally { _checkingWallpaper = false; }
         }
 
         public static void Refresh()
         {
             if (_stopped) return;
-            var dispatcher = System.Windows.Application.Current?.Dispatcher;
+            var dispatcher = Application.Current?.Dispatcher;
             if (dispatcher != null && !dispatcher.CheckAccess())
             {
-                if (dispatcher.HasShutdownStarted || dispatcher.HasShutdownFinished) return;
-                try { dispatcher.BeginInvoke(new Action(Refresh)); }
-                catch (InvalidOperationException) { }
+                if (!dispatcher.HasShutdownStarted) dispatcher.BeginInvoke(new Action(Refresh));
                 return;
             }
-            var s = App.Settings;
-            if (s == null) return;
-            if (!s.AutoTheme)
+            var settings = App.Settings;
+            if (settings == null) return;
+
+            bool automatic = FollowsBackground(settings);
+            bool watchWallpaper = NeedsWallpaper(settings);
+            if (_wallpaperTimer != null && _wallpaperTimer.IsEnabled != watchWallpaper)
             {
-                _background = s.ThemeColor;
-                _text = s.ThemeTextColor;
+                _wallpaper = null;
+                if (watchWallpaper)
+                {
+                    _wallpaperTimer.Start();
+                    CheckWallpaper();
+                }
+                else _wallpaperTimer.Stop();
             }
-            else
-            {
-                EnsureWallpaperBrightness();
-                bool bright = _wallpaperBright;
-                _background = bright ? "#111118" : "#F6F7FB";
-                _text = bright ? "#FFFFFF" : "#171821";
-            }
-            var resources = System.Windows.Application.Current?.Resources;
+
+            var (background, text) = automatic ? WallpaperTheme(_wallpaperBright) : (settings.ThemeColor, settings.ThemeTextColor);
+            var appearance = new Appearance(background, text, settings.ThemeOpacity,
+                settings.BorderEnabled ? settings.BorderColor : null, settings.BorderOpacity, settings.BorderThickness, automatic);
+            if (appearance == _appearance) return;
+            _appearance = appearance;
+
+            var resources = Application.Current?.Resources;
             if (resources != null)
             {
-                resources["ThemePanelBackground"] = Ui.Brush(_background, s.ThemeOpacity);
-                resources["ThemePanelBorder"] = s.BorderEnabled
-                    ? Ui.Brush(s.BorderColor, s.BorderOpacity)
-                    : System.Windows.Media.Brushes.Transparent;
-                resources["ThemePanelSubtle"] = Ui.Brush(_text, 0.06);
-                resources["ThemePanelControl"] = Ui.Brush(_text, 0.10);
-                resources["ThemePanelControlHover"] = Ui.Brush(_text, 0.18);
-                resources["ThemePanelHover"] = Ui.Brush(_text, 0.12);
-                resources["ThemePanelSelected"] = Ui.Brush(_text, 0.20);
-                resources["ThemePanelText"] = Ui.Brush(_text, 1);
+                resources["ThemePanelBackground"] = Ui.Brush(background, settings.ThemeOpacity);
+                resources["ThemePanelBorder"] = appearance.Border != null ? Ui.Brush(appearance.Border, appearance.BorderOpacity) : Brushes.Transparent;
+                resources["ThemePanelSubtle"] = Ui.Brush(text, 0.06);
+                resources["ThemePanelControl"] = Ui.Brush(text, 0.10);
+                resources["ThemePanelControlHover"] = Ui.Brush(text, 0.18);
+                resources["ThemePanelHover"] = Ui.Brush(text, 0.12);
+                resources["ThemePanelSelected"] = Ui.Brush(text, 0.20);
+                resources["ThemePanelText"] = Ui.Brush(text);
             }
-            // 颜色没变时不广播:避免 UserPreferenceChanged(改音量方案/其他偏好)反复全量重建模块画刷。
-            if (string.Equals(_background, lastBackground, StringComparison.OrdinalIgnoreCase)
-                && string.Equals(_text, lastText, StringComparison.OrdinalIgnoreCase)
-                && !firstCompute) return;
-            lastBackground = _background;
-            lastText = _text;
             Changed?.Invoke();
-        }
-
-        private static string lastBackground;
-        private static string lastText;
-        private static bool firstCompute = true;
-
-        /// <summary>取缓存的壁纸亮度;缓存缺失或过期(10 分钟)时在后台线程重算,先返回旧值。</summary>
-        private static void EnsureWallpaperBrightness()
-        {
-            long now = Environment.TickCount64;
-            if (_wallpaperComputedAt >= 0 && now - _wallpaperComputedAt < 600000) return;
-            if (System.Threading.Interlocked.CompareExchange(ref _wallpaperComputing, 1, 0) != 0) return;
-            bool first = _wallpaperComputedAt < 0;
-            if (first)
-            {
-                // 首次没有旧值可用,同步算一次(启动路径,仅一次);仍比每条偏好变化都算好。
-                _wallpaperBright = ComputeWallpaperBrightness();
-                _wallpaperComputedAt = now;
-                _wallpaperComputing = 0;
-                return;
-            }
-            System.Threading.ThreadPool.QueueUserWorkItem(_ =>
-            {
-                try
-                {
-                    bool bright = ComputeWallpaperBrightness();
-                    bool changed = bright != _wallpaperBright;
-                    _wallpaperBright = bright;
-                    _wallpaperComputedAt = Environment.TickCount64;
-                    if (changed) Refresh(); // 亮度结论变了才再刷一次
-                }
-                catch { }
-                finally { _wallpaperComputing = 0; }
-            });
-        }
-
-        private static bool ComputeWallpaperBrightness()
-        {
-            try
-            {
-                using var key = Registry.CurrentUser.OpenSubKey(@"Control Panel\Desktop");
-                string path = key?.GetValue("WallPaper") as string;
-                if (string.IsNullOrWhiteSpace(path) || !File.Exists(path)) return false;
-                using var bmp = new Bitmap(path);
-                int stepX = Math.Max(1, bmp.Width / 32);
-                int stepY = Math.Max(1, bmp.Height / 32);
-                double sum = 0;
-                int count = 0;
-                for (int y = 0; y < bmp.Height; y += stepY)
-                    for (int x = 0; x < bmp.Width; x += stepX)
-                    {
-                        var c = bmp.GetPixel(x, y);
-                        sum += (0.299 * c.R + 0.587 * c.G + 0.114 * c.B) / 255.0;
-                        count++;
-                    }
-                return count > 0 && sum / count > 0.56;
-            }
-            catch { return false; }
         }
     }
 }

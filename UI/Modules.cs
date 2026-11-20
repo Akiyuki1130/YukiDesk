@@ -109,14 +109,16 @@ namespace DesktopBar.UI
         private readonly DispatcherTimer _timer;
         public ClockModule(TabStyle st) : base(st)
         {
-            _pillText = MakeText(""); Pill.Child = _pillText;
+            _pillText = MakePillText("");
+            Pill.Child = _pillText;
             // 下拉内容整体居中:文字居中对齐,并设最小宽度留出左右呼吸感。
             var body = new StackPanel { HorizontalAlignment = HorizontalAlignment.Center, MinWidth = 170 * Ui.Scale };
             _pTime = MakeText("", 12); _pWeek = MakeText(""); _pDate = MakeText(""); _pLunar = MakeText(""); _pFest = MakeText("");
+            _pTime.FontWeight = FontWeights.Bold;
             foreach (var tb in new[] { _pTime, _pWeek, _pDate, _pLunar, _pFest }) tb.HorizontalAlignment = HorizontalAlignment.Center;
             _pTime.Margin = new Thickness(4, 2, 4, 6); _pWeek.Margin = new Thickness(4, 2, 4, 2); _pDate.Margin = new Thickness(4, 2, 4, 2); _pLunar.Margin = new Thickness(4, 2, 4, 2);
             _pFest.Margin = new Thickness(4, 0, 4, 4);
-            _pFest.FontSize = Math.Max(9, 12 * Ui.Scale);
+            _pFest.FontSize = Math.Max(9, 13 * Ui.Scale);
             body.Children.Add(_pTime); body.Children.Add(_pWeek); body.Children.Add(_pDate); body.Children.Add(_pLunar); body.Children.Add(_pFest); Panel.Child = body;
             _timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(250) }; _timer.Tick += (s, e) => Refresh(); _timer.Start(); Refresh();
             // 模块隐藏(或整条顶栏隐藏)时停表,不再空转刷新 5 个 TextBlock。
@@ -178,7 +180,7 @@ namespace DesktopBar.UI
             _smallImg = new Image { Width = 26 * Ui.Scale, Height = 26 * Ui.Scale, Stretch = Stretch.UniformToFill }; coverHost.Children.Add(_smallImg);
             var coverBorder = new Border { Width = 26 * Ui.Scale, Height = 26 * Ui.Scale, CornerRadius = new CornerRadius(7 * Ui.Scale), Child = coverHost, VerticalAlignment = VerticalAlignment.Center }; coverBorder.Clip = new RectangleGeometry(new Rect(0, 0, 26 * Ui.Scale, 26 * Ui.Scale), 7 * Ui.Scale, 7 * Ui.Scale);
             // 歌名超宽时在药丸内滚动；未超宽时药丸收缩到内容宽度。
-            _pillMarquee = new MarqueeText(MakeText("暂无音乐"), 150 * Ui.Scale, 20 * Ui.Scale, hug: true);
+            _pillMarquee = new MarqueeText(MakePillText("暂无音乐"), 150 * Ui.Scale, 20 * Ui.Scale, hug: true);
             _pillMarquee.Margin = new Thickness(8 * Ui.Scale, 0, 0, 0);
             var pillSp = new StackPanel { Orientation = Orientation.Horizontal }; pillSp.Children.Add(coverBorder); pillSp.Children.Add(_pillMarquee); Pill.Child = pillSp;
 
@@ -309,25 +311,21 @@ namespace DesktopBar.UI
             _syncing = false;
             var body = new StackPanel { Width = 230 * Ui.Scale };
             body.Children.Add(MakePanelTitle("音量"));
-            body.Children.Add(_slider = new Slider
+            _slider = new Slider
             {
                 Minimum = 0,
                 Maximum = 1,
                 Value = initialVolume,
-                Style = (Style)Application.Current.FindResource("SliderDark"),
-                // 量程只有 0..1，而 RangeBase.LargeChange 默认就是 1.0——正好等于整个量程。
-                // SliderDark 模板把整条轨道填成了 IncreaseLarge/DecreaseLarge 两个 RepeatButton，
-                // 于是点一次轨道就被 ±1.0 直接顶到 100% 或 0%（拖动滑块走 Thumb.DragDelta，不受影响，
-                // 这就是"能拖不能点"的原因）。开 IsMoveToPointEnabled 让点击直接跳到鼠标位置，
-                // 再把 LargeChange/SmallChange 缩到 2%/1%，键盘 PageUp/PageDown/方向键才可用。
-                IsMoveToPointEnabled = true,
+                Style = (Style)Application.Current.FindResource("CapsuleSlider"),
                 LargeChange = 0.02,
                 SmallChange = 0.01
-            });
+            };
             _slider.SetResourceReference(Control.BackgroundProperty, "ThemePanelControl");
-            body.Children.Add(_value = MakeText(initialVolumeAvailable ? Math.Round(initialVolume * 100) + "%" : "读取失败"));
+            System.Windows.Automation.AutomationProperties.SetName(_slider, "音量");
+            _value = MakeText(initialVolumeAvailable ? Math.Round(initialVolume * 100) + "%" : "读取失败");
+            _value.FontWeight = FontWeights.Bold;
+            body.Children.Add(Ui.SliderWithValue(_slider, _value, 52 * Ui.Scale, panel: true));
             _slider.IsEnabled = initialVolumeAvailable;
-            _value.HorizontalAlignment = HorizontalAlignment.Center;
             Panel.Child = body;
             // 写音量经 120ms 合并:一次拖动只落一次系统写,不逐刻度跨进程写。
             _writeTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(120) };
@@ -494,7 +492,7 @@ namespace DesktopBar.UI
             _name = name;
             var sp = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
             sp.Children.Add(MakeFolderGlyph(18));
-            var tb = MakeText(name);
+            var tb = MakePillText(name);
             tb.Margin = new Thickness(8 * Ui.Scale, 0, 0, 0);
             sp.Children.Add(tb);
             Pill.Child = sp;
@@ -992,7 +990,7 @@ namespace DesktopBar.UI
 
             // 经 MakeText 登记随主题刷新;直接快照 Foreground 会在切主题后保留旧色。
             _emptyHint = MakeText("回收站是空的", -1);
-            _emptyHint.FontSize = 12 * Ui.Scale;
+            _emptyHint.FontSize = 13 * Ui.Scale;
             _emptyHint.Opacity = 0.65;
             _emptyHint.HorizontalAlignment = HorizontalAlignment.Center;
             _emptyHint.Margin = new Thickness(12 * Ui.Scale, 16 * Ui.Scale, 12 * Ui.Scale, 10 * Ui.Scale);
@@ -1509,7 +1507,7 @@ namespace DesktopBar.UI
                 Text = displayName,
                 TextWrapping = TextWrapping.Wrap,
                 TextAlignment = TextAlignment.Center,
-                FontSize = 11 * scale,
+                FontSize = 12 * scale,
                 Opacity = 0.9,
                 MaxHeight = 28 * scale,
                 TextTrimming = TextTrimming.CharacterEllipsis,
@@ -1729,11 +1727,12 @@ namespace DesktopBar.UI
     {
         private readonly SpectrumSurface _surface;
         private readonly float[] _current = new float[SpectrumService.BarCount];
-        private readonly double _maxHeight, _minHeight;
+        private static readonly TimeSpan ActiveInterval = TimeSpan.FromMilliseconds(32);
+        private static readonly TimeSpan IdleInterval = TimeSpan.FromMilliseconds(100);
+        private readonly DispatcherTimer _refresh = new DispatcherTimer(DispatcherPriority.Background);
         private bool _captureActive;
-        private bool _renderSubscribed;
         private bool _disposed;
-        private TimeSpan _lastRenderTime = TimeSpan.MinValue;
+        private long _lastTick, _lastAudible;
 
         public SpectrumModule(TabStyle st) : base(st)
         {
@@ -1741,25 +1740,13 @@ namespace DesktopBar.UI
             double s = Ui.Scale;
             int n = SpectrumService.BarCount;
             double barW = 3.2 * s, gap = 2.8 * s;
-            double inner = n * barW + (n - 1) * gap;
-            double pillW = 125 * s;
-            _maxHeight = 20 * s;
-            _minHeight = 1.6 * s;
-
-            _surface = new SpectrumSurface(
-                n,
-                barW,
-                gap,
-                _maxHeight,
-                _minHeight,
-                1.5 * s,
-                Ui.Brush(ThemeService.Text, 1));
-
-            Pill.Width = pillW;
+            _surface = new SpectrumSurface(n, barW, gap, 20 * s, 1.6 * s, 1.5 * s);
+            _surface.SetResourceReference(SpectrumSurface.InkProperty, ContentInkKey);
+            _refresh.Tick += OnSpectrumTick;
+            Pill.Width = 125 * s;
             Pill.Padding = new Thickness(0);
             Pill.Child = _surface;
 
-            ThemeService.Changed += OnBarThemeChanged;
             IsVisibleChanged += (s2, e2) => SetSpectrumActive(IsVisible);
             Loaded += (s2, e2) => SetSpectrumActive(IsVisible);
             Unloaded += (s2, e2) => SetSpectrumActive(false);
@@ -1778,98 +1765,46 @@ namespace DesktopBar.UI
             if (active)
             {
                 SpectrumService.Instance.AddRef();
-                _lastRenderTime = TimeSpan.MinValue;
-                if (!_renderSubscribed)
-                {
-                    CompositionTarget.Rendering += OnRendering;
-                    _renderSubscribed = true;
-                }
+                _lastTick = _lastAudible = Environment.TickCount64;
+                _refresh.Interval = ActiveInterval;
+                _refresh.Start();
                 return;
             }
 
-            if (_renderSubscribed)
-            {
-                CompositionTarget.Rendering -= OnRendering;
-                _renderSubscribed = false;
-            }
+            _refresh.Stop();
             SpectrumService.Instance.ReleaseRef();
         }
 
-        private const int IdleAfterMs = 20000; // 持续无跳动多久后进入空闲动画
-        private bool _idleAnim;
-        private double _idleHead;
-        private long _idleLastTick;
-        private long _lastActiveTick = Environment.TickCount64;
-
-        private void OnBarThemeChanged()
+        private void OnSpectrumTick(object sender, EventArgs e)
         {
-            if (Dispatcher.CheckAccess()) ApplyBarTheme();
-            else Dispatcher.BeginInvoke(new Action(ApplyBarTheme));
-        }
-
-        private void ApplyBarTheme()
-        {
-            _surface.SetBrush(Ui.Brush(ThemeService.Text, 1));
-        }
-
-        private void OnRendering(object sender, EventArgs args)
-        {
-            if (!(args is RenderingEventArgs renderingArgs)) return;
-            TimeSpan now = renderingArgs.RenderingTime;
-            // 空闲波纹是纯装饰的慢波(170ms 行进一根),没必要 60fps 重绘:
-            // 分层窗口每被弄脏一次就要整条重呈,实测 60fps 空闲波会在静音桌面上常驻吃掉约 10% 单核。
-            // 空闲期降到 20fps 观感几乎无差(每根柱子仍有 8+ 帧插值),开销降到约 1/3。
-            double frameMs = _idleAnim ? 50.0 : 16.0;
-            if (_lastRenderTime != TimeSpan.MinValue
-                && now - _lastRenderTime < TimeSpan.FromMilliseconds(frameMs)) return;
-
-            double elapsedMs = _lastRenderTime == TimeSpan.MinValue
-                ? 33
-                : Math.Min(150, Math.Max(1, (now - _lastRenderTime).TotalMilliseconds));
-            _lastRenderTime = now;
-            Tick(elapsedMs);
-        }
-
-        private void Tick(double elapsedMs)
-        {
-            if (_disposed || !_captureActive || Visibility != Visibility.Visible) return;
+            if (_disposed || !_captureActive || !IsVisible) return;
+            long now = Environment.TickCount64;
+            double elapsedMs = Math.Clamp(now - _lastTick, 1, 150);
+            _lastTick = now;
 
             var target = SpectrumService.Instance.Bands;
             // 采集线程重连等中断期间让柱子自然落回底端。
-            bool stale = Environment.TickCount64 - SpectrumService.Instance.LastDataTick > 600;
+            bool stale = now - SpectrumService.Instance.LastDataTick > 600;
 
-            // 任一频段有真实跳动就刷新活跃时间;持续 20 秒无跳动则进入逐根跳起动画。
+            // 静音时让频谱回到静止状态，不让装饰动画持续刷新整个分层顶栏。
             bool active = false;
             if (!stale && target != null)
                 foreach (var v in target)
                     if (v > 0.12f) { active = true; break; }
-            if (active) _lastActiveTick = Environment.TickCount64;
-            bool idle = Environment.TickCount64 - _lastActiveTick >= IdleAfterMs;
-
+            if (active) _lastAudible = now;
+            bool idle = now - _lastAudible >= 1500;
+            var interval = idle ? IdleInterval : ActiveInterval;
+            if (_refresh.Interval != interval) _refresh.Interval = interval;
             if (idle)
             {
-                if (!_idleAnim) { _idleAnim = true; _idleHead = -3; _idleLastTick = Environment.TickCount64; }
-                long now = Environment.TickCount64;
-                // 每 170ms 行进一根;首尾各留 3 根缓冲,扫过一圈后循环。
-                _idleHead += (now - _idleLastTick) / 170.0;
-                _idleLastTick = now;
-                if (_idleHead > _current.Length + 3) _idleHead = -3;
+                Array.Clear(_current);
+                _surface.SetValues(_current);
+                return;
             }
-            else _idleAnim = false;
 
             for (int i = 0; i < _current.Length; i++)
             {
-                float t;
-                if (idle)
-                {
-                    // 行进波头:波头到达时该柱跳满,随波头继续前进平滑回落。
-                    float d = (float)(_idleHead - i);
-                    t = d >= 0 && d <= 2.5f ? 1f - d / 2.5f : 0f;
-                }
-                else
-                {
-                    t = !stale && target != null && i < target.Length ? target[i] : 0f;
-                }
+                float t = !stale && target != null && i < target.Length ? target[i] : 0f;
                 float c = _current[i];
                 // 上升跟随快、下落衰减慢；按真实帧间隔插值，交互繁忙跳帧后不会积压变慢。
                 double baseBlend = t > c ? 0.55 : 0.28;
@@ -1889,7 +1824,9 @@ namespace DesktopBar.UI
             private readonly double _maxHeight;
             private readonly double _minHeight;
             private readonly double _radius;
-            private Brush _brush;
+            internal static readonly DependencyProperty InkProperty = DependencyProperty.Register(
+                "Ink", typeof(Brush), typeof(SpectrumSurface),
+                new FrameworkPropertyMetadata(Brushes.White, FrameworkPropertyMetadataOptions.AffectsRender));
 
             public SpectrumSurface(
                 int count,
@@ -1897,8 +1834,7 @@ namespace DesktopBar.UI
                 double gap,
                 double maxHeight,
                 double minHeight,
-                double radius,
-                Brush brush)
+                double radius)
             {
                 _values = new float[count];
                 _barWidth = barWidth;
@@ -1906,7 +1842,6 @@ namespace DesktopBar.UI
                 _maxHeight = maxHeight;
                 _minHeight = minHeight;
                 _radius = radius;
-                _brush = brush;
                 Width = count * barWidth + (count - 1) * gap;
                 Height = maxHeight;
                 HorizontalAlignment = HorizontalAlignment.Center;
@@ -1925,15 +1860,10 @@ namespace DesktopBar.UI
                 if (changed) InvalidateVisual();
             }
 
-            public void SetBrush(Brush brush)
-            {
-                _brush = brush;
-                InvalidateVisual();
-            }
-
             protected override void OnRender(DrawingContext drawingContext)
             {
                 base.OnRender(drawingContext);
+                var brush = (Brush)GetValue(InkProperty);
                 for (int i = 0; i < _values.Length; i++)
                 {
                     float value = Math.Clamp(_values[i], 0f, 1f);
@@ -1942,7 +1872,7 @@ namespace DesktopBar.UI
                     double y = _maxHeight - height;
                     drawingContext.PushOpacity(0.4 + 0.6 * value);
                     drawingContext.DrawRoundedRectangle(
-                        _brush,
+                        brush,
                         null,
                         new Rect(x, y, _barWidth, height),
                         _radius,
@@ -1956,12 +1886,8 @@ namespace DesktopBar.UI
         {
             if (_disposed) return;
             _disposed = true;
-            if (_renderSubscribed)
-            {
-                CompositionTarget.Rendering -= OnRendering;
-                _renderSubscribed = false;
-            }
-            ThemeService.Changed -= OnBarThemeChanged;
+            _refresh.Stop();
+            _refresh.Tick -= OnSpectrumTick;
             if (_captureActive)
             {
                 _captureActive = false;
@@ -1982,7 +1908,6 @@ namespace DesktopBar.UI
         private readonly TextBlock _value;
         private readonly Dictionary<string, TextBlock> _rows = new Dictionary<string, TextBlock>();
         private string _lastPillText;
-        private TextBlock _panelTitle;
         private bool _active;
         private bool _disposed;
 
@@ -2006,13 +1931,14 @@ namespace DesktopBar.UI
                     _ => MakeMemoryGlyph(18)
                 });
             }
-            _value = MakeText("--", -1);
+            _value = MakePillText("--", -1);
             _value.Margin = new Thickness(metric == PerfMetric.Network ? 0 : 4 * s, 0, 0, 0);
             sp.Children.Add(_value);
             Pill.Child = sp;
             Pill.Padding = new Thickness(0);
             // 固定宽度:数值在 "0%" 与 "100%" 间变化时不让胶囊抖动。
-            Pill.Width = (metric == PerfMetric.Network ? 88 : 58) * s;
+            Pill.Width = (metric == PerfMetric.Network ? 112 : 58) * s;
+            System.Windows.Automation.AutomationProperties.SetName(Pill, Caption);
 
             BuildHoverPanel();
             IsVisibleChanged += (s2, e2) => SetActive(IsVisible);
@@ -2061,11 +1987,10 @@ namespace DesktopBar.UI
             };
             var body = new StackPanel { Width = width * s };
             string title = _metric == PerfMetric.Memory ? "内存" : _metric == PerfMetric.Network ? "网络" : _metric == PerfMetric.Cpu ? "CPU" : "GPU";
-            _panelTitle = MakeText(title);
-            _panelTitle.FontSize = 14 * s;
-            _panelTitle.FontWeight = FontWeights.SemiBold;
-            _panelTitle.Margin = new Thickness(2, 0, 2, 6 * s);
-            body.Children.Add(_panelTitle);
+            var titleBlock = MakeText(title, 1.5);
+            titleBlock.FontWeight = FontWeights.Bold;
+            titleBlock.Margin = new Thickness(2, 0, 2, 6 * s);
+            body.Children.Add(titleBlock);
 
             switch (_metric)
             {
@@ -2098,12 +2023,15 @@ namespace DesktopBar.UI
         {
             double s = Ui.Scale;
             var row = new Grid { Margin = new Thickness(2, 2 * s, 2, 2 * s) };
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(42 * s) });
+            row.ColumnDefinitions.Add(new ColumnDefinition());
             var lab = MakeText(label);
             lab.Opacity = 0.72;
             row.Children.Add(lab);
             var val = MakeText("--");
-            val.HorizontalAlignment = HorizontalAlignment.Right;
+            val.TextAlignment = TextAlignment.Right;
             val.TextTrimming = TextTrimming.CharacterEllipsis;
+            Grid.SetColumn(val, 1);
             row.Children.Add(val);
             body.Children.Add(row);
             _rows[label] = val;
@@ -2136,7 +2064,7 @@ namespace DesktopBar.UI
             {
                 Dispatcher.BeginInvoke(new Action(() =>
                 {
-                    if (!_disposed) Apply(sample);
+                    if (!_disposed && _active) Apply(sample);
                 }));
             }
             catch (InvalidOperationException) { }
@@ -2178,16 +2106,17 @@ namespace DesktopBar.UI
                     SetRow("频率", sample.MemSpeedMts > 0 ? Math.Round(sample.MemSpeedMts) + " MT/s" : "--");
                     break;
                 default:
-                    if (sample.NetUpBps < 0 && sample.NetDownBps < 0)
+                    if (!IsValidRate(sample.NetUpBps) && !IsValidRate(sample.NetDownBps))
                     {
                         SetPillText("--");
                     }
                     else
                     {
-                        SetPillText("↓" + FmtSpeed(sample.NetDownBps) + " ↑" + FmtSpeed(sample.NetUpBps));
+                        SetPillText("↓" + FormatNetworkRate(sample.NetDownBps, compact: true)
+                            + " ↑" + FormatNetworkRate(sample.NetUpBps, compact: true));
                     }
-                    SetRow("下行", sample.NetDownBps < 0 ? "--" : FmtSpeedLong(sample.NetDownBps) + "/s");
-                    SetRow("上行", sample.NetUpBps < 0 ? "--" : FmtSpeedLong(sample.NetUpBps) + "/s");
+                    SetRow("下行", FormatNetworkRate(sample.NetDownBps, compact: false));
+                    SetRow("上行", FormatNetworkRate(sample.NetUpBps, compact: false));
                     break;
             }
         }
@@ -2197,7 +2126,11 @@ namespace DesktopBar.UI
             // 面板没打开时那棵树不参与合成,逐秒写它只是白花 DP 与文本排版开销;
             // 打开时 OnPanelShown 会整体刷一遍,不会显示旧值。
             if (Panel == null || !Panel.IsVisible) return;
-            if (_rows.TryGetValue(label, out var tb) && tb.Text != text) tb.Text = text;
+            if (_rows.TryGetValue(label, out var tb) && tb.Text != text)
+            {
+                tb.Text = text;
+                if (label == "型号") tb.ToolTip = text == "--" ? null : text;
+            }
         }
 
         private static string FmtTemp(double c)
@@ -2220,26 +2153,34 @@ namespace DesktopBar.UI
         }
 
         private static string FmtPercent(double v)
-            => v < 0 ? "--" : Math.Round(v).ToString() + "%";
+            => !double.IsFinite(v) || v < 0 ? "--" : Math.Round(Math.Min(100, v)).ToString() + "%";
 
         private static string FmtGb(ulong bytes)
             => (bytes / 1073741824.0).ToString("0.0");
 
-        private static string FmtSpeed(double bps)
-        {
-            if (bps < 0) return "--";
-            if (bps >= 1073741824) return (bps / 1073741824).ToString("0.0") + "G";
-            if (bps >= 1048576) return (bps / 1048576).ToString(bps >= 10485760 ? "0" : "0.0") + "M";
-            return (bps / 1024).ToString(bps >= 10240 ? "0" : "0.0") + "K";
-        }
+        private static readonly string[] RateUnits = { "B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB" };
+        private static bool IsValidRate(double bytesPerSecond) => double.IsFinite(bytesPerSecond) && bytesPerSecond >= 0;
 
-        private static string FmtSpeedLong(double bps)
+        internal static string FormatNetworkRate(double bytesPerSecond, bool compact)
         {
-            if (bps < 0) return "未知";
-            if (bps >= 1073741824) return (bps / 1073741824).ToString("0.0") + " MB";
-            if (bps >= 1048576) return (bps / 1048576).ToString("0.0") + " MB";
-            if (bps >= 1024) return (bps / 1024).ToString("0.0") + " KB";
-            return Math.Round(bps) + " B";
+            if (!IsValidRate(bytesPerSecond)) return "--";
+            double value = bytesPerSecond;
+            int unit = 0;
+            while (value >= 1024 && unit < RateUnits.Length - 1)
+            {
+                value /= 1024;
+                unit++;
+            }
+            int decimals = unit == 0 || (compact && value >= 10) ? 0 : 1;
+            double rounded = Math.Round(value, decimals, MidpointRounding.AwayFromZero);
+            if (rounded >= 1024 && unit < RateUnits.Length - 1)
+            {
+                rounded = 1;
+                unit++;
+            }
+            string suffix = compact ? RateUnits[unit].Substring(0, 1) : " " + RateUnits[unit] + "/s";
+            string amount = rounded >= 1024 ? (compact ? "999+" : "1023+") : rounded.ToString("0.#");
+            return amount + suffix;
         }
 
         public override void Dispose()
