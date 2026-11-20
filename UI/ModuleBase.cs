@@ -797,47 +797,6 @@ namespace DesktopBar.UI
             };
         }
 
-        // 与应用图标(assets/YukiDesk.ico)同款:六条直臂从中心辐射,末端为实心三角箭头。
-        protected FrameworkElement MakeSnowflakeGlyph(double size = 21)
-        {
-            var canvas = new Canvas { Width = 24, Height = 24 };
-            const double cx = 12, cy = 12, r = 10.5;
-            for (int i = 0; i < 6; i++)
-            {
-                double a = -Math.PI / 2 + i * Math.PI / 3;
-                double ux = Math.Cos(a), uy = Math.Sin(a);
-                var line = new Line
-                {
-                    X1 = cx, Y1 = cy,
-                    X2 = cx + ux * r * 0.60, Y2 = cy + uy * r * 0.60,
-                    Stroke = Ui.Brush(ThemeService.Text, 1),
-                    StrokeThickness = 1.6,
-                    StrokeStartLineCap = PenLineCap.Round,
-                    StrokeEndLineCap = PenLineCap.Round
-                };
-                line.SetResourceReference(Shape.StrokeProperty, ContentInkKey);
-                canvas.Children.Add(line);
-
-                double tipX = cx + ux * r, tipY = cy + uy * r;
-                double baseX = cx + ux * r * 0.52, baseY = cy + uy * r * 0.52;
-                double nx = -uy, ny = ux;
-                const double halfW = 2.2;
-                var tri = new Polygon
-                {
-                    Points = new PointCollection
-                    {
-                        new Point(tipX, tipY),
-                        new Point(baseX + nx * halfW, baseY + ny * halfW),
-                        new Point(baseX - nx * halfW, baseY - ny * halfW)
-                    },
-                    Fill = Ui.Brush(ThemeService.Text, 1)
-                };
-                tri.SetResourceReference(Shape.FillProperty, ContentInkKey);
-                canvas.Children.Add(tri);
-            }
-            return IconViewbox(size, canvas);
-        }
-
         protected FrameworkElement MakePowerGlyph(double size = 22)
         {
             var canvas = new Canvas { Width = 24, Height = 24 };

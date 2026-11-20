@@ -5,6 +5,8 @@ using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
+using System.Windows.Shapes;
+using Path = System.IO.Path;
 
 namespace DesktopBar.UI
 {
@@ -16,6 +18,41 @@ namespace DesktopBar.UI
         private const string FontFamilyName = "Resource Han Rounded SC";
         public static FontFamily TextFont { get; } = new FontFamily(
             new Uri(AppContext.BaseDirectory, UriKind.Absolute), $"./{FontDirectory}/#{FontFamilyName}");
+
+        internal static Viewbox SnowflakeGlyph(double size, string inkKey)
+        {
+            var canvas = new Canvas { Width = 24, Height = 24 };
+            const double center = 12, radius = 10.5, halfTipWidth = 2.2;
+            for (int arm = 0; arm < 6; arm++)
+            {
+                double angle = -Math.PI / 2 + arm * Math.PI / 3;
+                double x = Math.Cos(angle), y = Math.Sin(angle);
+                var line = new Line
+                {
+                    X1 = center, Y1 = center,
+                    X2 = center + x * radius * 0.60, Y2 = center + y * radius * 0.60,
+                    StrokeThickness = 1.6,
+                    StrokeStartLineCap = PenLineCap.Round,
+                    StrokeEndLineCap = PenLineCap.Round
+                };
+                line.SetResourceReference(Shape.StrokeProperty, inkKey);
+                canvas.Children.Add(line);
+
+                double baseX = center + x * radius * 0.52, baseY = center + y * radius * 0.52;
+                var tip = new Polygon
+                {
+                    Points = new PointCollection
+                    {
+                        new Point(center + x * radius, center + y * radius),
+                        new Point(baseX - y * halfTipWidth, baseY + x * halfTipWidth),
+                        new Point(baseX + y * halfTipWidth, baseY - x * halfTipWidth)
+                    }
+                };
+                tip.SetResourceReference(Shape.FillProperty, inkKey);
+                canvas.Children.Add(tip);
+            }
+            return new Viewbox { Width = size, Height = size, Child = canvas, Stretch = Stretch.Uniform };
+        }
 
         internal static void ApplyTrayFont(System.Windows.Forms.ContextMenuStrip menu)
         {

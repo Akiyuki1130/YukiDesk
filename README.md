@@ -2,7 +2,7 @@
 
 YukiDesk 是 Windows 桌面上的一条可自定义顶栏。它把小文件夹、时钟、音乐控制和性能监测放进一排胶囊里。普通窗口会盖过顶栏，回到桌面就能继续使用。
 
-[下载最新版](../../releases/latest) · [2.0.0 更新公告](release-notes.md)
+[下载最新版](../../releases/latest) · [更新公告](release-notes.md)
 
 ## 液态玻璃
 

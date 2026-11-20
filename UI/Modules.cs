@@ -29,8 +29,7 @@ namespace DesktopBar.UI
         {
             Pill.Width = 38 * Ui.Scale;
             Pill.Padding = new Thickness(0);
-            // 与文件夹图标同级的雪花：六臂双层分叉，24 网格等比缩放。
-            Pill.Child = CenterIcon(MakeSnowflakeGlyph(21));
+            Pill.Child = CenterIcon(Ui.SnowflakeGlyph(21 * Ui.Scale, ContentInkKey));
             Pill.MouseLeftButtonUp += (s, e) => App.ShowSettings();
         }
         protected override bool HasPanel => false;

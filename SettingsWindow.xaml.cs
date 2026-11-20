@@ -34,6 +34,7 @@ namespace DesktopBar
             InitializeComponent();
             // 先应用主题再创建动态控件，避免控件捕获初始化阶段的低对比度画刷。
             ApplyWindowTheme();
+            TitleIconHost.Content = Ui.SnowflakeGlyph(18, "SettingsSubTextBrush");
             SettingsThemeHost.Content = BuildThemeModePicker();
             BuildAppearancePage();
             BuildTimePage();
@@ -1568,13 +1569,6 @@ namespace DesktopBar
             GeneralHost.Children.Clear();
 
             var card1 = Card("启动", null, out var b1);
-            b1.Children.Add(ToggleRow("开机自动启动", S.AutoStart, v =>
-            {
-                S.AutoStart = v;
-                AutoStartService.Set(v);
-                Save();
-            }));
-            b1.Children.Add(MakeHint("通过当前用户注册表 Run 键实现,登录系统后立即启动,无等待。"));
             // 开关初值取注册表实况而非内存值:用户手删 Run 键/被组策略拦截时两者会脱节;
             // 写入失败时回读校正并把开关拨回去,不让 UI 显示一个没生效的状态。
             ToggleButton autostartToggle = null;
@@ -1582,14 +1576,15 @@ namespace DesktopBar
             {
                 bool ok = AutoStartService.Set(v);
                 S.AutoStart = AutoStartService.IsEnabled();
-                Save();
+                App.Save();
+                autostartToggle?.SetCurrentValue(ToggleButton.IsCheckedProperty, S.AutoStart);
                 if (!ok)
                 {
                     ConfirmDialog.Notice("设置未生效",
                         "开机自动启动未能写入注册表(可能被组策略或安全软件拦截)。");
-                    autostartToggle?.SetCurrentValue(ToggleButton.IsCheckedProperty, S.AutoStart);
                 }
             }, onCreated: t => autostartToggle = t));
+            b1.Children.Add(MakeHint("登录 Windows 后为当前用户启动 YukiDesk。"));
             b1.Children.Add(Row("悬停关闭", NumberSlider(80, 2000, S.HoverCloseDelayMs, "ms", v => { S.HoverCloseDelayMs = (int)Math.Round(v); Save(); })));
             b1.Children.Add(Row("动画时长", NumberSlider(80, 1200, S.AnimationDurationMs, "ms", v => { S.AnimationDurationMs = (int)Math.Round(v); Save(); })));
             GeneralHost.Children.Add(card1);

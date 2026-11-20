@@ -131,10 +131,7 @@
                 <Grid>
                     <Border Height="1" VerticalAlignment="Bottom" Background="{DynamicResource SettingsDivider}"/>
                     <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="18,0,0,0">
-                        <Path Data="M 8,1 L 8,15 M 2,4.5 L 14,11.5 M 2,11.5 L 14,4.5 M 6,3 L 8,5 L 10,3 M 6,13 L 8,11 L 10,13"
-                              Width="13" Height="13" Stretch="Uniform" Stroke="{DynamicResource SettingsSubTextBrush}"
-                              StrokeThickness="1.15" StrokeStartLineCap="Round" StrokeEndLineCap="Round"
-                              VerticalAlignment="Center"/>
+                        <ContentControl x:Name="TitleIconHost" VerticalAlignment="Center" IsHitTestVisible="False"/>
                         <TextBlock Text="YukiDesk 设置" FontSize="15" FontWeight="Medium" Foreground="{DynamicResource SettingsTextBrush}"
                                    Margin="9,0,0,0" VerticalAlignment="Center"/>
                     </StackPanel>
