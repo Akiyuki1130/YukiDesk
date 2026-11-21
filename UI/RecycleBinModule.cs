@@ -27,7 +27,20 @@ namespace DesktopBar.UI
             Pill.Width = 38 * Ui.Scale;
             Pill.Padding = new Thickness(0);
             Pill.Child = CenterIcon(MakeTrashGlyph(20.5));
-            Pill.MouseLeftButtonUp += (_, _) => ShowPanel();
+            bool doubleClick = false;
+            Pill.MouseLeftButtonDown += (_, e) => doubleClick = e.ClickCount == 2;
+            Pill.MouseLeftButtonUp += (_, e) =>
+            {
+                if (!doubleClick)
+                {
+                    ShowPanel();
+                    return;
+                }
+                doubleClick = false;
+                e.Handled = true;
+                ClosePanelImmediately();
+                ShellOpen.OpenRecycleBin();
+            };
             Pill.MouseRightButtonUp += (_, e) =>
             {
                 e.Handled = true;
@@ -114,30 +127,33 @@ namespace DesktopBar.UI
                 var entries = await completion.Task;
                 if (_disposed || !Open) return;
                 entries = entries.OrderBy(item => item.Name, StringComparer.CurrentCultureIgnoreCase).ToList();
-                _status.Text = "回收站是空的";
-                _status.Visibility = entries.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+                var status = entries.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
                 if (entries.Count == _snapshot.Count && entries.Zip(_snapshot,
-                        (current, previous) => current.Id.AsSpan().SequenceEqual(previous.Id)).All(same => same)) return;
+                        (current, previous) => current.Id.AsSpan().SequenceEqual(previous.Id)).All(same => same))
+                {
+                    _status.Text = "回收站是空的";
+                    _status.Visibility = status;
+                    return;
+                }
 
-                _items.Children.Clear();
-                int cols = Math.Min(4, Math.Max(1, entries.Count));
-                _items.Width = cols * 76 * Ui.Scale;
-                Panel.Width = Math.Max(190, cols * 76 + 26) * Ui.Scale;
+                var views = new FrameworkElement[entries.Count];
                 for (int i = 0; i < entries.Count; i++)
                 {
-                    _items.Children.Add(MakeItem(entries[i]));
+                    views[i] = MakeItem(entries[i]);
                     if (i % 12 == 11 && i + 1 < entries.Count)
                     {
                         await Dispatcher.Yield(DispatcherPriority.Background);
-                        if (_disposed || !Open)
-                        {
-                            _items.Children.Clear();
-                            _snapshot.Clear();
-                            return;
-                        }
+                        if (_disposed || !Open) return;
                     }
                 }
+                int cols = Math.Min(4, Math.Max(1, entries.Count));
+                _items.Width = cols * 76 * Ui.Scale;
+                Panel.Width = Math.Max(190, cols * 76 + 26) * Ui.Scale;
+                _items.Children.Clear();
+                foreach (var view in views) _items.Children.Add(view);
                 _snapshot = entries;
+                _status.Text = "回收站是空的";
+                _status.Visibility = status;
             }
             catch (Exception ex)
             {

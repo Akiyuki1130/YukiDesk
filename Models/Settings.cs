@@ -41,7 +41,7 @@ namespace DesktopBar.Models
         public bool? FollowCapsuleBackground { get; set; }
         public int HoverCloseDelayMs { get; set; } = 250;
         public int AnimationDurationMs { get; set; } = 180;
-        public bool ShowInScreenCapture { get; set; } = true;
+        public bool ShowInScreenCapture { get; set; }
 
         // ---- 胶囊材质(自绘云母 / Mica) ----
         // 云母本质是"壁纸模糊 + 亮度压带 + 主题染色 + 细噪点",只依赖壁纸不依赖背后窗口,

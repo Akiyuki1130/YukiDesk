@@ -788,7 +788,9 @@ namespace DesktopBar.Services
                     }
                     if (_wallpaperPixels == null) return PanelRead.Failed;
                     var pixels = _backdrop.Composite(request.Window, region, _wallpaperPixels);
-                    if (pixels == null) return PanelRead.Failed;
+                    // A window without a first frame can leave bright wallpaper showing through.
+                    if (pixels == null || _backdrop.WaitingForWindowFrame
+                        || (ReferenceEquals(pixels, _wallpaperPixels) && _backdrop.HasSources)) return PanelRead.Failed;
                     if (ReferenceEquals(request, _previousRequest) && region == _previousRegion
                         && pixels.AsSpan().SequenceEqual(_previous)) return PanelRead.Unchanged;
                     if (_dib != IntPtr.Zero) DestroyScreenCapture();
@@ -931,14 +933,19 @@ namespace DesktopBar.Services
             _panelFps = App.Settings.GlassMaxFps;
             _panelRequest = request;
             if (request.Options.Liquid) SetOptics(_panelEffect, App.Settings);
-            var fallback = panel.TryFindResource("ThemePanelBackground") as Brush;
-            surface.Fill = fallback ?? Ui.Brush(App.Settings.GlassTint);
+            var fallback = request.Options.UseWindowBackdrop
+                ? Ui.Brush("#222228", 0.55)
+                : panel.TryFindResource("ThemePanelBackground") as Brush ?? Ui.Brush(App.Settings.GlassTint);
+            surface.Fill = fallback;
             surface.Opacity = App.Settings.GlassOpacity;
+            if (request.Options.UseWindowBackdrop && UsesAdaptiveInk(App.Settings))
+                ModuleBase.SetGlassInk(panel, 0, panel: true);
 
-            // 相同位置和材质的近期帧可以直接用于显形，后台仍会采一帧核对桌面。
+            // A foreground window can change between opens even at the same screen position.
             long verified;
             lock (Gate) verified = _panelVerifiedSequence == _panelConsumedSequence ? _panelVerifiedAt : _panelDisplayedAt;
-            if (_panelDisplayedRequest is PanelRequest shown && shown.Bounds == bounds && shown.Dpi == request.Dpi
+            if (!request.Options.UseWindowBackdrop && _panelDisplayedRequest is PanelRequest shown
+                && shown.Bounds == bounds && shown.Dpi == request.Dpi
                 && shown.Options == request.Options && Environment.TickCount64 - verified <= 250)
             {
                 _panelDisplayedRequest = request;

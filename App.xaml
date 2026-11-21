@@ -367,7 +367,8 @@
                 <Setter.Value>
                     <ControlTemplate TargetType="ToggleButton">
                         <Grid Width="46" Height="26" HorizontalAlignment="Left">
-                            <Border x:Name="Bg" CornerRadius="13" Background="{DynamicResource SettingsSwitchTrack}"/>
+                            <Border x:Name="Bg" CornerRadius="13" Background="{DynamicResource SettingsSwitchTrack}"
+                                    BorderBrush="Transparent" BorderThickness="1"/>
                             <Border x:Name="Thumb" Width="20" Height="20" CornerRadius="10"
                                     Background="{DynamicResource SettingsSwitchThumb}" BorderBrush="{DynamicResource SettingsSwitchThumbBorder}" BorderThickness="0.6"
                                     HorizontalAlignment="Left" Margin="3,0,0,0"/>
@@ -377,6 +378,14 @@
                                 <Setter TargetName="Bg" Property="Background" Value="{DynamicResource SettingsAccent}"/>
                                 <Setter TargetName="Thumb" Property="HorizontalAlignment" Value="Right"/>
                                 <Setter TargetName="Thumb" Property="Margin" Value="0,0,3,0"/>
+                            </Trigger>
+                            <Trigger Property="IsKeyboardFocused" Value="True">
+                                <Setter TargetName="Thumb" Property="BorderBrush" Value="{DynamicResource SettingsAccentInk}"/>
+                                <Setter TargetName="Bg" Property="BorderBrush" Value="{DynamicResource SettingsLabelBrush}"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter TargetName="Bg" Property="Opacity" Value="0.48"/>
+                                <Setter TargetName="Thumb" Property="Opacity" Value="0.48"/>
                             </Trigger>
                         </ControlTemplate.Triggers>
                     </ControlTemplate>

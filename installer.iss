@@ -65,16 +65,9 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 #if FLAVOR == "slim"
 [InstallDelete]
-; 升级/换 flavor 前清空整个应用目录:配置在 %AppData%\YukiDesk 不受影响;
-; 此前的手抄 DLL 清单漏了 wpfgfx_cor3.dll 等十几个原生文件和全部托管框架 DLL,
-; full↔slim 交叉升级后残留旧运行时会被优先加载,存在版本错配隐患。
-Type: filesandordirs; Name: "{app}"
-#endif
-
-#if FLAVOR == "full"
-[InstallDelete]
-; full->full 覆盖升级同样先清空,避免旧版本废弃文件随升级无限累积。
-Type: filesandordirs; Name: "{app}"
+; 只移除完整版随附而精简版不包含的文件，保留安装目录中的其他内容。
+#define FullCleanup "publish\full-cleanup-" + ARCH + ".iss"
+#include FullCleanup
 #endif
 
 [Files]

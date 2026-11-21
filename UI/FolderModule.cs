@@ -55,25 +55,14 @@ namespace DesktopBar.UI
                 ShowFolderMenu();
             };
 
-            var open = new Button
-            {
-                Content = "在资源管理器中打开",
-                Style = TryFindResource("BtnTheme") as Style,
-                Margin = new Thickness(0, 0, 0, 4 * Ui.Scale),
-                HorizontalAlignment = HorizontalAlignment.Stretch
-            };
-            open.Click += (_, _) => ShellOpen.OpenFolder(_directory);
-            var body = new StackPanel();
-            body.Children.Add(open);
-            body.Children.Add(new ScrollViewer
+            Panel.Width = 190 * Ui.Scale;
+            Panel.Child = new ScrollViewer
             {
                 VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
                 HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
                 MaxHeight = SystemParameters.PrimaryScreenHeight * 0.5,
                 Content = _wrap
-            });
-            Panel.Width = 190 * Ui.Scale;
-            Panel.Child = body;
+            };
             Panel.MouseRightButtonUp += (_, e) =>
             {
                 e.Handled = true;
@@ -137,7 +126,7 @@ namespace DesktopBar.UI
                     watcher.Changed += (_, _) => ScheduleReload();
                     watcher.Deleted += (_, _) => ScheduleReload();
                     watcher.Renamed += (_, _) => ScheduleReload();
-                    watcher.Error += (_, _) => ScheduleReload();
+                    watcher.Error += (source, error) => OnWatcherError((FileSystemWatcher)source, error.GetException());
                     watcher.EnableRaisingEvents = true;
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or InvalidOperationException)
@@ -154,12 +143,35 @@ namespace DesktopBar.UI
                     .ToArray();
                 return (files, watcher);
             }
+            catch (DirectoryNotFoundException)
+            {
+                watcher?.Dispose();
+                return (Array.Empty<FileSystemInfo>(), null);
+            }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or InvalidOperationException)
             {
                 watcher?.Dispose();
                 App.Log("读取小文件夹失败: " + ex.Message);
                 return (null, null);
             }
+        }
+
+        private void OnWatcherError(FileSystemWatcher watcher, Exception error)
+        {
+            if (error is InternalBufferOverflowException)
+            {
+                ScheduleReload();
+                return;
+            }
+            if (_disposed || Dispatcher.HasShutdownStarted) return;
+            Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() =>
+            {
+                if (_disposed || (_watcher != null && !ReferenceEquals(_watcher, watcher))) return;
+                watcher.Dispose();
+                _watcher = null;
+                _loadVersion++;
+                ScheduleReload();
+            }));
         }
 
         private void ScheduleReload()

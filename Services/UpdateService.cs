@@ -179,7 +179,7 @@ namespace DesktopBar.Services
         {
             string dir = Path.Combine(Path.GetTempPath(), "YukiDeskUpdate");
             Directory.CreateDirectory(dir);
-            string target = Path.Combine(dir, info.FileName);
+            string target = Path.Combine(dir, "YukiDesk-Update-" + Guid.NewGuid().ToString("N") + ".exe");
 
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             cts.CancelAfter(TimeSpan.FromMinutes(15));
@@ -188,18 +188,37 @@ namespace DesktopBar.Services
 
             long? total = resp.Content.Headers.ContentLength;
             await using var src = await resp.Content.ReadAsStreamAsync(cts.Token);
-            await using var dst = new FileStream(target, FileMode.Create, FileAccess.Write, FileShare.None,
-                64 * 1024, useAsync: true);
-            var buffer = new byte[64 * 1024];
-            long readTotal = 0;
-            int read;
-            while ((read = await src.ReadAsync(buffer, cts.Token)) > 0)
+            try
             {
-                await dst.WriteAsync(buffer.AsMemory(0, read), cts.Token);
-                readTotal += read;
-                if (progress != null && total > 0) progress.Report(readTotal * 100.0 / total.Value);
+                await using var dst = new FileStream(target, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+                    64 * 1024, useAsync: true);
+                var buffer = new byte[64 * 1024];
+                long readTotal = 0;
+                int lastPercent = -1;
+                int read;
+                while ((read = await src.ReadAsync(buffer, cts.Token)) > 0)
+                {
+                    await dst.WriteAsync(buffer.AsMemory(0, read), cts.Token);
+                    readTotal += read;
+                    if (progress == null || total is not > 0) continue;
+                    int percent = (int)(readTotal * 100.0 / total.Value);
+                    if (percent == lastPercent) continue;
+                    lastPercent = percent;
+                    progress.Report(percent);
+                }
+                return target;
             }
-            return target;
+            catch
+            {
+                DeleteDownloadedInstaller(target);
+                throw;
+            }
+        }
+
+        private static void DeleteDownloadedInstaller(string path)
+        {
+            try { File.Delete(path); }
+            catch (Exception ex) { App.Log("更新: 清理临时安装包失败 " + ex.Message); }
         }
 
         // ---------- 安装 ----------
@@ -260,13 +279,11 @@ namespace DesktopBar.Services
             string text = await Http.GetStringAsync(info.ChecksumUrl, cts.Token);
             string expected = ParseChecksum(text, info.FileName);
             if (expected == null)
-            {
-                App.Log("更新: SHA256SUMS 中没有 " + info.FileName + " 条目,跳过校验");
-                return;
-            }
-            using var sha = System.Security.Cryptography.SHA256.Create();
-            await using var fs = File.OpenRead(installerPath);
-            string actual = Convert.ToHexString(sha.ComputeHash(fs)).ToLowerInvariant();
+                throw new InvalidOperationException("校验清单缺少安装包的有效 SHA-256 条目: " + info.FileName);
+            await using var fs = new FileStream(installerPath, FileMode.Open, FileAccess.Read, FileShare.Read,
+                64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
+            var digest = await System.Security.Cryptography.SHA256.HashDataAsync(fs, cts.Token);
+            string actual = Convert.ToHexString(digest).ToLowerInvariant();
             if (!string.Equals(actual, expected, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("SHA-256 不匹配(期望 " + expected + ",实际 " + actual + ")");
             App.Log("更新: 安装包 SHA-256 校验通过");
@@ -284,7 +301,7 @@ namespace DesktopBar.Services
                 string name = line.Substring(sep + 1).Trim().TrimStart('*');
                 if (string.Equals(name, fileName, StringComparison.OrdinalIgnoreCase)
                     && hash.Length == 64
-                    && Uri.IsHexDigit(hash[0]) && Uri.IsHexDigit(hash[63]))
+                    && hash.All(Uri.IsHexDigit))
                     return hash.ToLowerInvariant();
             }
             return null;
@@ -360,7 +377,7 @@ namespace DesktopBar.Services
                 }
                 catch (Exception ex)
                 {
-                    try { File.Delete(path); } catch { }
+                    DeleteDownloadedInstaller(path);
                     status?.Invoke("安装包校验失败: " + ex.Message);
                     ConfirmDialog.Notice("更新已取消", "下载的安装包未通过完整性校验,已删除。\n" + ex.Message);
                     return;
@@ -370,9 +387,18 @@ namespace DesktopBar.Services
                 // 安装会退出应用,默认键/焦点必须在"取消"侧,回车不能直接触发安装。
                 if (!ConfirmDialog.Show("YukiDesk 更新",
                     "新版本 v" + info.Version + " 已下载完成。\n\n立即安装吗?安装时会先退出 YukiDesk。", "立即安装",
-                    okIsDefault: false)) return;
+                    okIsDefault: false))
+                {
+                    DeleteDownloadedInstaller(path);
+                    status?.Invoke("已取消安装。");
+                    return;
+                }
                 if (!InstallAndRestart(path))
+                {
+                    DeleteDownloadedInstaller(path);
+                    status?.Invoke("安装未启动。");
                     ConfirmDialog.Notice("更新未完成", "安装程序未能启动或已取消，YukiDesk 将继续运行。");
+                }
             }
             finally { Volatile.Write(ref _busy, 0); }
         }

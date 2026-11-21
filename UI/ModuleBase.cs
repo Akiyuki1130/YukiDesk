@@ -51,6 +51,7 @@ namespace DesktopBar.UI
 
         // 玻璃使用固定捕获纹理。开合时只更新对应当前屏幕矩形的采样坐标。
         private readonly Rectangle _panelGlass;
+        private readonly Rectangle _panelBackdropFade;
         private readonly Grid _panelSurface;
         private double _panelLeft, _panelTop, _panelWidth, _panelHeight;   // 未变换时的完整矩形(DIP)
         private bool _panelTracking;
@@ -91,8 +92,16 @@ namespace DesktopBar.UI
                 RadiusX = 16 * scale,
                 RadiusY = 16 * scale
             };
+            _panelBackdropFade = new Rectangle
+            {
+                IsHitTestVisible = false,
+                RadiusX = _panelGlass.RadiusX,
+                RadiusY = _panelGlass.RadiusY,
+                Visibility = Visibility.Collapsed
+            };
             _panelSurface = new Grid();
             _panelSurface.Children.Add(_panelGlass);
+            _panelSurface.Children.Add(_panelBackdropFade);
             _panelSurface.Children.Add(Panel);
             // 展开页内容异步加载完成(文件夹列表/回收站条目)时窗口会被 SizeToContent 撑大,
             // 这里必须重推采样矩形,否则玻璃还在按打开瞬间那块小区域采样,和面板错位。
@@ -518,7 +527,19 @@ namespace DesktopBar.UI
         public void ShowPanel()
         {
             if (_disposed || !HasPanel || !IsVisible || !IsLoaded) return;
-            if (ReferenceEquals(_active, this) && Open && !_closing) return;
+            if (ReferenceEquals(_active, this))
+            {
+                if (_closing)
+                {
+                    _closeTimer.Stop();
+                    Open = true;
+                    _closing = false;
+                    _animationVersion++;
+                    AnimatePanelOpen(App.Settings?.PillMaterial is 3 or 4);
+                    return;
+                }
+                if (Open) return;
+            }
             if (_active != null && !ReferenceEquals(_active, this)) _active.HidePanelImmediate();
             _active = this;
             Open = true;
@@ -560,6 +581,7 @@ namespace DesktopBar.UI
             _panelWidth = width;
             _panelHeight = height;
             bool glass = App.Settings?.PillMaterial is 3 or 4;
+            bool windowBackdrop = glass && App.Settings.ShowInScreenCapture;
             double offset = glass ? 5 : 8;
             _panelTransform = new TranslateTransform(0, (above ? offset : -offset) * Ui.Scale);
             _panelScale = glass ? new ScaleTransform(0.86, 0.90) : new ScaleTransform(0.52, 0.68);
@@ -580,36 +602,33 @@ namespace DesktopBar.UI
             {
                 if (revealed || openVersion != _animationVersion || !Open || _closing) return;
                 revealed = true;
-                if (glass)
-                {
-                    RefreshLivePanelRect();
-                    StartPanelTracking();
-                }
                 if (Environment.GetEnvironmentVariable("YUKI_PANEL_SHOWLOG") == "1")
                 {
                     App.Log($"面板显形 {GetType().Name} Effect={_panelGlass.Effect?.GetType().Name} Fill={_panelGlass.Fill}");
                 }
                 PanelWindow.Visibility = Visibility.Visible;
-                var duration = TimeSpan.FromMilliseconds(Math.Max(120, App.Settings?.AnimationDurationMs ?? 180));
-                IEasingFunction ease = glass ? new CubicEase { EasingMode = EasingMode.EaseOut }
-                    : new BackEase { EasingMode = EasingMode.EaseOut, Amplitude = 0.12 };
-                _panelTransform.BeginAnimation(TranslateTransform.YProperty, new DoubleAnimation(0, duration) { EasingFunction = ease });
-                _panelScale.BeginAnimation(ScaleTransform.ScaleXProperty, new DoubleAnimation(1, duration) { EasingFunction = ease });
-                _panelScale.BeginAnimation(ScaleTransform.ScaleYProperty, new DoubleAnimation(1, duration) { EasingFunction = ease });
-                var fade = new DoubleAnimation(1, duration) { EasingFunction = ease };
-                fade.Completed += (s, e) =>
-                {
-                    if (openVersion != _animationVersion || !Open) return;
-                    ClearPanelAnimations();
-                    RefreshLivePanelRect();
-                };
-                _panelSurface.BeginAnimation(OpacityProperty, fade);
+                AnimatePanelOpen(glass);
             }
 
             if (glass)
             {
-                // 在后台准备好首帧后再显形；采集不可用时用主题底色及时打开。
-                GlassService.StartLivePanel(Panel, _panelGlass, left, targetTop, width, height, Reveal);
+                if (windowBackdrop)
+                {
+                    // WGC walks the z-order below this HWND. Show it at zero opacity first so
+                    // the scan starts from its on-screen position in the topmost group.
+                    PanelWindow.Show();
+                    ApplyRoundRegion(PanelWindow);
+                }
+                GlassService.StartLivePanel(Panel, _panelGlass, left, targetTop, width, height, () =>
+                {
+                    if (_panelBackdropFade.Visibility == Visibility.Visible)
+                    {
+                        var fade = new DoubleAnimation(0, TimeSpan.FromMilliseconds(120));
+                        fade.Completed += (_, _) => ClearPanelBackdropFade();
+                        _panelBackdropFade.BeginAnimation(OpacityProperty, fade);
+                    }
+                    Reveal();
+                });
                 if (FileDropInteractionActive) GlassService.SetPanelCapturePaused(Panel, true);
                 if (!revealed) RevealOnTimeout();
             }
@@ -621,9 +640,49 @@ namespace DesktopBar.UI
 
             async void RevealOnTimeout()
             {
-                await System.Threading.Tasks.Task.Delay(90);
+                await System.Threading.Tasks.Task.Delay(windowBackdrop ? 180 : 90);
+                if (revealed || openVersion != _animationVersion || !Open || _closing) return;
+                if (windowBackdrop && _panelGlass.Fill is SolidColorBrush fallback)
+                {
+                    // Keep the visible fill over the live surface until its first frame arrives.
+                    _panelBackdropFade.Fill = fallback;
+                    _panelBackdropFade.Opacity = _panelGlass.Opacity;
+                    _panelBackdropFade.Visibility = Visibility.Visible;
+                    _panelGlass.Fill = Brushes.Transparent;
+                }
                 Reveal();
             }
+        }
+
+        private void ClearPanelBackdropFade()
+        {
+            _panelBackdropFade.Visibility = Visibility.Collapsed;
+            _panelBackdropFade.BeginAnimation(OpacityProperty, null);
+            _panelBackdropFade.Fill = null;
+        }
+
+        private void AnimatePanelOpen(bool glass)
+        {
+            if (glass)
+            {
+                RefreshLivePanelRect();
+                StartPanelTracking();
+            }
+            int animationVersion = _animationVersion;
+            var duration = TimeSpan.FromMilliseconds(Math.Max(120, App.Settings?.AnimationDurationMs ?? 180));
+            IEasingFunction ease = glass ? new CubicEase { EasingMode = EasingMode.EaseOut }
+                : new BackEase { EasingMode = EasingMode.EaseOut, Amplitude = 0.12 };
+            _panelTransform.BeginAnimation(TranslateTransform.YProperty, new DoubleAnimation(_panelTransform.Y, 0, duration) { EasingFunction = ease });
+            _panelScale.BeginAnimation(ScaleTransform.ScaleXProperty, new DoubleAnimation(_panelScale.ScaleX, 1, duration) { EasingFunction = ease });
+            _panelScale.BeginAnimation(ScaleTransform.ScaleYProperty, new DoubleAnimation(_panelScale.ScaleY, 1, duration) { EasingFunction = ease });
+            var fade = new DoubleAnimation(_panelSurface.Opacity, 1, duration) { EasingFunction = ease };
+            fade.Completed += (_, _) =>
+            {
+                if (animationVersion != _animationVersion || !Open) return;
+                ClearPanelAnimations();
+                RefreshLivePanelRect();
+            };
+            _panelSurface.BeginAnimation(OpacityProperty, fade);
         }
 
         /// <summary>
@@ -635,18 +694,18 @@ namespace DesktopBar.UI
         {
             if (_panelScale != null)
             {
-                _panelScale.BeginAnimation(ScaleTransform.ScaleXProperty, null);
-                _panelScale.BeginAnimation(ScaleTransform.ScaleYProperty, null);
                 _panelScale.ScaleX = 1;
                 _panelScale.ScaleY = 1;
+                _panelScale.BeginAnimation(ScaleTransform.ScaleXProperty, null);
+                _panelScale.BeginAnimation(ScaleTransform.ScaleYProperty, null);
             }
             if (_panelTransform != null)
             {
-                _panelTransform.BeginAnimation(TranslateTransform.YProperty, null);
                 _panelTransform.Y = 0;
+                _panelTransform.BeginAnimation(TranslateTransform.YProperty, null);
             }
-            _panelSurface.BeginAnimation(OpacityProperty, null);
             _panelSurface.Opacity = 1;
+            _panelSurface.BeginAnimation(OpacityProperty, null);
         }
 
         private void StartPanelTracking()
@@ -726,7 +785,7 @@ namespace DesktopBar.UI
         private void HidePanelAnimated()
         {
             if (!Open || _closing) return;
-            if (!PanelWindow.IsVisible)
+            if (!PanelWindow.IsVisible || _panelSurface.Opacity == 0)
             {
                 ClosePanelImmediately();
                 return;
@@ -784,6 +843,7 @@ namespace DesktopBar.UI
             // 若基值留 1,重新打开的第一帧就会是「满尺寸、全不透明」的旧画面(闪一下)。
             _panelSurface.Opacity = 0;
             StopPanelTracking();
+            ClearPanelBackdropFade();
             GlassService.StopLivePanel(Panel);
             PanelWindow.Visibility = Visibility.Hidden;
             Panel.Visibility = Visibility.Collapsed;

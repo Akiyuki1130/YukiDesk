@@ -101,6 +101,7 @@ namespace DesktopBar.UI
             if (CaptureHotkey != null) CaptureHotkey(_hotkey);
             else
             {
+                if (!IsRaised && _bar.IsVisible && !_bar.IsAnyCapsuleCovered(hwnd)) return IntPtr.Zero;
                 _hotkeyAfterShowMs = App.Settings.RevealDurationSeconds * 1000;
                 Raise();
                 if (IsRaised && !_preparing && !_showing) StartHotkeyCountdown();
