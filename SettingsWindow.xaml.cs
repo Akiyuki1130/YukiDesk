@@ -10,6 +10,7 @@ using System.Windows.Controls.Primitives;
 using System.Windows.Documents;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
+using System.Windows.Media.Imaging;
 using System.Windows.Data;
 using System.Windows.Threading;
 using Microsoft.Win32;
@@ -70,7 +71,7 @@ namespace DesktopBar
             ["Folders"] = "小文件夹 文件 目录 位置 存储 创建 排序 重命名 资源管理器 定位",
             ["Modules"] = "模块显示 性能 监测 GPU CPU 内存 网络速率 CPU温度 GPU温度 音乐 音量 频谱 回收站",
             ["General"] = "通用 开机自启 启动 登录 动画时长 悬停关闭 桌面空间 预留 数据 配置 日志 顶栏唤出 鼠标触顶 触顶停留 置顶 全局快捷键 快捷键停留 停留时长 玻璃取景 逐窗口采样 截图 录屏 屏幕共享 远程控制",
-            ["About"] = "关于 版本 软件更新 检查更新 下载 GitHub"
+            ["About"] = "关于 版本 软件更新 检查更新 下载 GitHub 开发者 协助者 头像 Akiyuki1130 OneCat2015"
         };
 
         private void Search_TextChanged(object sender, TextChangedEventArgs e)
@@ -1592,6 +1593,14 @@ namespace DesktopBar
             ghBtn.Click += (s, e) => NativeMethods.ShellExecuteOpen("https://github.com/Akiyuki1130/YukiDesk");
             ab.Children.Add(Row("项目主页", ghBtn));
             ab.Children.Add(MakeHint("github.com/Akiyuki1130/YukiDesk\n如果 YukiDesk 对你有帮助,欢迎去点一个 Star。"));
+            var contributors = new UniformGrid { Columns = 2, Margin = new Thickness(0, 14, 0, 0) };
+            var developer = GitHubProfileButton("开发者", "Akiyuki1130");
+            developer.Margin = new Thickness(0, 0, 5, 0);
+            contributors.Children.Add(developer);
+            var collaborator = GitHubProfileButton("协助者", "OneCat2015");
+            collaborator.Margin = new Thickness(5, 0, 0, 0);
+            contributors.Children.Add(collaborator);
+            ab.Children.Add(contributors);
             AboutHost.Children.Add(about);
 
             var upd = Card("软件更新",
@@ -1619,6 +1628,56 @@ namespace DesktopBar
             ub.Children.Add(MakeHint("「自动下载更新」需要开启「自动检查更新」;下载完成后会先询问,确认后才安装。" +
                                      "安装新版本时会退出 YukiDesk 并启动安装程序,设置与小文件夹不会丢失。", 14));
             AboutHost.Children.Add(upd);
+        }
+
+        private Button GitHubProfileButton(string role, string login)
+        {
+            string profile = $"https://github.com/{login}";
+            var avatarUri = new Uri($"pack://application:,,,/YukiDesk;component/Assets/Contributors/{login}.png");
+            var avatar = new System.Windows.Shapes.Ellipse
+            {
+                Width = 38,
+                Height = 38,
+                Margin = new Thickness(0, 0, 10, 0),
+                Fill = new ImageBrush(new BitmapImage(avatarUri)) { Stretch = Stretch.UniformToFill }
+            };
+            var roleText = new TextBlock { Text = role, FontSize = 12 };
+            roleText.SetResourceReference(TextElement.ForegroundProperty, "SettingsSubTextBrush");
+            var labels = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
+            labels.Children.Add(roleText);
+            labels.Children.Add(new TextBlock { Text = login, FontSize = 14, FontWeight = FontWeights.Medium });
+
+            var arrow = new System.Windows.Shapes.Path
+            {
+                Data = Geometry.Parse("M 1,9 L 9,1 M 4,1 L 9,1 L 9,6"),
+                Width = 12,
+                Height = 12,
+                Margin = new Thickness(8, 0, 0, 0),
+                Stretch = Stretch.Uniform,
+                StrokeThickness = 1.4,
+                StrokeStartLineCap = PenLineCap.Round,
+                StrokeEndLineCap = PenLineCap.Round,
+                StrokeLineJoin = PenLineJoin.Round,
+                VerticalAlignment = VerticalAlignment.Center,
+            };
+            arrow.SetResourceReference(System.Windows.Shapes.Shape.StrokeProperty, "SettingsAccent");
+            var content = new DockPanel();
+            DockPanel.SetDock(avatar, Dock.Left);
+            DockPanel.SetDock(arrow, Dock.Right);
+            content.Children.Add(avatar);
+            content.Children.Add(arrow);
+            content.Children.Add(labels);
+            var button = new Button
+            {
+                Content = content,
+                HorizontalContentAlignment = HorizontalAlignment.Stretch,
+                Padding = new Thickness(12, 7, 12, 7),
+                Style = (Style)FindResource("Btn"),
+                ToolTip = profile
+            };
+            System.Windows.Automation.AutomationProperties.SetName(button, $"{role} {login}，打开 GitHub 主页");
+            button.Click += (_, _) => NativeMethods.ShellExecuteOpen(profile);
+            return button;
         }
 
         private void SetUpdateStatus(string text)

@@ -11,9 +11,9 @@
     <ApplicationIcon>Assets\YukiDesk.ico</ApplicationIcon>
     <RootNamespace>DesktopBar</RootNamespace>
     <UseWindowsForms>true</UseWindowsForms>
-    <Version>2.1.1</Version>
-    <FileVersion>2.1.1.0</FileVersion>
-    <InformationalVersion>2.1.1</InformationalVersion>
+    <Version>2.1.2</Version>
+    <FileVersion>2.1.2.0</FileVersion>
+    <InformationalVersion>2.1.2</InformationalVersion>
     <RuntimeIdentifiers>win-x64;win-arm64</RuntimeIdentifiers>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
     <DebugType>embedded</DebugType>
@@ -24,6 +24,7 @@
   <ItemGroup>
     <!-- AMD Zen SMN 读取模块(LGPL-2.1,取自 LibreHardwareMonitor 资源,由 PawnIO 官方签名),供 PawnIoTctl 加载 -->
     <EmbeddedResource Include="Resources\PawnIo\AMDFamily17.bin" />
+    <Resource Include="Assets\Contributors\*.png" />
     <None Update="Assets\Fonts\ResourceHanRoundedSC-*.ttf;Assets\Fonts\ResourceHanRounded-OFL.txt"
           CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
