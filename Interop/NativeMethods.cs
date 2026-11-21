@@ -52,6 +52,36 @@ namespace DesktopBar.Interop
         private const uint SWP_NOSIZE = 0x0001, SWP_NOMOVE = 0x0002, SWP_NOZORDER = 0x0004, SWP_NOACTIVATE = 0x0010;
         private const uint SWP_SHOWWINDOW = 0x0040;
 
+        internal const int WM_HOTKEY = 0x0312;
+        internal const uint MOD_NOREPEAT = 0x4000;
+
+        [DllImport("user32.dll", SetLastError = true)]
+        internal static extern bool RegisterHotKey(IntPtr hwnd, int id, uint modifiers, uint key);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        internal static extern bool UnregisterHotKey(IntPtr hwnd, int id);
+
+        [DllImport("user32.dll")]
+        private static extern bool GetPhysicalCursorPos(out POINT point);
+
+        [DllImport("user32.dll")]
+        private static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
+
+        internal static bool TryGetCursorPosition(out int x, out int y)
+        {
+            bool ok = GetPhysicalCursorPos(out var point);
+            x = point.X;
+            y = point.Y;
+            return ok;
+        }
+
+        internal static int WindowBottom(IntPtr hwnd)
+            => GetWindowRect(hwnd, out var rect) ? rect.Bottom : 0;
+
+        internal static bool SetWindowTopmost(IntPtr hwnd, bool topmost)
+            => SetWindowPos(hwnd, new IntPtr(topmost ? -1 : -2), 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+
         public static IntPtr FindDesktopHost() => FindWindowW("Progman", null);
 
         /// <summary>加工具窗口 + 不激活扩展样式:点击顶栏不会抢焦点、不会跳到前台。</summary>
@@ -218,22 +248,8 @@ namespace DesktopBar.Interop
             keybd_event(vk, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, UIntPtr.Zero);
         }
 
-        // ---------- 回收站 ----------
-        private const uint SHERB_NOCONFIRMATION = 0x1;
-        private const uint SHERB_NOPROGRESSUI = 0x2;
-        private const uint SHERB_NOSOUND = 0x4;
-        /// <summary>空桶调用 SHEmptyRecycleBin 的已知返回值,实际无事发生,不应报错。</summary>
-        public const int E_UNEXPECTED = unchecked((int)0x8000FFFF);
-
         [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
-        private static extern int SHEmptyRecycleBin(IntPtr hwnd, string root, uint flags);
-
-        /// <summary>清空所有盘的回收站；确认与提示音由应用自行处理，成功返回 0。</summary>
-        public static int EmptyRecycleBin()
-            => SHEmptyRecycleBin(IntPtr.Zero, null, SHERB_NOCONFIRMATION | SHERB_NOPROGRESSUI | SHERB_NOSOUND);
-
-        [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
-        private static extern int SHParseDisplayName(string pszName, IntPtr pbc, out IntPtr ppidl, uint sfgaoIn, out uint psfgaoOut);
+        internal static extern int SHParseDisplayName(string pszName, IntPtr pbc, out IntPtr ppidl, uint sfgaoIn, out uint psfgaoOut);
 
         [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
         private static extern IntPtr ShellExecuteW(IntPtr hwnd, string verb, string file, string args, string dir, int show);
@@ -263,63 +279,20 @@ namespace DesktopBar.Interop
         [DllImport("shell32.dll")]
         private static extern int SHOpenFolderAndSelectItems(IntPtr pidlFolder, uint cidl, IntPtr[] apidl, uint flags);
 
-        /// <summary>在资源管理器中打开一个 Shell 命名空间路径（如回收站 CLSID）；成功返回 0。</summary>
-        public static int OpenShellNamespace(string parsingName)
+        internal static bool SelectItemInExplorer(string path)
         {
-            if (SHParseDisplayName(parsingName, IntPtr.Zero, out IntPtr pidl, 0, out _) != 0 || pidl == IntPtr.Zero)
-                return unchecked((int)0x8000FFFF);
+            if (string.IsNullOrWhiteSpace(path)
+                || SHParseDisplayName(path, IntPtr.Zero, out IntPtr pidl, 0, out _) < 0 || pidl == IntPtr.Zero)
+                return false;
             try
             {
-                return SHOpenFolderAndSelectItems(pidl, 0, null, 0);
+                return SHOpenFolderAndSelectItems(pidl, 0, null, 0) >= 0;
             }
             finally
             {
                 Marshal.FreeCoTaskMem(pidl);
             }
         }
-
-        private const uint FO_DELETE = 3;
-        private const ushort FOF_SILENT = 0x4;
-        private const ushort FOF_NOCONFIRMATION = 0x10;
-        private const ushort FOF_ALLOWUNDO = 0x40;
-
-        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-        private struct SHFILEOPSTRUCT
-        {
-            public IntPtr hwnd;
-            public uint func;
-            public string pFrom;
-            public string pTo;
-            public ushort fFlags;
-            public bool fAnyOperationsAborted;
-            public IntPtr hNameMappings;
-            public string lpszProgressTitle;
-        }
-
-        [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
-        private static extern int SHFileOperation(ref SHFILEOPSTRUCT op);
-
-        /// <summary>把文件/文件夹移入系统回收站（带撤销信息）；confirm 由应用自行弹出。</summary>
-        public static bool DeleteToRecycleBin(string[] paths)
-        {
-            if (paths == null || paths.Length == 0) return false;
-            var op = new SHFILEOPSTRUCT
-            {
-                func = FO_DELETE,
-                // pFrom 必须以双 \0 结尾：每项由封送器补一个终结符，这里再显式补一个。
-                pFrom = string.Join("\0", paths) + "\0",
-                fFlags = (ushort)(FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT)
-            };
-            return SHFileOperation(ref op) == 0 && !op.fAnyOperationsAborted;
-        }
-
-        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-        private static extern bool CreateHardLinkW(string fileName, string existingFileName, IntPtr securityAttributes);
-
-        /// <summary>为文件创建硬链接（同卷瞬时零拷贝）；失败返回 false（跨卷/不支持时）。</summary>
-        public static bool CreateHardLink(string linkPath, string targetPath)
-            => CreateHardLinkW(linkPath, targetPath, IntPtr.Zero);
-
 
         // ---------- Shell 图标 ----------
         private const uint SHGFI_ICON = 0x100;
@@ -653,6 +626,12 @@ namespace DesktopBar.Interop
                 return root == IntPtr.Zero ? h : root;
             }
             catch { return IntPtr.Zero; }
+        }
+
+        internal static bool IsCoveredByApplication(IntPtr hwnd, int x, int y)
+        {
+            var root = RootWindowAt(x, y);
+            return root != IntPtr.Zero && root != hwnd && !IsDesktopDecoration(root);
         }
 
         /// <summary>窗口类名(遮挡探测判定桌面层窗口用)。</summary>

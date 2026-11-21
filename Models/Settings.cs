@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using System.IO;
+using System.Windows.Input;
 
 namespace DesktopBar.Models
 {
@@ -15,6 +16,10 @@ namespace DesktopBar.Models
 
     public class AppSettings
     {
+        internal const int MaxRevealEdgeDwellMs = 1500;
+        internal const int MinRevealDurationSeconds = 1;
+        internal const int MaxRevealDurationSeconds = 30;
+
         // 迁移版本用可空 int:旧配置没有该字段时反序列化得到 null(而不是 2),
         // 迁移门 `null 或 < 2` 才真的会对旧配置执行一次;写回时已固化为 2。
         public int? SchemaVersion { get; set; }
@@ -36,6 +41,7 @@ namespace DesktopBar.Models
         public bool? FollowCapsuleBackground { get; set; }
         public int HoverCloseDelayMs { get; set; } = 250;
         public int AnimationDurationMs { get; set; } = 180;
+        public bool ShowInScreenCapture { get; set; } = true;
 
         // ---- 胶囊材质(自绘云母 / Mica) ----
         // 云母本质是"壁纸模糊 + 亮度压带 + 主题染色 + 细噪点",只依赖壁纸不依赖背后窗口,
@@ -74,10 +80,7 @@ namespace DesktopBar.Models
         public double AcrylicNoise { get; set; } = 0.05;
 
         // ---- 胶囊材质(实时背景玻璃 / Glass, PillMaterial=3) ----
-        // 与云母"只采样壁纸一次性烘焙"不同,玻璃每帧捕获顶栏背后的真实屏幕内容
-        // (窗口+桌面图标+壁纸),高斯模糊后按胶囊并集铺在主窗口最底层——
-        // Apple/小米式真·毛玻璃。自己的窗口用 WDA_EXCLUDEFROMCAPTURE 排除自拍;
-        // 静止桌面经降采样差分门控,0 写屏。
+        // 截图兼容模式合成背后的可采集窗口和壁纸。整屏模式排除自家窗口，避免反馈。
         /// <summary>玻璃整体不透明度(玻璃层 Image 的 Opacity)。</summary>
         public double GlassOpacity { get; set; } = 1.00;
         /// <summary>玻璃高斯模糊半径(DIP,BlurEffect.Radius 按显示器 DPI 换算)。越大越糊、逐帧成本越高。</summary>
@@ -128,6 +131,12 @@ namespace DesktopBar.Models
 
         // 桌面与通用
         public bool AutoStart { get; set; } = false;
+        public bool RevealOnTopEdge { get; set; }
+        public int RevealEdgeDwellMs { get; set; } = 110;
+        public bool RevealWithHotkey { get; set; }
+        public Key RevealHotkeyKey { get; set; } = Key.Y;
+        public ModifierKeys RevealHotkeyModifiers { get; set; } = ModifierKeys.Control | ModifierKeys.Alt;
+        public int RevealDurationSeconds { get; set; } = 5;
         public bool ReserveDesktopSpace { get; set; } = false;
         public int DesktopSpaceHeight { get; set; } = 46;
         public bool ShowPower { get; set; } = true;

@@ -1,5 +1,8 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Interop;
@@ -27,6 +30,13 @@ namespace DesktopBar
         private readonly List<ModuleBase> _modules = new List<ModuleBase>();
         private readonly List<ModuleBase> _folderModules = new List<ModuleBase>();
         private readonly DispatcherTimer _pinTimer;
+        private readonly BarRevealController _reveal;
+        private readonly DispatcherTimer _folderRefresh;
+        private FileSystemWatcher _folderRootWatcher;
+        private string _folderRoot;
+        private int _folderScanVersion;
+        private StackPanel _folderStrip;
+        internal event Action FolderCatalogChanged;
         private MediaService _media;
         private Action<MediaInfo> _mediaHandler;
         private Action _mediaLost;
@@ -40,6 +50,13 @@ namespace DesktopBar
 
         public MainWindow()
         {
+            _reveal = new BarRevealController(this);
+            _folderRefresh = new DispatcherTimer(DispatcherPriority.Background, Dispatcher);
+            _folderRefresh.Tick += (_, _) =>
+            {
+                _folderRefresh.Stop();
+                _ = RefreshFolderCatalogAsync();
+            };
             FontFamily = Ui.TextFont;
             Bar = this;   // 全局单例:MicaService/GlassService/自检都靠它拿"当前顶栏",
                           // 这里漏赋值过一次,导致液态玻璃几何换算永远拿到 null 而静默不生效。
@@ -62,9 +79,10 @@ namespace DesktopBar
                 var handle = new WindowInteropHelper(this).Handle;
                 NativeMethods.ApplyNoActivateToolStyle(handle);
                 NativeMethods.EnsureShown(handle);
-                // 玻璃材质需要把主窗排除出屏幕捕获,否则会把顶栏自己拍进去(正反馈)。
-                // 未启用玻璃时服务内部只登记不设置,材质切到玻璃时统一生效。
+                // 登记窗口，由玻璃服务按照当前截图兼容设置决定是否排除。
                 GlassService.RegisterWindow(handle);
+                GlassService.SetBarWindow(handle);
+                _reveal.Attach(handle);
                 App.Log("YukiDesk 主窗口句柄=" + handle + " 尺寸=" + ActualWidth + "x" + ActualHeight);
             };
 
@@ -98,6 +116,9 @@ namespace DesktopBar
                 _closing = true;
                 _layoutVersion++;
                 _pinTimer.Stop();
+                _folderRefresh.Stop();
+                _folderRootWatcher?.Dispose();
+                _reveal.Dispose();
                 Microsoft.Win32.SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;
                 DisposeModules();
                 try { _media?.Dispose(); } catch { }
@@ -123,10 +144,38 @@ namespace DesktopBar
             }));
         }
 
-        private void PinToDesktopLayer()
+        internal void PinToDesktopLayer()
         {
+            if (_reveal.IsRaised) return;
             var hwnd = new WindowInteropHelper(this).Handle;
             if (hwnd != IntPtr.Zero) NativeMethods.PinAboveDesktop(hwnd);
+        }
+
+        internal bool HasRevealInteraction => IsMouseOver || IsMouseCaptureWithin || ModuleBase.ActivePanelKeepsBarRevealed;
+
+        internal bool IsAnyCapsuleCovered(IntPtr hwnd)
+        {
+            int screenWidth = NativeMethods.ScreenWidth();
+            foreach (var module in _modules)
+            {
+                var pill = module.Pill;
+                if (!pill.IsVisible || pill.ActualWidth < 1 || pill.ActualHeight < 1) continue;
+                var center = pill.PointToScreen(new Point(pill.ActualWidth / 2, pill.ActualHeight / 2));
+                if (center.X >= 0 && center.X < screenWidth
+                    && NativeMethods.IsCoveredByApplication(hwnd, (int)center.X, (int)center.Y)) return true;
+            }
+            return false;
+        }
+
+        internal bool RevealHotkeyRegistered => _reveal.IsHotkeyRegistered;
+        internal void SetEdgeReveal(bool enabled) => _reveal.SetEdgeEnabled(enabled);
+        internal bool TrySetRevealHotkey(bool enabled, BarHotkey shortcut) => _reveal.TrySetHotkey(enabled, shortcut);
+        internal void CaptureRevealHotkey(Action<BarHotkey> capture) => _reveal.CaptureHotkey = capture;
+
+        internal void ShowForReveal()
+        {
+            base.Show();
+            GlassService.SetActive(true);
         }
 
         public void ApplySettings()
@@ -148,7 +197,7 @@ namespace DesktopBar
 
             var root = new Grid();
 
-            // 实时玻璃层放在最底(背景条之下):Image+BlurEffect 承载捕获条带,
+            // 玻璃层放在最底(背景条之下):Image 承载壁纸或捕获条带,
             // Clip=胶囊并集保证胶囊外 alpha=0、点击照常穿透桌面。元素由服务缓存,
             // 全量重建时复用同一块 WriteableBitmap,避免重建瞬间玻璃空一帧。
             var glassHost = GlassService.EnsureHost();
@@ -198,15 +247,10 @@ namespace DesktopBar
             _modules.Add(_recycle);
             left.Children.Add(_recycle);
 
-            // 小文件夹
-            _folderModules.Clear();
-            foreach (var name in S.Folders)
-            {
-                var fm = new FolderModule(name, S.Folder);
-                _folderModules.Add(fm);
-                _modules.Add(fm);
-                left.Children.Add(fm);
-            }
+            _folderStrip = new StackPanel { Orientation = Orientation.Horizontal };
+            left.Children.Add(_folderStrip);
+            ApplyFolderOrder();
+            WatchFolderRoot();
 
             // 时间:靠右时跟随右侧内容,居中时覆盖完整顶栏宽度。
             var clock = new ClockModule(S.Clock);
@@ -275,6 +319,116 @@ namespace DesktopBar
                 else
                     DesktopSpaceService.Apply(S);
             }));
+        }
+
+        internal void ApplyFolderOrder()
+        {
+            foreach (var module in _folderModules)
+            {
+                module.Dispose();
+                _modules.Remove(module);
+            }
+            _folderModules.Clear();
+            if (_folderStrip == null) return;
+            _folderStrip.Children.Clear();
+            foreach (var name in S.Folders)
+            {
+                var folder = new FolderModule(name, S.Folder);
+                _folderModules.Add(folder);
+                _modules.Add(folder);
+                _folderStrip.Children.Add(folder);
+                SetModuleVisibility(folder, S.ShowFolders);
+            }
+        }
+
+        private void WatchFolderRoot()
+        {
+            if (string.Equals(_folderRoot, S.StorageRoot, StringComparison.OrdinalIgnoreCase)) return;
+            _folderRoot = S.StorageRoot;
+            _folderRefresh.Stop();
+            _folderRootWatcher?.Dispose();
+            _folderRootWatcher = null;
+            _ = RefreshFolderCatalogAsync();
+        }
+
+        private async Task RefreshFolderCatalogAsync()
+        {
+            string root = _folderRoot;
+            int version = ++_folderScanVersion;
+            bool needsWatcher = _folderRootWatcher == null;
+            var (names, watcher) = await Task.Run(() => ReadFolderCatalog(root, needsWatcher));
+            if (_closing || version != _folderScanVersion || !string.Equals(root, S.StorageRoot, StringComparison.OrdinalIgnoreCase))
+            {
+                watcher?.Dispose();
+                return;
+            }
+            _folderRootWatcher ??= watcher;
+            if (names == null)
+            {
+                _folderRootWatcher?.Dispose();
+                _folderRootWatcher = null;
+                ScheduleFolderRefresh(TimeSpan.FromSeconds(3));
+                return;
+            }
+            if (_folderRootWatcher == null) ScheduleFolderRefresh(TimeSpan.FromSeconds(3));
+            var order = MiniFolderCatalog.Reconcile(S.Folders, names);
+            if (S.Folders.SequenceEqual(order, StringComparer.Ordinal)) return;
+            S.Folders = order;
+            ApplyFolderOrder();
+            FolderCatalogChanged?.Invoke();
+        }
+
+        private (string[] Names, FileSystemWatcher Watcher) ReadFolderCatalog(string root, bool needsWatcher)
+        {
+            FileSystemWatcher watcher = null;
+            if (needsWatcher)
+            {
+                try
+                {
+                    watcher = new FileSystemWatcher(root) { NotifyFilter = NotifyFilters.DirectoryName };
+                    watcher.Created += CatalogChanged;
+                    watcher.Deleted += CatalogChanged;
+                    watcher.Renamed += CatalogChanged;
+                    watcher.Error += (_, _) => CatalogChanged(watcher, null);
+                    watcher.EnableRaisingEvents = true;
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or InvalidOperationException)
+                {
+                    watcher?.Dispose();
+                    watcher = null;
+                }
+            }
+            try
+            {
+                return (MiniFolderCatalog.ReadNames(root), watcher);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+            {
+                watcher?.Dispose();
+                return (null, null);
+            }
+        }
+
+        private void CatalogChanged(object sender, FileSystemEventArgs args)
+        {
+            var watcher = (FileSystemWatcher)sender;
+            Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() =>
+            {
+                if (_closing || !string.Equals(_folderRoot, watcher.Path, StringComparison.OrdinalIgnoreCase)) return;
+                if (args == null && ReferenceEquals(watcher, _folderRootWatcher))
+                {
+                    _folderRootWatcher.Dispose();
+                    _folderRootWatcher = null;
+                }
+                ScheduleFolderRefresh(TimeSpan.FromMilliseconds(300));
+            }));
+        }
+
+        private void ScheduleFolderRefresh(TimeSpan delay)
+        {
+            _folderRefresh.Stop();
+            _folderRefresh.Interval = delay;
+            _folderRefresh.Start();
         }
 
         private List<(ModuleBase Module, Rect Bounds)> _glassPills = new();
@@ -420,8 +574,10 @@ namespace DesktopBar
         public void HideWithPanels()
         {
             ClosePanels();
+            _reveal.Reset();
             _pinTimer.Stop();
             Hide();
+            Opacity = 1;
             GlassService.SetActive(false);
         }
 
@@ -488,6 +644,7 @@ namespace DesktopBar
             };
             _media.Updated += _mediaHandler;
             _media.SessionLost += _mediaLost;
+            _mediaHandler(_media.Current);
         }
     }
 }

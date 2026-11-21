@@ -1,10 +1,8 @@
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
-using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
@@ -163,58 +161,88 @@ namespace DesktopBar.UI
     {
         private readonly Image _smallImg, _bigImg;
         private readonly MarqueeText _pillMarquee, _panelMarquee;
-        private readonly TextBlock _tArtist, _playGlyph, _placeholderGlyph;
-        private string _mediaKey = "";
-        private long _lastMediaGeneration;
+        private readonly TextBlock _tArtist, _playGlyph;
+        private readonly TrackTransition _pillTransition, _panelTransition;
+        private string _trackKey = "", _thumbnailKey = "";
+        private long _lastMediaGeneration = -1;
+        private long _skipExpiresAt;
+        private int _skipDirection;
         private string _lastTitle = "暂无音乐";
         public MusicModule(TabStyle st) : base(st)
         {
-            var coverHost = new Grid { Width = 26 * Ui.Scale, Height = 26 * Ui.Scale };
-            _placeholderGlyph = Glyph("♫", 14);
-            _placeholderGlyph.Width = 26 * Ui.Scale;
-            _placeholderGlyph.Height = 26 * Ui.Scale;
-            _placeholderGlyph.HorizontalAlignment = HorizontalAlignment.Center;
-            _placeholderGlyph.VerticalAlignment = VerticalAlignment.Center;
-            coverHost.Children.Add(_placeholderGlyph);
-            _smallImg = new Image { Width = 26 * Ui.Scale, Height = 26 * Ui.Scale, Stretch = Stretch.UniformToFill }; coverHost.Children.Add(_smallImg);
-            var coverBorder = new Border { Width = 26 * Ui.Scale, Height = 26 * Ui.Scale, CornerRadius = new CornerRadius(7 * Ui.Scale), Child = coverHost, VerticalAlignment = VerticalAlignment.Center }; coverBorder.Clip = new RectangleGeometry(new Rect(0, 0, 26 * Ui.Scale, 26 * Ui.Scale), 7 * Ui.Scale, 7 * Ui.Scale);
+            var coverBorder = BuildCover(26, 7, 14, out _smallImg);
             // 歌名超宽时在药丸内滚动；未超宽时药丸收缩到内容宽度。
             _pillMarquee = new MarqueeText(MakePillText("暂无音乐"), 150 * Ui.Scale, 20 * Ui.Scale, hug: true);
             _pillMarquee.Margin = new Thickness(8 * Ui.Scale, 0, 0, 0);
-            var pillSp = new StackPanel { Orientation = Orientation.Horizontal }; pillSp.Children.Add(coverBorder); pillSp.Children.Add(_pillMarquee); Pill.Child = pillSp;
+            var pillContent = new StackPanel { Orientation = Orientation.Horizontal };
+            pillContent.Children.Add(coverBorder);
+            pillContent.Children.Add(_pillMarquee);
+            _pillTransition = new TrackTransition(pillContent);
+            Pill.Child = _pillTransition;
 
-            _bigImg = new Image { Width = 96 * Ui.Scale, Height = 96 * Ui.Scale, Stretch = Stretch.UniformToFill };
-            var bigCover = new Border
-            {
-                Width = 96 * Ui.Scale,
-                Height = 96 * Ui.Scale,
-                CornerRadius = new CornerRadius(14 * Ui.Scale),
-                Child = _bigImg,
-                HorizontalAlignment = HorizontalAlignment.Center
-            };
+            var bigCover = BuildCover(96, 14, 30, out _bigImg);
             bigCover.SetResourceReference(Border.BackgroundProperty, "ThemePanelSubtle");
-            bigCover.Clip = new RectangleGeometry(new Rect(0, 0, 96 * Ui.Scale, 96 * Ui.Scale), 14 * Ui.Scale, 14 * Ui.Scale);
             // 展开页歌名同样滚动；超宽前保持居中。宽度 = 面板 300 - 内边距 24 - 标题左右边距 8。
             _panelMarquee = new MarqueeText(MakeText("暂无音乐", 2), 268 * Ui.Scale, 24 * Ui.Scale, hug: false);
+            _panelMarquee.Margin = new Thickness(4 * Ui.Scale, 12 * Ui.Scale, 4 * Ui.Scale, 0);
             _pillMarquee.SetText("暂无音乐");
             _panelMarquee.SetText("暂无音乐");
-            _tArtist = MakeText(""); _tArtist.TextAlignment = TextAlignment.Center;
-            var btnRow = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 14 * Ui.Scale, 0, 0) }; btnRow.Children.Add(ShellButton(Glyph("⏮", 19), () => NativeMethods.SendMediaKey(NativeMethods.VK_MEDIA_PREV))); _playGlyph = Glyph("▶", 19); btnRow.Children.Add(ShellButton(_playGlyph, () => NativeMethods.SendMediaKey(NativeMethods.VK_MEDIA_PLAY_PAUSE))); btnRow.Children.Add(ShellButton(Glyph("⏭", 19), () => NativeMethods.SendMediaKey(NativeMethods.VK_MEDIA_NEXT)));
-            var body = new StackPanel { Width = 300 * Ui.Scale }; body.Children.Add(bigCover); _panelMarquee.Margin = new Thickness(4 * Ui.Scale, 12 * Ui.Scale, 4 * Ui.Scale, 0); body.Children.Add(_panelMarquee); _tArtist.Margin = new Thickness(4 * Ui.Scale, 4 * Ui.Scale, 4 * Ui.Scale, 0); body.Children.Add(_tArtist); body.Children.Add(btnRow); Panel.Child = body;
+            _tArtist = MakeText("");
+            _tArtist.TextAlignment = TextAlignment.Center;
+            _tArtist.Margin = new Thickness(4 * Ui.Scale, 4 * Ui.Scale, 4 * Ui.Scale, 0);
+            var panelTrack = new StackPanel();
+            panelTrack.Children.Add(bigCover);
+            panelTrack.Children.Add(_panelMarquee);
+            panelTrack.Children.Add(_tArtist);
+            _panelTransition = new TrackTransition(panelTrack);
+
+            var buttons = new StackPanel
+            {
+                Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center,
+                Margin = new Thickness(0, 14 * Ui.Scale, 0, 0)
+            };
+            buttons.Children.Add(ShellButton(Glyph("⏮", 19), () => Skip(-1), pressFeedback: true));
+            _playGlyph = Glyph("▶", 19);
+            buttons.Children.Add(ShellButton(_playGlyph, () => NativeMethods.SendMediaKey(NativeMethods.VK_MEDIA_PLAY_PAUSE)));
+            buttons.Children.Add(ShellButton(Glyph("⏭", 19), () => Skip(1), pressFeedback: true));
+            var body = new StackPanel { Width = 300 * Ui.Scale };
+            body.Children.Add(_panelTransition);
+            body.Children.Add(buttons);
+            Panel.Child = body;
+        }
+
+        private Border BuildCover(double size, double radius, double glyphSize, out Image image)
+        {
+            double width = size * Ui.Scale, corner = radius * Ui.Scale;
+            image = new Image { Stretch = Stretch.UniformToFill };
+            var host = new Grid();
+            host.Children.Add(Glyph("♫", glyphSize));
+            host.Children.Add(image);
+            return new Border
+            {
+                Width = width, Height = width, CornerRadius = new CornerRadius(corner), Child = host,
+                HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center,
+                Clip = new RectangleGeometry(new Rect(0, 0, width, width), corner, corner)
+            };
+        }
+
+        private void Skip(int direction)
+        {
+            _skipDirection = direction;
+            _skipExpiresAt = Environment.TickCount64 + 3000;
+            NativeMethods.SendMediaKey(direction < 0 ? NativeMethods.VK_MEDIA_PREV : NativeMethods.VK_MEDIA_NEXT);
         }
 
         public void Update(MediaInfo info)
         {
-            if (info == null || info.Generation < _lastMediaGeneration) return;
+            if (info == null || info.Generation <= _lastMediaGeneration) return;
             _lastMediaGeneration = info.Generation;
+            if (info.HasSession && info.TrackKey.Length == 0) return;
 
-            string key = (info.TrackKey ?? "") + "|" + (info.ThumbnailKey ?? "");
-            if (!string.Equals(key, _mediaKey, StringComparison.Ordinal))
-            {
-                _mediaKey = key;
-                _smallImg.Source = null;
-                _bigImg.Source = null;
-            }
+            bool trackChanged = !string.Equals(_trackKey, info.TrackKey, StringComparison.Ordinal);
+            bool animateTrack = trackChanged && _trackKey.Length != 0 && info.HasSession;
+            var outgoingPill = animateTrack ? _pillTransition.Snapshot() : null;
+            var outgoingPanel = animateTrack ? _panelTransition.Snapshot() : null;
 
             string title = string.IsNullOrEmpty(info.Title) ? "暂无音乐" : info.Title;
             if (!string.Equals(title, _lastTitle, StringComparison.Ordinal))
@@ -224,10 +252,115 @@ namespace DesktopBar.UI
                 _panelMarquee.SetText(title);
             }
 
-            _tArtist.Text = info.Artist ?? "";
-            _smallImg.Source = info.Cover;
-            _bigImg.Source = info.Cover;
-            _playGlyph.Text = info.Playing ? "⏸" : "▶"; NudgeGlyph(_playGlyph, info.Playing ? "⏸" : "▶");
+            if (_tArtist.Text != info.Artist) _tArtist.Text = info.Artist;
+            if (trackChanged || _thumbnailKey != info.ThumbnailKey)
+            {
+                _thumbnailKey = info.ThumbnailKey;
+                SetCover(_smallImg, info.Cover, !animateTrack);
+                SetCover(_bigImg, info.Cover, !animateTrack);
+            }
+            string playGlyph = info.Playing ? "⏸" : "▶";
+            if (_playGlyph.Text != playGlyph)
+            {
+                _playGlyph.Text = playGlyph;
+                NudgeGlyph(_playGlyph, playGlyph);
+            }
+            if (trackChanged)
+            {
+                int direction = Environment.TickCount64 < _skipExpiresAt ? _skipDirection : 0;
+                _skipDirection = 0;
+                _trackKey = info.TrackKey;
+                _pillTransition.Play(outgoingPill, direction, 8 * Ui.Scale);
+                _panelTransition.Play(outgoingPanel, direction, 18 * Ui.Scale);
+            }
+        }
+
+        private static void SetCover(Image image, BitmapSource source, bool fade)
+        {
+            if (ReferenceEquals(image.Source, source)) return;
+            image.BeginAnimation(OpacityProperty, null);
+            image.Source = source;
+            if (fade && source != null && image.IsVisible && SystemParameters.ClientAreaAnimation)
+                image.BeginAnimation(OpacityProperty, TrackAnimation(0, 1, 135));
+        }
+
+        protected override void OnPanelHidden()
+        {
+            _panelTransition.Reset();
+            _bigImg.BeginAnimation(OpacityProperty, null);
+        }
+
+        public override void Dispose()
+        {
+            _pillTransition.Reset();
+            _panelTransition.Reset();
+            _smallImg.BeginAnimation(OpacityProperty, null);
+            _bigImg.BeginAnimation(OpacityProperty, null);
+            base.Dispose();
+        }
+
+        private static DoubleAnimation TrackAnimation(double from, double to, int milliseconds) =>
+            new DoubleAnimation(from, to, TimeSpan.FromMilliseconds(milliseconds))
+            {
+                EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut },
+                FillBehavior = FillBehavior.Stop
+            };
+
+        private sealed class TrackTransition : Grid
+        {
+            private readonly FrameworkElement _content;
+            private readonly TranslateTransform _motion = new TranslateTransform();
+            private readonly Canvas _outgoing = new Canvas { IsHitTestVisible = false };
+
+            internal TrackTransition(FrameworkElement content)
+            {
+                _content = content;
+                _content.RenderTransform = _motion;
+                _outgoing.ClipToBounds = true;
+                ClipToBounds = true;
+                Children.Add(_content);
+                Children.Add(_outgoing);
+            }
+
+            internal BitmapSource Snapshot()
+            {
+                if (!SystemParameters.ClientAreaAnimation || !IsVisible || ActualWidth < 1 || ActualHeight < 1)
+                    return null;
+                var dpi = VisualTreeHelper.GetDpi(this);
+                var bitmap = new RenderTargetBitmap((int)Math.Ceiling(ActualWidth * dpi.DpiScaleX),
+                    (int)Math.Ceiling(ActualHeight * dpi.DpiScaleY), dpi.PixelsPerInchX, dpi.PixelsPerInchY,
+                    PixelFormats.Pbgra32);
+                bitmap.Render(this);
+                bitmap.Freeze();
+                return bitmap;
+            }
+
+            internal void Play(BitmapSource previous, int direction, double distance)
+            {
+                Reset();
+                if (previous == null) return;
+                int duration = Math.Clamp(App.Settings?.AnimationDurationMs ?? 180, 120, 360);
+                var past = new Image { Source = previous, Width = previous.Width, Height = previous.Height };
+                var travel = new TranslateTransform();
+                past.RenderTransform = travel;
+                _outgoing.Children.Add(past);
+                _content.BeginAnimation(OpacityProperty, TrackAnimation(0.1, 1, duration));
+                var fade = TrackAnimation(1, 0, duration);
+                fade.Completed += (_, _) => _outgoing.Children.Remove(past);
+                past.BeginAnimation(OpacityProperty, fade);
+                var axis = direction == 0 ? TranslateTransform.YProperty : TranslateTransform.XProperty;
+                double offset = direction == 0 ? distance / 2 : direction * distance;
+                _motion.BeginAnimation(axis, TrackAnimation(offset, 0, duration));
+                travel.BeginAnimation(axis, TrackAnimation(0, -offset, duration));
+            }
+
+            internal void Reset()
+            {
+                _outgoing.Children.Clear();
+                _content.BeginAnimation(OpacityProperty, null);
+                _motion.BeginAnimation(TranslateTransform.XProperty, null);
+                _motion.BeginAnimation(TranslateTransform.YProperty, null);
+            }
         }
         // Segoe UI Symbol 媒体符号的行盒下留白偏大，墨迹在圆形按键里整体偏下；
         // 按实测（48px 按钮内 19px 字形）逐字形向上做光学补偿。
@@ -255,7 +388,7 @@ namespace DesktopBar.UI
             else
                 t.RenderTransform = null;
         }
-        private Border ShellButton(FrameworkElement content, Action click)
+        private Border ShellButton(FrameworkElement content, Action click, bool pressFeedback = false)
         {
             var b = new Border
             {
@@ -271,7 +404,18 @@ namespace DesktopBar.UI
             b.SetResourceReference(Border.BackgroundProperty, "ThemePanelControl");
             b.MouseEnter += (s, e) => b.SetResourceReference(Border.BackgroundProperty, "ThemePanelControlHover");
             b.MouseLeave += (s, e) => b.SetResourceReference(Border.BackgroundProperty, "ThemePanelControl");
-            b.MouseLeftButtonUp += (s, e) => click();
+            b.MouseLeftButtonUp += (s, e) =>
+            {
+                if (pressFeedback && SystemParameters.ClientAreaAnimation)
+                {
+                    var scale = new ScaleTransform();
+                    b.RenderTransform = scale;
+                    b.RenderTransformOrigin = new Point(0.5, 0.5);
+                    scale.BeginAnimation(ScaleTransform.ScaleXProperty, TrackAnimation(0.84, 1, 150));
+                    scale.BeginAnimation(ScaleTransform.ScaleYProperty, TrackAnimation(0.84, 1, 150));
+                }
+                click();
+            };
             return b;
         }
     }
@@ -452,1114 +596,6 @@ namespace DesktopBar.UI
         }
     }
 
-    public class FolderModule : ModuleBase
-    {
-        private readonly string _name; private readonly WrapPanel _wrap = new WrapPanel(); private readonly ScrollViewer _scroll; private FileSystemWatcher _watcher; private readonly DispatcherTimer _debounce;
-        private bool _disposed;
-        private bool _filesDirty = true;
-        private int _fileLoadVersion;
-
-        private sealed class MoveRequest
-        {
-            public string Source;
-            public string ReplaceTarget;
-            public bool CopyInstead;
-        }
-        private readonly List<DispatcherTimer> _itemOpenTimers = new List<DispatcherTimer>();
-        private string Dir
-        {
-            get
-            {
-                if (!IsSafeLeafName(_name)) return string.Empty;
-                try
-                {
-                    string root = FilePath.GetFullPath(App.Settings.StorageRoot);
-                    string candidate = FilePath.GetFullPath(FilePath.Combine(root, _name));
-                    string relative = FilePath.GetRelativePath(root, candidate);
-                    if (relative == "." || FilePath.IsPathRooted(relative)
-                        || relative.StartsWith(".." + FilePath.DirectorySeparatorChar, StringComparison.Ordinal)
-                        || relative.StartsWith(".." + FilePath.AltDirectorySeparatorChar, StringComparison.Ordinal)) return string.Empty;
-                    return string.Equals(relative, _name, StringComparison.OrdinalIgnoreCase) ? candidate : string.Empty;
-                }
-                catch { return string.Empty; }
-            }
-        }
-
-        private static bool IsSafeLeafName(string name) => SettingsService.IsValidFolderName(name);
-        public FolderModule(string name, TabStyle st) : base(st)
-        {
-            _name = name;
-            var sp = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
-            sp.Children.Add(MakeFolderGlyph(18));
-            var tb = MakePillText(name);
-            tb.Margin = new Thickness(8 * Ui.Scale, 0, 0, 0);
-            sp.Children.Add(tb);
-            Pill.Child = sp;
-            _scroll = new ScrollViewer { VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled, MaxHeight = SystemParameters.PrimaryScreenHeight * 0.5 }; _scroll.Content = _wrap; Panel.Child = _scroll;
-            try { if (!string.IsNullOrEmpty(Dir)) Directory.CreateDirectory(Dir); } catch (Exception ex) { App.Log("创建小文件夹失败: " + ex.Message); }
-            // 空白处右键粘贴（项目上的右键会被项目自身处理并标记 Handled）。
-            Panel.MouseRightButtonUp += (s, e) => { ShowBlankMenu(); e.Handled = true; };
-            // 双击胶囊：在资源管理器中打开该文件夹。
-            Pill.MouseLeftButtonDown += (s, e) => { if (e.ClickCount == 2) { ShellOpen.OpenPath(Dir); e.Handled = true; } };
-            _debounce = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(300) };
-            _debounce.Tick += (s, e) =>
-            {
-                _debounce.Stop();
-                if (_disposed) return;
-                _filesDirty = true;
-                if (Open) LoadFiles();
-            };
-            SetupWatcher(); EnableDragDrop();
-        }
-        private void SetupWatcher()
-        {
-            try
-            {
-                    _watcher = new FileSystemWatcher(Dir) { EnableRaisingEvents = true };
-                _watcher.Created += (s, e) => RestartDebounce();
-                _watcher.Changed += (s, e) => RestartDebounce();
-                _watcher.Deleted += (s, e) => RestartDebounce();
-                _watcher.Renamed += (s, e) => RestartDebounce();
-                _watcher.Error += (s, e) => RestartDebounce();
-            }
-            catch (Exception ex) { App.Log("小文件夹监听失败: " + ex.Message); }
-        }
-        private void RestartDebounce()
-        {
-            if (_disposed || Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished) return;
-            try
-            {
-                Dispatcher.BeginInvoke(new Action(() =>
-                {
-                    if (_disposed) return;
-                    _debounce.Stop();
-                    _debounce.Start();
-                }));
-            }
-            catch (InvalidOperationException) { }
-        }
-        private void ShowBlankMenu()
-        {
-            // 剪贴板没有文件时“粘贴”置灰不可点；实际路径在点击时捕获，避免菜单打开后剪贴板变化。
-            bool has = FileClipboard.HasPasteableFiles && !string.IsNullOrEmpty(Dir);
-            TrackFlyout(FlyoutMenu.Show(new List<FlyoutItem>
-            {
-                new FlyoutItem("粘贴", PasteIntoFolder, enabled: has)
-            }));
-        }
-
-        private async void PasteIntoFolder()
-        {
-            string directory = Dir;
-            var snapshot = FileClipboard.CapturePasteSnapshot();
-            if (snapshot == null || string.IsNullOrEmpty(directory)) return;
-            try
-            {
-                FileClipboard.PasteResult paste = null;
-                var result = await OperationProgressDialog.RunDetailedAsync("正在粘贴文件", false, snapshot.Paths.Count,
-                    progress => Task.Run(() =>
-                    {
-                        paste = FileClipboard.PasteSnapshotDetailed(snapshot, directory,
-                            (completed, name, placed) => progress.Report(completed, name, placed));
-                    }));
-                if (!_disposed) LoadFiles();
-                if (!result.Started)
-                {
-                    ConfirmDialog.Notice("操作进行中", "已有文件操作正在进行，请稍后再试。");
-                    return;
-                }
-                if (result.Error != null)
-                {
-                    ConfirmDialog.Notice("移动未完成",
-                        "操作被中断：" + result.Error.Message + "\n部分项目可能已移动，请检查目标文件夹。");
-                    return;
-                }
-                int succeeded = paste?.Succeeded ?? result.Succeeded;
-                int total = paste?.Total ?? snapshot.Paths.Count;
-                // 剪切语义已完整消费:清掉剪贴板,符合资源管理器惯例,避免"再粘贴"静默无效。
-                if (snapshot.Move && paste != null && paste.Total > 0 && paste.Succeeded == paste.Total)
-                {
-                    try { Clipboard.Clear(); } catch { }
-                }
-                if (succeeded < total)
-                {
-                    var failed = paste?.FailedItems ?? Array.Empty<string>();
-                    ConfirmDialog.Notice("粘贴未全部完成",
-                        "已完成 " + succeeded + "/" + total + " 项。"
-                        + (failed.Count == 0 ? "" : "\n\n" + string.Join("\n", failed.Take(5))
-                            + (failed.Count > 5 ? "\n……" : "")));
-                }
-            }
-            // async void 的异常不会进调用方,只会落到全局兜底被静默吞掉;粘贴是用户显式动作,
-            // 失败必须留下日志和提示,否则表现为"点了没反应"。
-            catch (Exception ex)
-            {
-                App.Log("粘贴文件失败: " + ex.Message);
-                ConfirmDialog.Notice("粘贴失败", "操作意外中断: " + ex.Message);
-            }
-        }
-
-        protected override void OnPanelShown()
-        {
-            if (_filesDirty) LoadFiles();
-        }
-
-        protected override void OnPanelHidden()
-        {
-            // 面板已收起,悬停打开计时器必须作废,否则文件会在面板消失后"莫名"打开。
-            foreach (var timer in _itemOpenTimers) timer.Stop();
-            _itemOpenTimers.Clear();
-        }
-
-        private async void LoadFiles()
-        {
-            int version = ++_fileLoadVersion;
-            string directory = Dir;
-            try
-            {
-                var items = await Task.Run(() => SnapshotFiles(directory));
-                if (_disposed || !Open || version != _fileLoadVersion)
-                {
-                    _filesDirty = true;
-                    return;
-                }
-
-                _wrap.Children.Clear();
-                int cols = Math.Min(4, Math.Max(1, items.Count));
-                // 最多四列；为四列预留完整 viewport，细滚动条不会把第四列挤到下一行。
-                double cell = 76 * Ui.Scale;
-                _wrap.Width = cols * cell;
-                Panel.Width = (cols * 76 + 26) * Ui.Scale;
-
-                const int batchSize = 8;
-                for (int index = 0; index < items.Count; index += batchSize)
-                {
-                    if (_disposed || !Open || version != _fileLoadVersion)
-                    {
-                        _filesDirty = true;
-                        return;
-                    }
-                    int end = Math.Min(items.Count, index + batchSize);
-                    for (int i = index; i < end; i++)
-                        _wrap.Children.Add(MakeItem(items[i]));
-
-                    if (end < items.Count)
-                        await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.Background);
-                }
-                _filesDirty = false;
-            }
-            catch (InvalidOperationException) { _filesDirty = true; }
-            // InvalidOperationException 是面板竞态的预期路径;其余异常(目录被占用的 IO 等)
-            // 也标记脏,下次打开面板会重试,同时留日志供排查。
-            catch (Exception ex)
-            {
-                _filesDirty = true;
-                App.Log("加载小文件夹失败: " + ex.Message);
-            }
-        }
-
-        private static List<FileSystemInfo> SnapshotFiles(string directory)
-        {
-            try
-            {
-                if (!Directory.Exists(directory)) return new List<FileSystemInfo>();
-                return new DirectoryInfo(directory)
-                    .GetFileSystemInfos()
-                    .OrderBy(item => item is DirectoryInfo ? 0 : 1)
-                    .ThenBy(item => item.Name, StringComparer.OrdinalIgnoreCase)
-                    .ToList();
-            }
-            catch
-            {
-                return new List<FileSystemInfo>();
-            }
-        }
-        private FrameworkElement MakeItem(FileSystemInfo f)
-        {
-            bool isDir = f is DirectoryInfo;
-            string displayName =
-                (string.Equals(f.Extension, ".lnk", StringComparison.OrdinalIgnoreCase)
-                 || string.Equals(f.Extension, ".url", StringComparison.OrdinalIgnoreCase))
-                    ? f.Name.Substring(0, f.Name.Length - f.Extension.Length)
-                    : f.Name;
-            var tile = ItemTile.Create(displayName, isDir, f.Extension, f.FullName, null, () => _disposed);
-            var border = tile.Root;
-            bool suppressClickAfterDrag = false;
-            // 拖出：按住左键移动超过系统阈值后发起 OLE 拖拽（Move 语义），
-            // 落点接受 Move 后由这里删除源（若目标是我们自己的其他面板则已被移动，删除自然失败可忽略）。
-            bool dragTaken = false;
-            border.PreviewMouseMove += (s, e) =>
-            {
-                if (tile.DragStart == null || dragTaken || e.LeftButton != MouseButtonState.Pressed) return;
-                var pos = e.GetPosition(border);
-                if (Math.Abs(pos.X - tile.DragStart.Value.X) < SystemParameters.MinimumHorizontalDragDistance
-                    && Math.Abs(pos.Y - tile.DragStart.Value.Y) < SystemParameters.MinimumVerticalDragDistance) return;
-                dragTaken = true;
-                suppressClickAfterDrag = true;
-                try
-                {
-                    var data = new DataObject(DataFormats.FileDrop, new[] { f.FullName });
-                    data.SetData("Preferred DropEffect", FileClipboard.EffectStream(FileClipboard.MoveEffect));
-                    var effect = DragDrop.DoDragDrop(border, data, DragDropEffects.Move);
-                    if ((effect & DragDropEffects.Move) != 0)
-                    {
-                        // 仅在源已被目标实际移走后刷新；不按旧路径盲删，避免误删新建同名文件。
-                        bool sourceStillExists = isDir ? Directory.Exists(f.FullName) : File.Exists(f.FullName);
-                        if (!sourceStillExists) LoadFiles();
-                    }
-                }
-                catch (Exception ex) { App.Log("拖出移动失败: " + ex.Message); }
-                finally
-                {
-                    tile.DragStart = null;
-                    dragTaken = false;
-                    tile.AnimateBack();
-                    border.Background = Brushes.Transparent;
-                }
-            };
-            DispatcherTimer openTimer = null;
-            border.MouseLeftButtonUp += (s, e) =>
-            {
-                tile.AnimateBack();
-                border.SetResourceReference(Border.BackgroundProperty, "ThemePanelControl");
-                if (suppressClickAfterDrag)
-                {
-                    suppressClickAfterDrag = false;
-                    e.Handled = true;
-                    return;
-                }
-                if (e.ClickCount >= 2)
-                {
-                    if (openTimer != null) _itemOpenTimers.Remove(openTimer);
-                    openTimer?.Stop();
-                    openTimer = null;
-                    ShellOpen.OpenPath(f.FullName);
-                }
-                else
-                {
-                    openTimer?.Stop();
-                    openTimer = new DispatcherTimer { Interval = SystemParameters.MouseHoverTime };
-                    _itemOpenTimers.Add(openTimer);
-                    openTimer.Tick += (ts, te) =>
-                    {
-                        openTimer.Stop();
-                        _itemOpenTimers.Remove(openTimer);
-                        openTimer = null;
-                        if (!_disposed && Open) ShellOpen.OpenPath(f.FullName);
-                    };
-                    openTimer.Start();
-                }
-                e.Handled = true;
-            };
-            border.MouseRightButtonUp += (s, e) => { ShowItemMenu(f); e.Handled = true; };
-            return border;
-        }
-        private void ShowItemMenu(FileSystemInfo f)
-        {
-            TrackFlyout(FlyoutMenu.Show(new List<FlyoutItem>
-            {
-                new FlyoutItem("打开", () => ShellOpen.OpenPath(f.FullName)),
-                new FlyoutItem("复制", () => FileClipboard.CopyFiles(new[] { f.FullName })),
-                new FlyoutItem("剪切", () => FileClipboard.CutFiles(new[] { f.FullName })),
-                new FlyoutItem("重命名", () => RenameItem(f)),
-                new FlyoutItem("删除", () => DeleteItem(f), danger: true)
-            }));
-        }
-        private void RenameItem(FileSystemInfo f)
-        {
-            string name = Prompt.Show("重命名", "新的名称:", f.Name);
-            if (string.IsNullOrWhiteSpace(name) || name == f.Name) return;
-            string extension = f.Extension;
-            if ((string.Equals(extension, ".lnk", StringComparison.OrdinalIgnoreCase)
-                 || string.Equals(extension, ".url", StringComparison.OrdinalIgnoreCase))
-                && !name.EndsWith(extension, StringComparison.OrdinalIgnoreCase))
-                name += extension;
-            if (!IsSafeLeafName(name))
-            {
-                ConfirmDialog.Notice("重命名失败", "名称不能包含路径分隔符或 ..。");
-                return;
-            }
-            try
-            {
-                string dest = FilePath.Combine(FilePath.GetDirectoryName(f.FullName) ?? "", name);
-                if (File.Exists(dest) || Directory.Exists(dest)) { ConfirmDialog.Notice("重命名失败", "同名项目已存在。"); return; }
-                if (f is DirectoryInfo dir) dir.MoveTo(dest);
-                else ((FileInfo)f).MoveTo(dest);
-                LoadFiles();
-            }
-            catch (Exception ex) { ConfirmDialog.Notice("重命名失败", ex.Message); }
-        }
-        private async void DeleteItem(FileSystemInfo f)
-        {
-            if (!ConfirmDialog.ShowDanger("删除", "确定要把“" + f.Name + "”移到回收站吗？", "删除")) return;
-            try
-            {
-                bool success = false;
-                var result = await OperationProgressDialog.RunDetailedAsync("正在移入回收站", true, 1,
-                    progress => Task.Run(() =>
-                    {
-                        success = NativeMethods.DeleteToRecycleBin(new[] { f.FullName });
-                        progress.Report(1, f.Name, success);
-                    }));
-                if (_disposed) return;
-                if (!result.Started)
-                {
-                    ConfirmDialog.Notice("操作进行中", "已有文件操作正在进行，请稍后再试。");
-                    return;
-                }
-                if (success) LoadFiles();
-                else ConfirmDialog.Notice("删除失败", "无法把“" + f.Name + "”移到回收站。");
-            }
-            catch (Exception ex)
-            {
-                App.Log("移入回收站失败: " + ex.Message);
-                ConfirmDialog.Notice("删除失败", "操作意外中断: " + ex.Message);
-            }
-        }
-        private void EnableDragDrop()
-        {
-            Pill.AllowDrop = true;
-            PanelWindow.AllowDrop = true;
-            foreach (var el in new UIElement[] { Pill, PanelWindow })
-            {
-                el.DragOver += (s, e) =>
-                {
-                    // 小文件夹拖入固定为移动语义；来源不允许 Move 时拒绝，不能显示 Copy 却实际移走源文件。
-                    e.Effects = !OperationProgressDialog.Busy
-                        && e.Data.GetDataPresent(DataFormats.FileDrop)
-                        && (e.AllowedEffects & DragDropEffects.Move) != 0
-                        ? DragDropEffects.Move
-                        : DragDropEffects.None;
-                    e.Handled = true;
-                };
-                el.Drop += (s, e) =>
-                {
-                    bool canMove = (e.AllowedEffects & DragDropEffects.Move) != 0;
-                    if (e.Data.GetDataPresent(DataFormats.FileDrop)
-                        && !OperationProgressDialog.Busy && canMove)
-                    {
-                        bool sourcesPreserved;
-                        bool success = MoveInto((string[])e.Data.GetData(DataFormats.FileDrop), out sourcesPreserved);
-                        e.Effects = success && !sourcesPreserved
-                            ? DragDropEffects.Move
-                            : DragDropEffects.None;
-                    }
-                    else e.Effects = DragDropEffects.None;
-                    e.Handled = true;
-                };
-            }
-        }
-        // 拖入默认采用移动语义；同名冲突选择“作为副本”时保留源项目。
-        private bool MoveInto(string[] files, out bool sourcesPreserved)
-        {
-            sourcesPreserved = false;
-            string destination = Dir;
-            if (string.IsNullOrEmpty(destination)) return false;
-            try
-            {
-                Directory.CreateDirectory(destination);
-                string destRoot = FilePath.GetFullPath(destination).TrimEnd('\\', '/');
-                var requests = new List<MoveRequest>();
-                ConflictChoice? choice = null;
-                bool applyToAll = false;
-                foreach (var f in files ?? Array.Empty<string>())
-                {
-                    if (string.IsNullOrEmpty(f)) continue;
-                    string full = FilePath.GetFullPath(f).TrimEnd('\\', '/');
-                    if (!File.Exists(full) && !Directory.Exists(full)) continue;
-                    // 跳过：源就是本目录、或把文件夹拖进它自己的子目录。
-                    if (string.Equals(full, destRoot, StringComparison.OrdinalIgnoreCase)) continue;
-                    if (destRoot.StartsWith(full + "\\", StringComparison.OrdinalIgnoreCase)) continue;
-                    string parent = FilePath.GetDirectoryName(full);
-                    if (string.Equals(parent?.TrimEnd('\\', '/'), destRoot, StringComparison.OrdinalIgnoreCase)) continue;
-
-                    string dest = FilePath.Combine(destRoot, FilePath.GetFileName(full));
-                    string replaceTarget = null;
-                    bool copyInstead = false;
-                    if (File.Exists(dest) || Directory.Exists(dest))
-                    {
-                        if (!applyToAll)
-                        {
-                            choice = ConfirmDialog.ShowConflict("存在同名项目",
-                                "“" + FilePath.GetFileName(dest) + "”已在此文件夹中。要替换它，还是把拖入的项保留为副本？",
-                                out applyToAll);
-                            if (choice == null) break;
-                        }
-                        if (choice == ConflictChoice.Replace) replaceTarget = dest;
-                        else if (choice == ConflictChoice.KeepBoth) copyInstead = true;
-                    }
-                    requests.Add(new MoveRequest
-                    {
-                        Source = full,
-                        ReplaceTarget = replaceTarget,
-                        CopyInstead = copyInstead
-                    });
-                }
-
-                if (requests.Count == 0) return false;
-                sourcesPreserved = requests.Any(request => request.CopyInstead);
-                var failures = new List<string>();
-                var result = OperationProgressDialog.RunWithDispatcherPumpDetailed("正在移动文件", false, requests.Count,
-                    progress =>
-                    {
-                        for (int i = 0; i < requests.Count; i++)
-                        {
-                            var request = requests[i];
-                            bool placed;
-                            string error = null;
-                            if (!string.IsNullOrEmpty(request.ReplaceTarget))
-                            {
-                                placed = FileClipboard.TryReplace(request.Source, request.ReplaceTarget,
-                                    () => NativeMethods.DeleteToRecycleBin(new[] { request.ReplaceTarget }),
-                                    out error);
-                            }
-                            else
-                            {
-                                placed = FileClipboard.TryPlace(request.Source, destination, move: !request.CopyInstead);
-                                if (!placed) error = request.CopyInstead ? "复制失败。" : "移动或跨卷复制失败。";
-                            }
-                            string name = FilePath.GetFileName(request.Source);
-                            if (!placed)
-                            {
-                                failures.Add(name + (string.IsNullOrEmpty(error) ? "" : "：" + error));
-                                App.Log("拖入操作失败: " + name + (string.IsNullOrEmpty(error) ? "" : " — " + error));
-                            }
-                            progress.Report(i + 1, name, placed);
-                        }
-                        return Task.CompletedTask;
-                    });
-                if (!_disposed) LoadFiles();
-                if (result.SucceededFully) return true;
-                if (result.Error != null)
-                {
-                    ConfirmDialog.Notice("移动被中断",
-                        "操作中途发生异常：" + result.Error.Message + "\n部分项目可能已移动，请检查目标文件夹。");
-                    return false;
-                }
-                if (result.Started && failures.Count > 0)
-                    ConfirmDialog.Notice("移动未全部完成",
-                        "已完成 " + result.Succeeded + "/" + requests.Count + " 项。\n\n"
-                        + string.Join("\n", failures.Take(5))
-                        + (failures.Count > 5 ? "\n……" : ""));
-                return false;
-            }
-            catch (Exception ex) { App.Log("拖入失败: " + ex.Message); return false; }
-        }
-        public override void Dispose()
-        {
-            _disposed = true;
-            _fileLoadVersion++;
-            _debounce.Stop();
-            foreach (var timer in _itemOpenTimers) timer.Stop();
-            _itemOpenTimers.Clear();
-            try
-            {
-                if (_watcher != null) _watcher.EnableRaisingEvents = false;
-                _watcher?.Dispose();
-            }
-            catch (Exception ex) { App.Log("关闭小文件夹监听失败: " + ex.Message); }
-            base.Dispose();
-        }
-    }
-
-    /// <summary>回收站模块：点击展开（悬停不展开），单击项目还原到原位置，右键胶囊清空回收站。</summary>
-    public class RecycleBinModule : ModuleBase
-    {
-        private readonly WrapPanel _wrap = new WrapPanel();
-        private readonly ScrollViewer _scroll;
-        private readonly TextBlock _emptyHint;
-        private bool _disposed;
-        private int _loadVersion;
-
-        public RecycleBinModule(TabStyle st) : base(st)
-        {
-            Pill.Width = 38 * Ui.Scale;
-            Pill.Padding = new Thickness(0);
-            Pill.Child = CenterIcon(MakeTrashGlyph(20.5));
-            Pill.MouseLeftButtonUp += (s, e) => ShowPanel();
-            Pill.MouseRightButtonUp += (s, e) => { ShowClearMenu(); e.Handled = true; };
-            // 双击胶囊:直接打开回收站视图(SHOpenFolderAndSelectItems 会打开"父文件夹"即桌面,
-            // 对虚拟根文件夹必须用 shell 命名空间路径导航进去;CLSID 是固定常量)。
-            Pill.MouseLeftButtonDown += (s, e) =>
-            {
-                if (e.ClickCount != 2) return;
-                e.Handled = true;
-                NativeMethods.ShellExecuteOpen("shell:::{645FF040-5081-101B-9F08-00AA002F954E}");
-            };
-
-            // 经 MakeText 登记随主题刷新;直接快照 Foreground 会在切主题后保留旧色。
-            _emptyHint = MakeText("回收站是空的", -1);
-            _emptyHint.FontSize = 13 * Ui.Scale;
-            _emptyHint.Opacity = 0.65;
-            _emptyHint.HorizontalAlignment = HorizontalAlignment.Center;
-            _emptyHint.Margin = new Thickness(12 * Ui.Scale, 16 * Ui.Scale, 12 * Ui.Scale, 10 * Ui.Scale);
-            _emptyHint.Visibility = Visibility.Collapsed;
-            _wrap.HorizontalAlignment = HorizontalAlignment.Center;
-            var host = new StackPanel();
-            host.Children.Add(_emptyHint);
-            host.Children.Add(_wrap);
-            _scroll = new ScrollViewer
-            {
-                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
-                HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
-                MaxHeight = SystemParameters.PrimaryScreenHeight * 0.5,
-                Content = host
-            };
-            Panel.Child = _scroll;
-            EnableDragDrop();
-        }
-
-        protected override bool HoverOpensPanel => false;
-        protected override void OnPanelShown() => LoadItems();
-
-        // 拖入回收站 = 把文件移入系统回收站（SHFileOperation 带 undo）。
-        private void EnableDragDrop()
-        {
-            Pill.AllowDrop = true; PanelWindow.AllowDrop = true;
-            foreach (var el in new UIElement[] { Pill, PanelWindow })
-            {
-                el.DragOver += (s, e) =>
-                {
-                    // 与小文件夹拖入同一约定:来源只允许 Copy 时不能假装 Move(拖入回收站是删除性移动),
-                    // 否则 zip/邮件附件等 Copy-only 源会被错误删除。
-                    e.Effects = !OperationProgressDialog.Busy
-                        && e.Data.GetDataPresent(DataFormats.FileDrop)
-                        && (e.AllowedEffects & DragDropEffects.Move) != 0
-                        ? DragDropEffects.Move : DragDropEffects.None;
-                    e.Handled = true;
-                };
-                el.Drop += (s, e) =>
-                {
-                    bool moved = false;
-                    if (e.Data.GetDataPresent(DataFormats.FileDrop) && !OperationProgressDialog.Busy
-                        && (e.AllowedEffects & DragDropEffects.Move) != 0)
-                    {
-                        var files = (string[])e.Data.GetData(DataFormats.FileDrop);
-                        // 忽略本模块拖出又拖回的临时硬链接/副本,避免把回收站内部路径再次回收。
-                        files = FilterOwnTempPaths(files);
-                        if (files != null && files.Length > 0)
-                        {
-                            bool success = false;
-                            var result = OperationProgressDialog.RunWithDispatcherPumpDetailed("正在移入回收站", true, files.Length,
-                                progress =>
-                                {
-                                    success = NativeMethods.DeleteToRecycleBin(files);
-                                    progress.Report(files.Length, success ? "已完成" : "操作失败", success);
-                                    if (success) App.Log("已把 " + files.Length + " 项移入回收站");
-                                    return Task.CompletedTask;
-                                });
-                            moved = result.SucceededFully && success;
-                            if (result.Started)
-                            {
-                                LoadItems();
-                                if (!moved)
-                                    ConfirmDialog.Notice("移入回收站未全部完成", "部分项目未能移入回收站,请重试或逐个检查。");
-                            }
-                            else
-                                ConfirmDialog.Notice("操作进行中", "已有文件操作正在进行，请稍后再试。");
-                        }
-                    }
-                    e.Effects = moved ? DragDropEffects.Move : DragDropEffects.None;
-                    e.Handled = true;
-                };
-            }
-        }
-
-        /// <summary>过滤来自本模块拖出的临时路径(回收站 $R 目录内的硬链接、%TEMP% 临时副本)。</summary>
-        private static string[] FilterOwnTempPaths(string[] files)
-        {
-            if (files == null) return files;
-            string tempRoot = (FilePath.GetTempPath() ?? "").TrimEnd('\\', '/');
-            var kept = files.Where(f =>
-            {
-                if (string.IsNullOrEmpty(f)) return false;
-                string full = f;
-                try { full = FilePath.GetFullPath(f); } catch { }
-                if (full.IndexOf("\\$Recycle.Bin\\", StringComparison.OrdinalIgnoreCase) >= 0) return false;
-                if (!string.IsNullOrEmpty(tempRoot)
-                    && full.StartsWith(tempRoot + "\\", StringComparison.OrdinalIgnoreCase)
-                    && full.IndexOf("YukiDeskClipboard", StringComparison.OrdinalIgnoreCase) >= 0) return false;
-                return true;
-            }).ToArray();
-            return kept;
-        }
-
-        private async void LoadItems()
-        {
-            int version = ++_loadVersion;
-            try
-            {
-                var items = await Task.Run(RecycleBin.Enumerate);
-                if (_disposed || !Open || version != _loadVersion) return;
-
-                _wrap.Children.Clear();
-                bool empty = items.Count == 0;
-                _emptyHint.Visibility = empty ? Visibility.Visible : Visibility.Collapsed;
-                _wrap.Visibility = empty ? Visibility.Collapsed : Visibility.Visible;
-                int cols = Math.Min(4, Math.Max(1, items.Count));
-                double cell = 76 * Ui.Scale;
-                _wrap.Width = cols * cell;
-                Panel.Width = empty ? 190 * Ui.Scale : (cols * 76 + 26) * Ui.Scale;
-
-                const int batchSize = 8;
-                for (int index = 0; index < items.Count; index += batchSize)
-                {
-                    if (_disposed || !Open || version != _loadVersion) return;
-                    int end = Math.Min(items.Count, index + batchSize);
-                    for (int i = index; i < end; i++) _wrap.Children.Add(MakeRecycleItem(items[i]));
-                    if (end < items.Count)
-                        await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.Background);
-                }
-            }
-            catch (InvalidOperationException) { }
-            // 面板竞态是预期路径;其余异常(磁盘枚举失败等)留日志,面板内容可能不新但不崩。
-            catch (Exception ex) { App.Log("加载回收站失败: " + ex.Message); }
-        }
-
-        private FrameworkElement MakeRecycleItem(RecycleItem item)
-        {
-            string ext = FilePath.GetExtension(item.DataPath);
-            string tooltip = item.OriginalPath + "\n删除于 " + item.DeletedAt.ToString("yyyy-MM-dd HH:mm")
-                + (item.Size >= 0 ? "\n大小 " + FmtRecycleSize(item.Size) : "")
-                + "\n双击还原;右键更多操作";
-            var tile = ItemTile.Create(item.Name, item.IsDirectory, ext, item.DataPath, tooltip, () => _disposed);
-            var border = tile.Root;
-            // 拖出 = 把内容移出回收站：落点接受 Move 后删除 $R 内容与 $I 元数据。
-            bool dragTaken = false;
-            border.PreviewMouseMove += (s, e) =>
-            {
-                if (tile.DragStart == null || dragTaken || e.LeftButton != MouseButtonState.Pressed) return;
-                var pos = e.GetPosition(border);
-                if (Math.Abs(pos.X - tile.DragStart.Value.X) < SystemParameters.MinimumHorizontalDragDistance
-                    && Math.Abs(pos.Y - tile.DragStart.Value.Y) < SystemParameters.MinimumVerticalDragDistance) return;
-                dragTaken = true;
-                // $R 文件名是随机的；文件用硬链接、目录用临时副本，均使用原始名称拖出。
-                string dragPath = null;
-                string tempLink = null;
-                bool prepared = false;
-                if (!item.IsDirectory)
-                {
-                    try
-                    {
-                        string linkDir = FilePath.GetDirectoryName(item.DataPath) ?? "";
-                        tempLink = FileClipboard.UniqueDest(item.Name, linkDir);
-                        if (!NativeMethods.CreateHardLink(tempLink, item.DataPath))
-                            throw new IOException("无法创建拖拽硬链接");
-                        dragPath = tempLink;
-                        prepared = true;
-                    }
-                    catch (Exception ex)
-                    {
-                        App.Log("准备回收站文件拖出失败: " + ex.Message);
-                        if (tempLink != null && File.Exists(tempLink)) { try { File.Delete(tempLink); } catch { } }
-                        tempLink = null;
-                    }
-                }
-                else
-                {
-                    var prepare = OperationProgressDialog.RunWithDispatcherPumpDetailed("正在准备拖出", true, 1,
-                        progress => Task.Run(() =>
-                        {
-                            try
-                            {
-                                tempLink = FileClipboard.CreateNamedTemporaryCopy(item.DataPath, item.Name);
-                                dragPath = tempLink;
-                                prepared = true;
-                                progress.Report(1, item.Name, true);
-                            }
-                            catch (Exception ex)
-                            {
-                                App.Log("准备回收站文件夹拖出失败: " + ex.Message);
-                                progress.Report(1, "操作失败", false);
-                            }
-                        }));
-                    if (!prepare.Started) prepared = false;
-                }
-                if (!prepared)
-                {
-                    dragTaken = false;
-                    ConfirmDialog.Notice("拖出失败", "无法以原始名称准备“" + item.Name + "”。");
-                    return;
-                }
-                var data = new DataObject(DataFormats.FileDrop, new[] { dragPath });
-                data.SetData("Preferred DropEffect", FileClipboard.EffectStream(FileClipboard.MoveEffect));
-                DragDropEffects effect = DragDropEffects.None;
-                try
-                {
-                    effect = DragDrop.DoDragDrop(border, data, DragDropEffects.Move);
-                }
-                catch (Exception ex)
-                {
-                    App.Log("回收站拖出失败: " + ex.Message);
-                }
-                finally
-                {
-                    tile.DragStart = null;
-                }
-                // 关键守卫:目标声称接受 Move 且临时项确实已从原处消失(被目标 rename/移走),
-                // 才允许删除 $R/$I。临时项仍在原处说明落点只是"口头接受"没取走数据,
-                // 此时删 $R 会造成内容永久丢失(目录分支的临时副本是拷贝,不是硬链接)。
-                bool linkStillThere = !string.IsNullOrEmpty(tempLink)
-                    && (Directory.Exists(tempLink) || File.Exists(tempLink));
-                if (!string.IsNullOrEmpty(tempLink))
-                {
-                    // 大目录临时副本可能 GB 级,同步删会冻结 UI,放后台清理。
-                    string cleanup = tempLink;
-                    Task.Run(() =>
-                    {
-                        try
-                        {
-                            if (Directory.Exists(cleanup)) Directory.Delete(cleanup, true);
-                            else if (File.Exists(cleanup)) File.Delete(cleanup);
-                        }
-                        catch (Exception ex) { App.Log("清理回收站拖拽临时项目失败: " + ex.Message); }
-                    });
-                }
-                if ((effect & DragDropEffects.Move) != 0 && linkStillThere)
-                {
-                    // 落点接受了 Drop 却没真正移走内容:保留 $R/$I,项目还在回收站,用户可重试。
-                    App.Log("拖出目标未实际取走内容,保留回收站项目: " + item.Name);
-                    LoadItems();
-                    return;
-                }
-                if ((effect & DragDropEffects.Move) != 0)
-                {
-                    // 只有 $R 内容和 $I 元数据都清理成功，才算完成拖出；否则保留元数据以便还原。
-                    bool dataDeleted = false;
-                    bool metaDeleted = false;
-                    var result = OperationProgressDialog.RunWithDispatcherPumpDetailed("正在完成移动", true, 1,
-                        progress =>
-                        {
-                            try
-                            {
-                                FileClipboard.ForceDelete(item.DataPath);
-                                dataDeleted = true;
-                            }
-                            catch (Exception ex) { App.Log("移出回收站内容失败: " + ex.Message); }
-                            if (dataDeleted)
-                            {
-                                try
-                                {
-                                    File.Delete(item.MetaFile);
-                                    metaDeleted = true;
-                                }
-                                catch (Exception ex) { App.Log("清理回收站元数据失败: " + ex.Message); }
-                            }
-                            progress.Report(1, item.Name, dataDeleted && metaDeleted);
-                            return Task.CompletedTask;
-                        });
-                    if (!result.Started)
-                        ConfirmDialog.Notice("操作进行中", "已有文件操作正在进行，请稍后再试。");
-                    else if (dataDeleted && metaDeleted) LoadItems();
-                    else if (dataDeleted)
-                    {
-                        // 内容已删但元数据没删掉:条目将变成孤儿 $I,提示要如实反映"内容已移出"。
-                        ConfirmDialog.Notice("移出完成但元数据清理失败",
-                            "“" + item.Name + "”的内容已移到目标位置,但回收站记录清理失败。\n"
-                            + "该条目可能继续显示在回收站列表中,可忽略或稍后在资源管理器中清理。");
-                        LoadItems();
-                    }
-                    else
-                        ConfirmDialog.Notice("移出回收站失败", "“" + item.Name + "”未能移出，原项目仍保留在回收站中。");
-                }
-            };
-            border.MouseLeftButtonUp += (s, e) =>
-            {
-                tile.AnimateBack();
-                border.SetResourceReference(Border.BackgroundProperty, "ThemePanelControl");
-                if (dragTaken) { dragTaken = false; e.Handled = true; return; }
-                // 还原改为双击触发:单击只是选中/查看,避免误触 68px 小条目就移动文件。
-                if (e.ClickCount >= 2) RestoreItemAsync(item);
-                e.Handled = true;
-            };
-            border.MouseRightButtonUp += (s, e) => { ShowItemMenu(item); e.Handled = true; };
-            return border;
-        }
-
-        private async void RestoreItemAsync(RecycleItem item)
-        {
-            try
-            {
-                bool success = false;
-                var result = await OperationProgressDialog.RunDetailedAsync("正在还原文件", true, 1,
-                    progress => Task.Run(() =>
-                    {
-                        success = RecycleBin.Restore(item);
-                        progress.Report(1, item.Name, success);
-                    }));
-                if (_disposed) return;
-                if (!result.Started)
-                {
-                    ConfirmDialog.Notice("操作进行中", "已有文件操作正在进行，请稍后再试。");
-                    return;
-                }
-                if (success) LoadItems();
-                else ConfirmDialog.Notice("还原失败", "还原“" + item.Name + "”失败，请检查原始位置是否可用。");
-            }
-            catch (Exception ex)
-            {
-                App.Log("还原回收站项目失败: " + ex.Message);
-                ConfirmDialog.Notice("还原失败", "操作意外中断: " + ex.Message);
-            }
-        }
-
-        private async void DeletePermanentlyAsync(RecycleItem item)
-        {
-            try
-            {
-                bool dataDeleted = false;
-                bool metaDeleted = false;
-                var result = await OperationProgressDialog.RunDetailedAsync("正在永久删除", true, 1,
-                    progress => Task.Run(() =>
-                    {
-                        try
-                        {
-                            if (item.IsDirectory) Directory.Delete(item.DataPath, true);
-                            else File.Delete(item.DataPath);
-                            dataDeleted = true;
-                            try
-                            {
-                                File.Delete(item.MetaFile);
-                                metaDeleted = true;
-                            }
-                            catch (Exception ex) { App.Log("永久删除元数据失败: " + ex.Message); }
-                        }
-                        catch (Exception ex) { App.Log("永久删除失败: " + ex.Message); }
-                        progress.Report(1, item.Name, dataDeleted && metaDeleted);
-                    }));
-                if (_disposed) return;
-                if (!result.Started)
-                {
-                    ConfirmDialog.Notice("操作进行中", "已有文件操作正在进行，请稍后再试。");
-                    return;
-                }
-                if (dataDeleted && metaDeleted) LoadItems();
-                else if (dataDeleted)
-                    ConfirmDialog.Notice("永久删除部分完成", "内容已删除，但回收站元数据清理失败，请检查回收站。");
-                else
-                    ConfirmDialog.Notice("永久删除失败", "无法删除“" + item.Name + "”。");
-                if (!dataDeleted || !metaDeleted) LoadItems();
-            }
-            catch (Exception ex)
-            {
-                App.Log("永久删除失败: " + ex.Message);
-                ConfirmDialog.Notice("永久删除失败", "操作意外中断: " + ex.Message);
-            }
-        }
-
-        private async void CopyRecycleItem(RecycleItem item)
-        {
-            try
-            {
-                string temporaryPath = null;
-                var result = await OperationProgressDialog.RunDetailedAsync("正在准备复制", true, 1,
-                    progress => Task.Run(() =>
-                    {
-                        try
-                        {
-                            temporaryPath = FileClipboard.CreateNamedTemporaryCopy(item.DataPath, item.Name);
-                            progress.Report(1, item.Name, true);
-                        }
-                        catch (Exception ex)
-                        {
-                            App.Log("复制回收站项目失败: " + ex.Message);
-                            progress.Report(1, "操作失败", false);
-                        }
-                    }));
-                if (!result.Started)
-                {
-                    ConfirmDialog.Notice("操作进行中", "已有文件操作正在进行，请稍后再试。");
-                    return;
-                }
-                // 剪贴板写入口(OLE)在被他进程短暂占用时会抛 COMException,这里必须兜住。
-                bool copied = !string.IsNullOrEmpty(temporaryPath)
-                    && FileClipboard.WriteTemporaryPath(temporaryPath);
-                if (!copied)
-                {
-                    FileClipboard.CleanupTemporaryPath(temporaryPath);
-                    ConfirmDialog.Notice("复制失败", "无法复制“" + item.Name + "”。");
-                }
-            }
-            catch (Exception ex)
-            {
-                App.Log("复制回收站项目失败: " + ex.Message);
-                ConfirmDialog.Notice("复制失败", "操作意外中断: " + ex.Message);
-            }
-        }
-
-        private void ShowItemMenu(RecycleItem item)
-        {
-            TrackFlyout(FlyoutMenu.Show(new List<FlyoutItem>
-            {
-                new FlyoutItem("还原", () => RestoreItemAsync(item)),
-                new FlyoutItem("复制", () => CopyRecycleItem(item)),
-                new FlyoutItem("永久删除", () =>
-                {
-                    if (!ConfirmDialog.ShowDanger("永久删除", "“" + item.Name + "”将被永久删除且无法恢复。\n确定要继续吗？", "永久删除")) return;
-                    DeletePermanentlyAsync(item);
-                }, danger: true)
-            }));
-        }
-
-        public override void Dispose()
-        {
-            if (_disposed) return;
-            _disposed = true;
-            _loadVersion++;
-            base.Dispose();
-        }
-
-        private static string FmtRecycleSize(long bytes)
-        {
-            if (bytes < 0) return "";
-            if (bytes >= 1073741824) return (bytes / 1073741824.0).ToString("0.0") + " GB";
-            if (bytes >= 1048576) return (bytes / 1048576.0).ToString("0.0") + " MB";
-            if (bytes >= 1024) return (bytes / 1024.0).ToString("0.0") + " KB";
-            return bytes + " B";
-        }
-
-        // ---------- 右键菜单：清空回收站 ----------
-
-        private void ShowClearMenu()
-        {
-            // 菜单打开不为数量同步扫描所有磁盘；展开页会在后台刷新准确内容。
-            TrackFlyout(FlyoutMenu.Show(new List<FlyoutItem>
-            {
-                new FlyoutItem("清空回收站", EmptyBin, danger: true)
-            }, "回收站"));
-        }
-
-        private async void EmptyBin()
-        {
-            if (!ConfirmDialog.ShowDanger("清空回收站", "所有项目将被永久删除，此操作不可恢复。\n确定要继续吗？", "清空回收站"))
-                return;
-            try
-            {
-                int hr = int.MinValue;
-                var result = await OperationProgressDialog.RunDetailedAsync("正在清空回收站", true, 1,
-                    progress => Task.Run(() =>
-                    {
-                        hr = NativeMethods.EmptyRecycleBin();
-                        progress.Report(1, hr == 0 ? "已完成" : "操作失败", hr == 0);
-                    }));
-                if (!result.Started)
-                {
-                    ConfirmDialog.Notice("操作进行中", "已有文件操作正在进行，请稍后再试。");
-                    return;
-                }
-                App.Log("清空回收站 hr=0x" + hr.ToString("X8"));
-                if (!_disposed) LoadItems();
-                // 空桶调用 SHEmptyRecycleBin 常返回 E_UNEXPECTED,实际无事发生,不能当失败吓用户。
-                if (hr != 0 && hr != NativeMethods.E_UNEXPECTED)
-                    ConfirmDialog.Notice("清空回收站失败", "Windows 未能完成清空操作。\n错误代码: 0x" + hr.ToString("X8"));
-            }
-            catch (Exception ex)
-            {
-                App.Log("清空回收站失败: " + ex.Message);
-                ConfirmDialog.Notice("清空回收站失败", "操作意外中断: " + ex.Message);
-            }
-        }
-
-    }
-
-    // 小文件夹与回收站条目共用的小瓦片骨架:图标+名称+圆角底+悬停/按压反馈+拖拽起点记录。
-    // 此前这段约 70 行的构建与交互代码在 FolderModule.MakeItem 与
-    // RecycleBinModule.MakeRecycleItem 里各抄一份,已经出现过只修一边的漂移;
-    // 抽到这里后,两边只保留真正的差异(拖出内容、双击行为、右键菜单、提示文字)。
-    internal sealed class ItemTile
-    {
-        public readonly Border Root;
-        public readonly ScaleTransform Transform;
-        // 按下时记录的拖拽起点,供调用方的 MouseMove 做系统拖拽阈值判定;
-        // 拖拽结束后由调用方置回 null,松键未拖动的路径由下一次按下覆盖。
-        public Point? DragStart;
-
-        private ItemTile(Border root, ScaleTransform transform)
-        {
-            Root = root;
-            Transform = transform;
-        }
-
-        public static ItemTile Create(string displayName, bool isDir, string ext,
-            string iconPath, string tooltip, Func<bool> isDisposed)
-        {
-            double scale = Ui.Scale;
-            var img = new Image
-            {
-                Width = 40 * scale,
-                Height = 40 * scale,
-                Source = IconCache.GetFallback(isDir, ext),
-                HorizontalAlignment = HorizontalAlignment.Center,
-                Stretch = Stretch.Uniform,
-                SnapsToDevicePixels = true,
-                UseLayoutRounding = true
-            };
-            IconCache.LoadAsync(iconPath, isDir, ext, icon =>
-            {
-                // 缓存命中时会在 img 加入可视化树之前同步回调，此时 IsVisible 必为 false，
-                // 不能用它做守卫，否则真实图标会被静默丢弃、条目永远停在占位图标上。
-                if (!isDisposed()) img.Source = icon;
-            });
-            RenderOptions.SetBitmapScalingMode(img, BitmapScalingMode.HighQuality);
-            var name = new TextBlock
-            {
-                Text = displayName,
-                TextWrapping = TextWrapping.Wrap,
-                TextAlignment = TextAlignment.Center,
-                FontSize = 12 * scale,
-                Opacity = 0.9,
-                MaxHeight = 28 * scale,
-                TextTrimming = TextTrimming.CharacterEllipsis,
-                Margin = new Thickness(0, 4 * scale, 0, 0)
-            };
-            name.SetResourceReference(TextBlock.ForegroundProperty, "ThemePanelText");
-            var sp = new StackPanel
-            {
-                Width = 68 * scale,
-                Margin = new Thickness(3 * scale, 8 * scale, 3 * scale, 8 * scale)
-            };
-            sp.Children.Add(img);
-            sp.Children.Add(name);
-            var root = new Border
-            {
-                CornerRadius = new CornerRadius(8 * scale),
-                Background = Brushes.Transparent,
-                Child = sp,
-                Cursor = Cursors.Hand,
-                ToolTip = tooltip,
-                RenderTransformOrigin = new Point(0.5, 0.5),
-                RenderTransform = new ScaleTransform(1, 1)
-            };
-            var tile = new ItemTile(root, (ScaleTransform)root.RenderTransform);
-            root.MouseEnter += (s, e) => root.SetResourceReference(Border.BackgroundProperty, "ThemePanelControl");
-            root.MouseLeave += (s, e) => { root.Background = Brushes.Transparent; tile.AnimateBack(); };
-            root.PreviewMouseLeftButtonDown += (s, e) =>
-            {
-                tile.DragStart = e.GetPosition(root);
-                tile.Transform.BeginAnimation(ScaleTransform.ScaleXProperty, null);
-                tile.Transform.BeginAnimation(ScaleTransform.ScaleYProperty, null);
-                tile.Transform.ScaleX = 0.93;
-                tile.Transform.ScaleY = 0.93;
-                root.SetResourceReference(Border.BackgroundProperty, "ThemePanelControlHover");
-            };
-            return tile;
-        }
-
-        public void AnimateBack()
-        {
-            Transform.BeginAnimation(ScaleTransform.ScaleXProperty,
-                new DoubleAnimation(1, TimeSpan.FromMilliseconds(150))
-                {
-                    EasingFunction = new BackEase { EasingMode = EasingMode.EaseOut, Amplitude = 0.08 }
-                });
-            Transform.BeginAnimation(ScaleTransform.ScaleYProperty,
-                new DoubleAnimation(1, TimeSpan.FromMilliseconds(150))
-                {
-                    EasingFunction = new BackEase { EasingMode = EasingMode.EaseOut, Amplitude = 0.08 }
-                });
-        }
-    }
-
     public static class IconCache
     {
         private sealed class IconRequest
@@ -1568,14 +604,17 @@ namespace DesktopBar.UI
             public bool IsDirectory;
             public int PixelSize;
             public string Key;
+            public List<Action<BitmapSource>> Subscribers;
         }
 
+        private const int CacheCapacity = 512;
         private static readonly object Gate = new object();
-        private static readonly Dictionary<string, BitmapSource> Cache = new Dictionary<string, BitmapSource>();
-        private static readonly Dictionary<string, BitmapSource> Fallbacks = new Dictionary<string, BitmapSource>();
-        private static readonly ConcurrentDictionary<string, byte> Pending = new ConcurrentDictionary<string, byte>();
-        private static readonly Dictionary<string, List<Action<BitmapSource>>> Callbacks = new Dictionary<string, List<Action<BitmapSource>>>();
-        private static readonly BlockingCollection<IconRequest> Queue = new BlockingCollection<IconRequest>(new ConcurrentQueue<IconRequest>());
+        private static readonly Dictionary<string, BitmapSource> Cache = new();
+        private static readonly Queue<string> CachedKeys = new();
+        private static readonly Dictionary<string, BitmapSource> Fallbacks = new();
+        private static readonly Dictionary<string, LinkedListNode<IconRequest>> Pending = new();
+        private static readonly LinkedList<IconRequest> PrefetchQueue = new();
+        private static readonly LinkedList<IconRequest> VisibleQueue = new();
         private static Thread _worker;
 
         public static BitmapSource GetFallback(bool isDir, string ext)
@@ -1583,100 +622,96 @@ namespace DesktopBar.UI
             int pixelSize = IconPixelSize();
             string key = (isDir ? "dir:" : "file:") + pixelSize;
             lock (Gate)
-            {
-                if (Fallbacks.TryGetValue(key, out var icon)) return icon;
-                // 占位也用 Windows 系统图标（imageres.dll 的文件夹/通用文件），
-                // 保证条目从出现到换上真实图标全程都是 Explorer 同款样式。
-                icon = NativeMethods.GetSystemTypeIcon(isDir, pixelSize) ?? TypeIcon(isDir, ext);
-                Fallbacks[key] = icon;
-                return icon;
-            }
+                if (Fallbacks.TryGetValue(key, out var cached)) return cached;
+            var icon = NativeMethods.GetSystemTypeIcon(isDir, pixelSize) ?? TypeIcon(isDir, ext);
+            lock (Gate) Fallbacks[key] = icon;
+            return icon;
         }
 
         private static int IconPixelSize()
             => Math.Max(48, (int)Math.Ceiling(48 * Ui.Scale * 1.5));
 
-        public static void LoadAsync(string fullPath, bool isDir, string ext, Action<BitmapSource> apply)
+        internal static void LoadAsync(FileSystemInfo item, Action<BitmapSource> apply = null)
         {
-            if (string.IsNullOrWhiteSpace(fullPath) || apply == null) return;
-            int pixelSize = IconPixelSize();
-            string key = (isDir ? "dir:" : "file:") + fullPath.ToLowerInvariant() + "|" + pixelSize;
-            BitmapSource cached;
-            lock (Gate) Cache.TryGetValue(key, out cached);
-            if (cached != null)
-            {
-                apply(cached);
-                return;
-            }
-
+            bool isDirectory = item is DirectoryInfo;
+            int pixels = IconPixelSize();
+            string key = (isDirectory ? "dir:" : "file:") + item.FullName + "|" + pixels + "|" + item.LastWriteTimeUtc.Ticks;
+            BitmapSource icon;
             lock (Gate)
             {
-                if (!Callbacks.TryGetValue(key, out var callbacks))
-                    Callbacks[key] = callbacks = new List<Action<BitmapSource>>();
-                callbacks.Add(apply);
-            }
-            if (!Pending.TryAdd(key, 0)) return;
-            EnsureWorker();
-            Queue.Add(new IconRequest { Path = fullPath, IsDirectory = isDir, PixelSize = pixelSize, Key = key });
-        }
-
-        private static void EnsureWorker()
-        {
-            lock (Gate)
-            {
-                if (_worker != null) return;
-                _worker = new Thread(ProcessQueue)
+                if (!Cache.TryGetValue(key, out icon))
                 {
-                    IsBackground = true,
-                    Name = "ShellIconLoader"
-                };
-                _worker.SetApartmentState(ApartmentState.STA);
-                _worker.Start();
+                    if (!Pending.TryGetValue(key, out var node))
+                    {
+                        var target = apply == null ? PrefetchQueue : VisibleQueue;
+                        node = target.AddLast(new IconRequest
+                        {
+                            Path = item.FullName, IsDirectory = isDirectory, PixelSize = pixels, Key = key
+                        });
+                        Pending.Add(key, node);
+                    }
+                    if (apply != null)
+                    {
+                        (node.Value.Subscribers ??= new List<Action<BitmapSource>>()).Add(apply);
+                        if (node.List == PrefetchQueue)
+                        {
+                            // 展开的面板先取图标。启动预取与点击共用同一个请求。
+                            PrefetchQueue.Remove(node);
+                            VisibleQueue.AddLast(node);
+                        }
+                    }
+                    if (_worker == null)
+                    {
+                        _worker = new Thread(ProcessQueue) { IsBackground = true, Name = "ShellIconLoader" };
+                        _worker.SetApartmentState(ApartmentState.STA);
+                        _worker.Start();
+                    }
+                    Monitor.Pulse(Gate);
+                    return;
+                }
             }
+            apply?.Invoke(icon);
         }
 
         private static void ProcessQueue()
         {
-            foreach (var request in Queue.GetConsumingEnumerable())
+            while (true)
             {
+                IconRequest request;
+                lock (Gate)
+                {
+                    while (VisibleQueue.Count == 0 && PrefetchQueue.Count == 0) Monitor.Wait(Gate);
+                    var queue = VisibleQueue.Count > 0 ? VisibleQueue : PrefetchQueue;
+                    request = queue.First.Value;
+                    queue.RemoveFirst();
+                }
                 BitmapSource icon = null;
                 try
                 {
                     icon = NativeMethods.GetFileIcon(request.Path, request.IsDirectory, request.PixelSize)
                         ?? GetFallback(request.IsDirectory, FilePath.GetExtension(request.Path));
-                    lock (Gate)
-                    {
-                        // 简单容量上限:长会话浏览海量文件/改缩放会让"路径|尺寸"键只增不减,
-                        // 超限整体清空,图标按需重建(重建成本低,远好于无界增长)。
-                        if (Cache.Count >= 512) Cache.Clear();
-                        Cache[request.Key] = icon;
-                    }
                 }
-                catch (Exception ex)
+                catch (Exception ex) { App.Log("提取文件图标失败: " + ex.Message); }
+
+                List<Action<BitmapSource>> callbacks;
+                lock (Gate)
                 {
-                    App.Log("提取文件图标失败: " + ex.Message);
-                    icon = GetFallback(request.IsDirectory, FilePath.GetExtension(request.Path));
+                    Pending.Remove(request.Key);
+                    if (icon != null)
+                    {
+                        if (Cache.Count >= CacheCapacity) Cache.Remove(CachedKeys.Dequeue());
+                        Cache.Add(request.Key, icon);
+                        CachedKeys.Enqueue(request.Key);
+                    }
+                    callbacks = request.Subscribers;
                 }
-                finally
+                if (callbacks == null || icon == null) continue;
+                var dispatcher = Application.Current?.Dispatcher;
+                if (dispatcher == null || dispatcher.HasShutdownStarted) continue;
+                dispatcher.BeginInvoke(new Action(() =>
                 {
-                    List<Action<BitmapSource>> callbacks = null;
-                    lock (Gate)
-                    {
-                        if (Callbacks.TryGetValue(request.Key, out callbacks)) Callbacks.Remove(request.Key);
-                    }
-                    Pending.TryRemove(request.Key, out _);
-                    if (callbacks != null && icon != null)
-                    {
-                        try
-                        {
-                            System.Windows.Application.Current?.Dispatcher.BeginInvoke(new Action(() =>
-                            {
-                                foreach (var callback in callbacks) callback(icon);
-                            }));
-                        }
-                        catch (InvalidOperationException) { }
-                    }
-                }
+                    foreach (var apply in callbacks) apply(icon);
+                }));
             }
         }
 
@@ -1726,8 +761,10 @@ namespace DesktopBar.UI
     {
         private readonly SpectrumSurface _surface;
         private readonly float[] _current = new float[SpectrumService.BarCount];
+        private const int IdleAfterMs = 20000;
         private static readonly TimeSpan ActiveInterval = TimeSpan.FromMilliseconds(32);
-        private static readonly TimeSpan IdleInterval = TimeSpan.FromMilliseconds(100);
+        private static readonly TimeSpan QuietInterval = TimeSpan.FromMilliseconds(100);
+        private static readonly TimeSpan IdleInterval = TimeSpan.FromMilliseconds(67);
         private readonly DispatcherTimer _refresh = new DispatcherTimer(DispatcherPriority.Background);
         private bool _captureActive;
         private bool _disposed;
@@ -1785,30 +822,32 @@ namespace DesktopBar.UI
             // 采集线程重连等中断期间让柱子自然落回底端。
             bool stale = now - SpectrumService.Instance.LastDataTick > 600;
 
-            // 静音时让频谱回到静止状态，不让装饰动画持续刷新整个分层顶栏。
             bool active = false;
             if (!stale && target != null)
                 foreach (var v in target)
                     if (v > 0.12f) { active = true; break; }
             if (active) _lastAudible = now;
-            bool idle = now - _lastAudible >= 1500;
-            var interval = idle ? IdleInterval : ActiveInterval;
+            long silentMs = now - _lastAudible;
+            bool idle = silentMs >= IdleAfterMs;
+            var interval = idle ? IdleInterval : silentMs >= 1500 ? QuietInterval : ActiveInterval;
             if (_refresh.Interval != interval) _refresh.Interval = interval;
-            if (idle)
-            {
-                Array.Clear(_current);
-                _surface.SetValues(_current);
-                return;
-            }
 
+            // 20 秒安静后恢复原来的逐柱波纹，按时间推进，避免空闲时每帧刷新整条顶栏。
+            double head = ((silentMs - IdleAfterMs) / 170.0) % (_current.Length + 6) - 3;
+            float attack = (float)(1 - Math.Pow(0.45, elapsedMs / 33.0));
+            float decay = (float)(1 - Math.Pow(0.72, elapsedMs / 33.0));
             for (int i = 0; i < _current.Length; i++)
             {
-                float t = !stale && target != null && i < target.Length ? target[i] : 0f;
+                float t;
+                if (idle)
+                {
+                    double distance = head - i;
+                    t = distance >= 0 && distance <= 2.5 ? (float)(1 - distance / 2.5) : 0f;
+                }
+                else
+                    t = !stale && target != null && i < target.Length ? target[i] : 0f;
                 float c = _current[i];
-                // 上升跟随快、下落衰减慢；按真实帧间隔插值，交互繁忙跳帧后不会积压变慢。
-                double baseBlend = t > c ? 0.55 : 0.28;
-                double blend = 1 - Math.Pow(1 - baseBlend, elapsedMs / 33.0);
-                c += (t - c) * (float)blend;
+                c += (t - c) * (t > c ? attack : decay);
                 _current[i] = Math.Clamp(c, 0f, 1f);
             }
 

@@ -46,7 +46,7 @@ UI/Modules.cs              10 个具体模块 + IconCache + ItemTile + 自绘渲
 UI/LiquidGlassEffect.cs    液态玻璃 ShaderEffect：胶囊从布局纹理采样轮廓，展开页通过寄存器更新圆角几何；d3dcompiler_47 运行时编译 + 按源码 SHA-256 落盘缓存
 UI/PillGlassGeometry.cs    布局变化时生成全部可见胶囊的距离和法线纹理，着色器成本不随胶囊数量增长
 Services/GlassDiagnostics.cs 玻璃取证/性能自检（--glassshot / --glassperf / --glasssampler），见 §14
-UI/*.cs                    ColorEditor / ConfirmDialog / OperationProgressDialog / Prompt / FlyoutMenu / ShellOpen / Ui
+UI/*.cs                    ColorEditor / ConfirmDialog / FlyoutMenu / ShellOpen / Ui
 docs/                      README 引用的液态玻璃顶栏、展开面板和深浅色设置截图
 Assets/YukiDesk.ico        exe 图标 + 安装器 SetupIconFile
 ```
@@ -58,9 +58,9 @@ Assets/YukiDesk.ico        exe 图标 + 安装器 SetupIconFile
 1. 全局异常兜底**最先**注册（`:64`）：`Bar == null` 时重抛并 `Shutdown(1)`，避免"无窗口无托盘却占着单实例互斥体"的僵尸；启动完成后才吞异常。
 2. `--tempslave` 分支（`:74`）：无托盘/无主窗/不建互斥体的**提权温度从属进程**，由登录计划任务拉起，写入共享内存 `Global\YukiDeskTctl`，主进程退出后自行结束。
 3. 单实例互斥体 `YukiDesk_SingleInstance_Mutex`（`:80`）。
-4. `SettingsService.Load` → `AutoStartService.Set` → 清理 `%TEMP%\YukiDeskClipboard` 残留 → 建 `StorageRoot` 与各小文件夹目录 → 无文件夹时seed「常用」。
+4. `SettingsService.Load` → `AutoStartService.Set`。首次运行初始化存储根目录，随后从实际目录读取小文件夹。
 5. `ThemeService.Start()` → `new MainWindow().Show()` → `BuildTray()` → `UpdateService.StartAutoCheck()`（延迟 25s）→ 后台补齐温度从属进程。
-6. `OnExit`（`:153`）是有序拆解，**不要随意改动顺序**：先 `OperationProgressDialog.BeginShutdown()` + `WaitForIdle(5000)` 等在途文件操作收尾，再停服务、还原 AppBar、关托盘与面板。
+6. `OnExit` 停止服务并还原 AppBar，再释放托盘和顶栏面板。
 
 托盘菜单：打开设置 / 显示·隐藏顶栏 / 打开数据目录 / 退出（`App.xaml.cs:139`）。
 
@@ -84,8 +84,8 @@ Assets/YukiDesk.ico        exe 图标 + 安装器 SetupIconFile
 | `ClockModule` | 106 | 时间/日期/星期/农历/节气，250ms 计时器（隐藏即停） | `Lunar`、`Festivals` |
 | `MusicModule` | 145 | 封面 + 跑马灯歌名；控制走**媒体键** | `MediaService` |
 | `VolumeModule` | 262 | 点击静音、滚轮 ±4%、滑块；120ms 合并写入 | `VolumeService` |
-| `FolderModule` | 442 | 每个 `Settings.Folders` 一项：图标网格、拖入拖出、重命名、粘贴 | `FileSystemWatcher`(300ms 防抖)、`IconCache`、`ItemTile`、`FileClipboard` |
-| `RecycleBinModule` | 953 | 回收站枚举、双击还原、永久删除、拖入即删除 | `RecycleBin`、`ItemTile`、`FileClipboard` |
+| `FolderModule` | `UI/FolderModule.cs` | 预载图标、预览、Windows 文件操作入口 | `FileSystemWatcher`、`IconCache`、`ShellFiles` |
+| `RecycleBinModule` | `UI/RecycleBinModule.cs` | 查看、还原、清空和拖放回收站项目 | `ShellFiles`、`ShellOpen` |
 | `SpectrumModule` | 1712 | 胶囊内 16 根频谱柱，`CompositionTarget.Rendering` 自绘 | `SpectrumService` |
 | `PerfModule` | 1960 | 一个实例一个指标（`PerfMetric` = Cpu/Gpu/Memory/Network） | `PerfService` |
 
@@ -97,11 +97,10 @@ Assets/YukiDesk.ico        exe 图标 + 安装器 SetupIconFile
 | `SpectrumService` | WASAPI **环回采集** → 2048 点 FFT（汉宁窗）→ 40Hz–15kHz 对数 16 频段 | `IAudioClient`/`IAudioCaptureClient` |
 | `MediaService` | SMTC 全局会话：曲名/歌手/封面/播放状态 | WinRT `GlobalSystemMediaTransportControlsSessionManager` |
 | `VolumeService` | 当前默认输出设备的音量/静音 | `IMMDeviceEnumerator`/`IAudioEndpointVolume` |
-| `FileClipboard` | Explorer 兼容的 `CF_HDROP` + `Preferred DropEffect`（复制=5/剪切=2） | WPF `Clipboard` |
-| `RecycleBin` | 直接解析 `$Recycle.Bin\<SID>\$I` 元数据 | 纯托管 |
+| `MiniFolderCatalog` | 读取存储根目录的子文件夹，并保留既有排序 | `Directory.GetDirectories` |
 | `ThemeService` | 主题色解析、壁纸明暗自动适配、系统偏好监听 | `SystemEvents` |
 | `MicaService` | 胶囊自绘材质烘焙（`PillMaterial`：1=云母 2=亚克力，**均已从设置 UI 下架**，仅遗留配置会落到烘焙；采样壁纸→盒式重模糊→压带/保色→染色→噪点→一张冻结位图，后台 STA 烘焙线程） | 注册表壁纸配置 |
-| `GlassService` | 实时背景玻璃（`PillMaterial`：3=高斯模糊 4=液态玻璃）。两条抓屏路径：**DXGI Desktop Duplication**（默认，`Interop/DxgiCapture.cs`，0.5ms/帧、按合成节拍取帧）与 GDI BitBlt 兜底（`YUKI_GLASS_GDI=1`，4ms/帧）。捕获线程半分辨率保留锐帧，四分之一分辨率处理主体 + 三趟盒式模糊（O(n)）→ 差分门控（静止 0 写屏）→ 遮挡保护（全屏窗口盖住时 0 采样）→ 发布驱动 UI 泵 WritePixels → 胶囊挂 `LiquidGlassEffect`（模糊帧做主体、未模糊帧做轮廓折射）。悬停面板走**独立实时玻璃管线**（自己的捕获线程 + `Rectangle` 挂同一个 `LiquidGlassEffect`，复用固定捕获区域，动画只按当前可见矩形更新采样坐标）。自家窗口全部 WDA_EXCLUDEFROMCAPTURE 排除自拍 | `IDXGIOutputDuplication`、`ID3D11Device`、`GetDC`/`BitBlt`、`SetWindowDisplayAffinity`、`WindowFromPoint` |
+| `GlassService` | 实时背景玻璃（`PillMaterial`：3=高斯模糊 4=液态玻璃）。两条抓屏路径：**DXGI Desktop Duplication**（默认，`Interop/DxgiCapture.cs`，0.5ms/帧、按合成节拍取帧）与 GDI BitBlt 兜底（`YUKI_GLASS_GDI=1`，4ms/帧）。捕获线程半分辨率保留锐帧，四分之一分辨率处理主体 + 三趟盒式模糊（O(n)）→ 差分门控（静止 0 写屏）→ 遮挡保护（全屏窗口盖住时 0 采样）→ 发布驱动 UI 泵 WritePixels → 胶囊挂 `LiquidGlassEffect`（模糊帧做主体、未模糊帧做轮廓折射）。悬停面板走**独立实时玻璃管线**（自己的捕获线程 + `Rectangle` 挂同一个 `LiquidGlassEffect`，复用固定捕获区域，动画只按当前可见矩形更新采样坐标）。截图兼容模式用 Windows Graphics Capture 逐窗口采样并按层级合成，整屏模式通过 WDA_EXCLUDEFROMCAPTURE 排除自身 | `IDXGIOutputDuplication`、`ID3D11Device`、`GetDC`/`BitBlt`、`SetWindowDisplayAffinity`、`WindowFromPoint` |
 | `SettingsService` | 原子写 + 备份 + 损坏隔离 + 迁移/钳制 | `System.Text.Json` |
 | `UpdateService` | GitHub Releases 检查/下载/安装（可选 SHA-256 校验） | `HttpClient` |
 | `PawnIoTctl` / `TemperatureSlave` | 读 AMD 原生 Tctl 温度 / 提权从属进程 | `DeviceIoControl`、`MemoryMappedFile` |
@@ -114,7 +113,7 @@ Assets/YukiDesk.ico        exe 图标 + 安装器 SetupIconFile
 - **桌面层钉底**：不是 `WorkerW` 挂载（`计划书.md` 里的旧方案已废弃）。实际做法是 `SetWindowPos` 钉在桌面装饰层之上、普通窗口之下，`WS_EX_NOACTIVATE` 保证不抢焦点；**每 3 秒保底重钉**，钉底前会撤掉外部软件误加的置顶标志，遍历时跳过 DWM cloak 的窗口。顶栏被别的窗口盖住是**设计语义**，不是 bug。
 - **悬停面板是独立置顶窗口**，不在主窗口内；所以隐藏顶栏前必须 `ClosePanels()`，否则会留下可交互的孤儿窗口。
 - **点击穿透**：主窗口 `Background=null` 时鼠标事件穿透到桌面图标；顶栏背景条一旦设置不透明度才会拦截该区域。玻璃档（3/4）下胶囊并集之外 alpha=0（`MainWindow.UpdateGlassClip` 的 GeometryGroup Clip），穿透契约保持；**该函数必须做 Rect 集合比较防抖**——每次给 Clip 赋新 GeometryGroup 都会触发布局失效，不比较会和 LayoutUpdated 形成无限失效循环打满 UI 线程（实测 118%）。
-- **实时玻璃（PillMaterial 3/4）**：模糊在捕获线程 CPU 完成（四分之一分辨率盒式三趟），WPF 侧不放 BlurEffect（满宽 BlurEffect 曾被打满一个核，虽有部分原因是上面的失效循环，CPU 模糊仍更可控）；主窗+面板 WDA_EXCLUDEFROMCAPTURE 后**任何外部截图/录屏都看不到顶栏**（取证用 `YUKI_GLASS_DUMP=<目录>` 环境变量，进程内转储发布帧+主窗 RTB）；顶栏被盖住时捕获自动暂停，这是设计不是卡死。
+- **实时玻璃（PillMaterial 3/4）**：模糊在捕获线程 CPU 完成（四分之一分辨率盒式三趟），WPF 侧不放 BlurEffect（满宽 BlurEffect 曾被打满一个核，虽有部分原因是上面的失效循环，CPU 模糊仍更可控）；截图兼容模式在壁纸上合成各自窗口下方的实时帧。顶栏和面板共享 HWND 采集会话，最多各合成四层，仅读回交叠区域。启用实时屏幕采样时排除自身，顶栏被盖住时暂停采集。
 - **GPU 抓屏（DXGI）**：COM 方法按 SDK 定义的槽位和签名调用（例如 `ID3D11Device::CreateTexture2D` 为 slot 5，`IDXGIOutputDuplication::GetDesc` 返回 `void`）。结构体出参用按 `Marshal.SizeOf` 分配的原生缓冲，`DXGI_OUTDUPL_FRAME_INFO` 为 48 字节，`DXGI_OUTDUPL_DESC` 为 36 字节。暂存纹理的读权限为 `0x20000`。更新门控检查脏矩形和移动区域，切换显示设置重建会话。进程退出时由系统回收最后一个 DXGI 会话，避免驱动 Release 阻塞退出。
 - **玻璃节奏**：GlassMaxFps 为 0 时使用自动节奏，顶栏和面板上限分别为 48 / 36 fps。正数使用手动上限，静止继续按最近一次发布的时间降频。液态玻璃提供清透、柔雾和自定义外观；前两档会按采样背景选择前景颜色。
 - **主题**：`ModuleBase.ApplyTheme` 与 `ThemeService.Refresh` **都会重写** `Application.Current.Resources["ThemePanel*"]`，模块一多就有两个写入方；设置窗口/对话框另用一套冻结的 `Settings*` 键，不跟随运行时主题切换。
@@ -179,7 +178,7 @@ packaging.cmd
 3. ~~`thisPc` 模块没有 `ShowThisPc` 开关~~ **【已修复 2026-10-24】**：`Settings.ShowThisPc`（默认 true）→ `MainWindow.ApplyModuleVisibility` → 设置页「模块显示·此电脑」开关已接通，README 模块清单也已补上。
 4. 无磁盘 IO 监测，尽管叫"性能监测"；四个胶囊只有 CPU/GPU/内存/网络。
 5. `ModuleBase._active` 是跨所有模块的静态单面板锁；`MainWindow._modules` 与 `_folderModules`、单独字段需手工同步，容易泄漏。
-6. ~~`UI/Modules.cs` 有 8 个 `async void`（异常不可观测，仅靠 `_disposed`/版本号守卫）；`FolderModule.MakeItem` 与 `RecycleBinModule.MakeRecycleItem` 是约 150 行的近似复制~~ **【已修复 2026-10-24】**：8 个 `async void` 全部补了兜底 `catch`——用户主动触发的文件操作（粘贴/删除/还原/永久删除/复制/清空）记日志并弹提示，面板刷新（`LoadFiles`/`LoadItems`）只记日志、`LoadFiles` 同时置脏标记。重复段抽成共享 `ItemTile`（图标+名称+圆角底+悬停/按压反馈+拖拽起点记录，约 70 行构建代码单一来源），两模块只保留真正差异（拖出内容、双击行为、右键菜单、提示文字）；`RecycleBinModule.AnimateItemBack` 已删除，统一走 `ItemTile.AnimateBack`。
+6. 文件操作由 Windows Shell 处理，顶栏保留菜单和拖放入口。小文件夹后台读取目录和预取图标，通过版本号阻止旧快照覆盖新列表。
 7. 顶栏设置项多数走"每次变更即写盘 + 整栏重建"，对单个复选框偏重。
 8. ~~`app.manifest` 的 `assemblyIdentity version` 仍是 `1.0.0.0`~~ **【已修复 2026-10-24】**：已同步为 `1.0.8.0`；发版时需随 `<Version>` 手动更新。
 9. `installer.iss:32` 的 AppId 最后一段是 **13 位十六进制**（正常 12 位），虽能编译但形态可疑；改这里会导致升级标识变化。
@@ -218,7 +217,7 @@ YukiDesk.exe --glasstest
 - **这三个开关都排在单实例互斥体之后**——已经有 YukiDesk 在跑时会**静默退出、无产物**。先 `taskkill /F /IM YukiDesk.exe`。
 - **连续跑自检要间隔 ≥6 秒**，否则上一个实例还占着 exe/互斥体，后一次会以 `exit 127/139` 静默失败（127 是 bash 无法 exec，不是应用崩溃；事件日志里也查不到 Application Error）。
 - `--glassshot` 的产物：`shot-bar-original`/`shot-bar-test`（全屏截图）、`glass-input-test.png`（发布帧，四分之一分辨率）、`rtb-*`（窗口内 RenderTargetBitmap，不含 DWM）、`shot-panel-<模块>`（每块面板）、`wallpaper-test.png`。
-- **顶栏在外部截图里看不见是正常的**：主窗与面板都设了 `WDA_EXCLUDEFROMCAPTURE`，凡是从进程外抓屏都拍不到顶栏自己。要拍顶栏必须走进程内（`ShootAsync` 里的 `SaveRtb` 或 `YUKI_GLASS_DUMP` 转储）。
+- 截图兼容模式允许外部捕获顶栏。实时屏幕采样模式使用 WDA_EXCLUDEFROMCAPTURE，内置取证会临时恢复捕获。
 
 ### 玻璃与面板相关的环境变量（都是诊断/兜底，正常运行时不需要）
 

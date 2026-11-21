@@ -39,6 +39,8 @@ namespace DesktopBar
             BuildAppearancePage();
             BuildTimePage();
             BuildFoldersPage();
+            var folderBar = App.Bar;
+            if (folderBar != null) folderBar.FolderCatalogChanged += RefreshFolderList;
             BuildModulesPage();
             BuildGeneralPage();
             BuildAboutPage();
@@ -51,6 +53,8 @@ namespace DesktopBar
             };
             Closed += (s, e) =>
             {
+                if (folderBar != null) folderBar.FolderCatalogChanged -= RefreshFolderList;
+                EndRevealShortcutCapture();
                 ThemeService.Changed -= OnThemeChanged;
                 Microsoft.Win32.SystemEvents.UserPreferenceChanged -= OnSystemThemeChanged;
                 _tempStatusTimer?.Stop();
@@ -63,9 +67,9 @@ namespace DesktopBar
         {
             ["Appearance"] = "外观 材质 胶囊 液态玻璃 雾面 壁纸换图过渡 壁纸过渡 幻灯片过渡 更新节奏 透明度 主题 配色 颜色 边框 缩放",
             ["Time"] = "时间 时钟 日期 星期 秒数 农历 居中",
-            ["Folders"] = "小文件夹 文件 目录 位置 存储 创建 排序 重命名",
+            ["Folders"] = "小文件夹 文件 目录 位置 存储 创建 排序 重命名 资源管理器 定位",
             ["Modules"] = "模块显示 性能 监测 GPU CPU 内存 网络速率 CPU温度 GPU温度 音乐 音量 频谱 回收站",
-            ["General"] = "通用 开机自启 启动 登录 动画时长 悬停关闭 桌面空间 预留 数据 配置 日志",
+            ["General"] = "通用 开机自启 启动 登录 动画时长 悬停关闭 桌面空间 预留 数据 配置 日志 顶栏唤出 鼠标触顶 触顶停留 置顶 全局快捷键 快捷键停留 停留时长 玻璃取景 逐窗口采样 截图 录屏 屏幕共享 远程控制",
             ["About"] = "关于 版本 软件更新 检查更新 下载 GitHub"
         };
 
@@ -87,7 +91,17 @@ namespace DesktopBar
 
         private void Settings_PreviewKeyDown(object sender, KeyEventArgs e)
         {
-            if (e.Key == Key.F && Keyboard.Modifiers == ModifierKeys.Control)
+            if (_recordingRevealShortcut)
+            {
+                e.Handled = true;
+                var key = e.Key == Key.System ? e.SystemKey : e.Key;
+                var modifiers = Keyboard.Modifiers;
+                if (key == Key.Escape && modifiers == ModifierKeys.None)
+                    EndRevealShortcutCapture();
+                else if (!e.IsRepeat && !BarHotkey.IsModifier(key))
+                    SetRevealShortcut(new BarHotkey(key, modifiers));
+            }
+            else if (e.Key == Key.F && Keyboard.Modifiers == ModifierKeys.Control)
             {
                 SettingsSearchBox.Focus();
                 SettingsSearchBox.SelectAll();
@@ -330,7 +344,7 @@ namespace DesktopBar
         }
 
         private FrameworkElement NumberSlider(double min, double max, double val, string suffix, Action<double> changed,
-            Action<double> preview = null, string name = null)
+            Action<double> preview = null, string name = null, double step = 1)
         {
             var s = new Slider
             {
@@ -338,9 +352,9 @@ namespace DesktopBar
                 Maximum = max,
                 Value = Math.Max(min, Math.Min(max, val)),
                 IsSnapToTickEnabled = true,
-                TickFrequency = 1,
-                SmallChange = 1,
-                LargeChange = Math.Max(1, Math.Round((max - min) / 10)),
+                TickFrequency = step,
+                SmallChange = step,
+                LargeChange = step * Math.Max(1, Math.Round((max - min) / (10 * step))),
                 Style = (Style)FindResource("CapsuleSlider")
             };
             if (name != null) System.Windows.Automation.AutomationProperties.SetName(s, name);
@@ -732,252 +746,93 @@ namespace DesktopBar
 
         // ---------- 小文件夹 ----------
 
-        private static bool IsValidFolderName(string name) => SettingsService.IsValidFolderName(name);
-
-        private string GetFolderPath(string name)
-        {
-            if (!IsValidFolderName(name)) return null;
-            try
-            {
-                string root = Path.GetFullPath(S.StorageRoot);
-                string candidate = Path.GetFullPath(Path.Combine(root, name));
-                string relative = Path.GetRelativePath(root, candidate);
-                if (relative == "." || Path.IsPathRooted(relative)
-                    || relative.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal)
-                    || relative.StartsWith(".." + Path.AltDirectorySeparatorChar, StringComparison.Ordinal)) return null;
-                return string.Equals(relative, name, StringComparison.OrdinalIgnoreCase) ? candidate : null;
-            }
-            catch { return null; }
-        }
-
-        /// <summary>
-        /// 把存储根目录下实际存在的子文件夹同步进 S.Folders:
-        /// 磁盘新出现的文件夹自动追加到列表末尾(顶栏最右),配置里已不存在的自动剔除。
-        /// 返回是否有变更。
-        /// </summary>
-        private bool SyncFoldersFromDisk()
-        {
-            try
-            {
-                if (!Directory.Exists(S.StorageRoot)) return false;
-                var onDisk = Directory.GetDirectories(S.StorageRoot)
-                    .Select(Path.GetFileName)
-                    .Where(n => IsValidFolderName(n))
-                    .ToList();
-                var comparer = StringComparer.OrdinalIgnoreCase;
-                bool changed = false;
-                // 新发现的文件夹追加到末尾(顶栏最右)。
-                foreach (var name in onDisk.Where(n => !S.Folders.Contains(n, comparer)))
-                {
-                    S.Folders.Add(name);
-                    changed = true;
-                }
-                // 配置里有但磁盘上已删掉的,自动剔除。
-                for (int i = S.Folders.Count - 1; i >= 0; i--)
-                {
-                    if (!onDisk.Contains(S.Folders[i], comparer))
-                    {
-                        S.Folders.RemoveAt(i);
-                        changed = true;
-                    }
-                }
-                return changed;
-            }
-            catch (Exception ex) { App.Log("同步小文件夹失败: " + ex.Message); return false; }
-        }
-
         private void BuildFoldersPage()
         {
             FoldersHost.Children.Clear();
-            bool synced = SyncFoldersFromDisk();
-            if (synced) Save();
-
-            var pathCard = Card("存储路径",
-                "每个小文件夹都是这个目录下的一个真实子文件夹,拖入的文件就存在里面。目录下的所有文件夹会自动加入顶栏。", out var pbody);
+            var pathCard = Card("存储路径", "顶栏会同步显示这个目录下的子文件夹。", out var pathBody);
             var pathBox = new TextBox
             {
-                Style = (Style)FindResource("DarkBox"),
-                Text = S.StorageRoot,
-                VerticalAlignment = VerticalAlignment.Center,
-                FontSize = 13,
-                IsReadOnly = true
+                Style = (Style)FindResource("DarkBox"), Text = S.StorageRoot,
+                VerticalAlignment = VerticalAlignment.Center, FontSize = 13, IsReadOnly = true
             };
-            var browse = new Button { Content = "浏览…", Style = (Style)FindResource("Btn"), Margin = new Thickness(8, 0, 0, 0) };
-            browse.Click += (s, e) =>
+            var browse = new Button
             {
-                var dlg = new OpenFolderDialog { Title = "选择存储根目录" };
-                if (dlg.ShowDialog() != true) return;
-                string newRoot = dlg.FolderName;
+                Content = "浏览…", Style = (Style)FindResource("Btn"), Margin = new Thickness(8, 0, 0, 0)
+            };
+            browse.Click += async (_, _) =>
+            {
+                var picker = new OpenFolderDialog { Title = "选择存储根目录" };
+                if (picker.ShowDialog(this) != true) return;
+                string root = picker.FolderName;
+                if (string.Equals(root, S.StorageRoot, StringComparison.OrdinalIgnoreCase)) return;
+                browse.IsEnabled = false;
                 try
                 {
-                    if (string.Equals(Path.GetFullPath(newRoot), Path.GetFullPath(S.StorageRoot), StringComparison.OrdinalIgnoreCase)) return;
+                    var names = await System.Threading.Tasks.Task.Run(() => MiniFolderCatalog.ReadNames(root));
+                    if (!IsVisible) return;
+                    if (!ConfirmDialog.Show("更换存储路径",
+                        "将显示新目录下的 " + names.Length + " 个子文件夹。文件仍保存在各自的目录中。\n\n" + root,
+                        "更换", okIsDefault: false)) return;
+                    S.StorageRoot = root;
+                    S.Folders = MiniFolderCatalog.Reconcile(S.Folders, names);
+                    pathBox.Text = root;
+                    App.Save();
+                    App.Bar?.ApplySettings();
+                    RefreshFolderList();
                 }
-                catch { return; }
-                // 换目录会把新目录下所有子文件夹吞进顶栏:误选用户目录/系统目录会瞬间生成一堆
-                // 选项卡且立即持久化,原目录内容不会迁移。必须让用户确认后再执行。
-                int subCount = 0;
-                try { subCount = Directory.GetDirectories(newRoot).Count(n => IsValidFolderName(Path.GetFileName(n))); } catch { }
-                if (!ConfirmDialog.Show("更换存储路径",
-                    "将把存储路径切换为:\n" + newRoot
-                    + "\n\n新目录下的 " + subCount + " 个子文件夹会自动加入顶栏;原目录中的文件不会被移动或删除,顶栏此后指向新位置。确定继续吗?",
-                    "更换", okIsDefault: false))
-                    return;
-                S.StorageRoot = newRoot;
-                pathBox.Text = S.StorageRoot;
-                SyncFoldersFromDisk();
-                Save();
-                RefreshFolderList();
-                App.Bar?.ApplySettings();
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+                {
+                    if (IsVisible) ConfirmDialog.Notice("无法读取目录", ex.Message);
+                }
+                finally { browse.IsEnabled = true; }
             };
-            var pgrid = new Grid();
-            pgrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-            pgrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            Grid.SetColumn(pathBox, 0);
+            var pathGrid = new Grid();
+            pathGrid.ColumnDefinitions.Add(new ColumnDefinition());
+            pathGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             Grid.SetColumn(browse, 1);
-            pgrid.Children.Add(pathBox);
-            pgrid.Children.Add(browse);
-            pbody.Children.Add(pgrid);
+            pathGrid.Children.Add(pathBox);
+            pathGrid.Children.Add(browse);
+            pathBody.Children.Add(pathGrid);
+            var explorer = new Button
+            {
+                Content = "在资源管理器中管理文件夹", Style = (Style)FindResource("BtnAccent"),
+                HorizontalAlignment = HorizontalAlignment.Left, Margin = new Thickness(0, 10, 0, 0)
+            };
+            explorer.Click += (_, _) => ShellOpen.OpenFolder(S.StorageRoot);
+            pathBody.Children.Add(explorer);
             FoldersHost.Children.Add(pathCard);
 
-            var listCard = Card("小文件夹管理",
-                "拖动列表项排序(顶栏同步生效);列表自动包含目录下所有文件夹。「删除文件夹」会将该文件夹及其内容移入回收站。", out var lbody);
+            var listCard = Card("小文件夹顺序", "拖动列表项调整顶栏顺序。也可以选中文件夹来重命名或删除。", out var listBody);
             _folderList = new ListBox
             {
-                Style = (Style)FindResource("DarkList"),
-                Height = 210,
-                Margin = new Thickness(0, 8, 0, 0),
-                FontSize = 14,
-                AllowDrop = true,
-                ItemTemplate = MakeFolderItemTemplate()
+                Style = (Style)FindResource("DarkList"), Height = 210, Margin = new Thickness(0, 8, 0, 0),
+                FontSize = 14, AllowDrop = true, ItemTemplate = MakeFolderItemTemplate()
             };
             _folderList.SetResourceReference(TextElement.ForegroundProperty, "SettingsTextBrush");
             SetupFolderDragSort();
             RefreshFolderList();
-
-            var btnAdd = new Button { Content = "新建文件夹", Style = (Style)FindResource("BtnAccent") };
-            var btnRename = new Button { Content = "重命名", Style = (Style)FindResource("Btn"), Margin = new Thickness(8, 0, 0, 0) };
-            var btnRemove = new Button { Content = "删除文件夹", Style = (Style)FindResource("Btn"), Margin = new Thickness(8, 0, 0, 0) };
-            btnAdd.Click += (s, e) =>
+            listBody.Children.Add(_folderList);
+            var rename = new Button { Content = "重命名", Style = (Style)FindResource("Btn"), IsEnabled = false };
+            var delete = new Button
             {
-                var name = Prompt.Show("新建小文件夹", "文件夹名称:", "新文件夹");
-                if (name == null) return;
-                if (!IsValidFolderName(name))
-                {
-                    ConfirmDialog.Notice("名称无效", "请输入单级文件夹名称，不能包含路径分隔符或 ..。");
-                    return;
-                }
-                try
-                {
-                    string dir = GetFolderPath(name);
-                    if (dir == null) return;
-                    Directory.CreateDirectory(dir);
-                    if (!S.Folders.Contains(name, StringComparer.OrdinalIgnoreCase)) S.Folders.Add(name);
-                    Save();
-                    RefreshFolderList();
-                    App.Bar?.ApplySettings();
-                }
-                catch (Exception ex) { ConfirmDialog.Notice("错误", ex.Message); }
+                Content = "删除文件夹", Style = (Style)FindResource("Btn"), IsEnabled = false,
+                Margin = new Thickness(8, 0, 0, 0)
             };
-            btnRename.Click += (s, e) =>
+            _folderList.SelectionChanged += (_, _) => rename.IsEnabled = delete.IsEnabled = _folderList.SelectedItem is FolderRow;
+            void WithSelectedFolder(Action<IntPtr, string> action)
             {
-                if (_folderList.SelectedIndex < 0)
-                {
-                    ConfirmDialog.Notice("提示", "请先在列表中选中一个小文件夹。");
-                    return;
-                }
-                int idx = _folderList.SelectedIndex;
-                if (idx >= S.Folders.Count) return;
-                string old = S.Folders[idx];
-                var name = Prompt.Show("重命名", "新的名称:", old);
-                if (string.IsNullOrWhiteSpace(name) || name == old) return;
-                if (!IsValidFolderName(name))
-                {
-                    ConfirmDialog.Notice("名称无效", "请输入单级文件夹名称，不能包含路径分隔符或 ..。");
-                    return;
-                }
-                try
-                {
-                    string oldDir = GetFolderPath(old);
-                    string newDir = GetFolderPath(name);
-                    if (oldDir == null || newDir == null) return;
-                    if (!Directory.Exists(oldDir))
-                    {
-                        ConfirmDialog.Notice("重命名失败", "原文件夹不存在，未修改配置。");
-                        return;
-                    }
-                    // 仅大小写变化(abc→ABC)时 Windows 的 Exists 判断会误报"已存在",放行走 Move。
-                    bool caseOnly = string.Equals(oldDir, newDir, StringComparison.OrdinalIgnoreCase);
-                    if (!caseOnly && Directory.Exists(newDir))
-                    {
-                        ConfirmDialog.Notice("重命名失败", "目标文件夹已存在。");
-                        return;
-                    }
-                    if (S.Folders.Where((folder, index) => index != idx).Contains(name, StringComparer.OrdinalIgnoreCase))
-                    {
-                        ConfirmDialog.Notice("重命名失败", "同名小文件夹已存在。");
-                        return;
-                    }
-                    Directory.Move(oldDir, newDir);
-                    S.Folders[idx] = name;
-                    Save();
-                    RefreshFolderList();
-                    App.Bar?.ApplySettings();
-                }
-                catch (Exception ex) { ConfirmDialog.Notice("错误", ex.Message); }
-            };
-            btnRemove.Click += async (s, e) =>
-            {
-                if (_folderList.SelectedIndex < 0) return;
-                int idx = _folderList.SelectedIndex;
-                if (idx >= S.Folders.Count) return;
-                string sel = S.Folders[idx];
-                if (!ConfirmDialog.ShowDanger("确认删除", "删除小文件夹“" + sel + "”？\n\n文件夹及其中的所有文件将移入回收站(可在回收站还原),顶栏选项卡同步移除。", "删除")) return;
-                try
-                {
-                    string dir = GetFolderPath(sel);
-                    if (dir == null)
-                    {
-                        ConfirmDialog.Notice("错误", "该配置中的文件夹名称无效，已阻止删除。");
-                        return;
-                    }
-                    if (Directory.Exists(dir))
-                    {
-                        // 目录内容连同文件夹一起移入回收站(带撤销信息);直接删除不可恢复,不用。
-                        bool success = false;
-                        var result = await OperationProgressDialog.RunDetailedAsync("正在移入回收站", true, 1,
-                            progress => System.Threading.Tasks.Task.Run(() =>
-                            {
-                                success = NativeMethods.DeleteToRecycleBin(new[] { dir });
-                                progress.Report(1, success ? sel : "操作失败", success);
-                            }));
-                        if (!result.Started)
-                        {
-                            ConfirmDialog.Notice("操作进行中", "已有文件操作正在进行，请稍后再试。");
-                            return;
-                        }
-                        if (!success)
-                        {
-                            ConfirmDialog.Notice("错误", "删除文件夹失败(可能被其他程序占用)。");
-                            return;
-                        }
-                    }
-                    // await 期间用户可能已拖动排序或改名,按名称重新定位,不能信 await 前的旧索引。
-                    int cur = S.Folders.FindIndex(f => string.Equals(f, sel, StringComparison.OrdinalIgnoreCase));
-                    if (cur < 0) { RefreshFolderList(); return; }
-                    S.Folders.RemoveAt(cur);
-                    Save();
-                    RefreshFolderList();
-                    App.Bar?.ApplySettings();
-                }
-                catch (Exception ex) { ConfirmDialog.Notice("错误", ex.Message); }
-            };
-
-            var btnRow = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 10, 0, 0) };
-            btnRow.Children.Add(btnAdd);
-            btnRow.Children.Add(btnRename);
-            btnRow.Children.Add(btnRemove);
-            lbody.Children.Add(_folderList);
-            lbody.Children.Add(btnRow);
+                if (_folderList.SelectedItem is not FolderRow selected) return;
+                string path = MiniFolderCatalog.GetFolderPath(S.StorageRoot, selected.Name);
+                if (path == null) return;
+                var owner = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+                ShellFileActions.Run(() => action(owner, path));
+            }
+            rename.Click += (_, _) => WithSelectedFolder(ShellFileActions.Rename);
+            delete.Click += (_, _) => WithSelectedFolder((owner, path) => ShellFiles.Invoke(owner, path, "delete"));
+            var actions = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 10, 0, 0) };
+            actions.Children.Add(rename);
+            actions.Children.Add(delete);
+            listBody.Children.Add(actions);
             FoldersHost.Children.Add(listCard);
         }
 
@@ -1008,8 +863,8 @@ namespace DesktopBar
             {
                 if ((s as FrameworkElement)?.DataContext is FolderRow folder)
                 {
-                    string path = GetFolderPath(folder.Name);
-                    if (path != null) ShellOpen.OpenPath(path);
+                    string path = MiniFolderCatalog.GetFolderPath(S.StorageRoot, folder.Name);
+                    ShellOpen.OpenFolder(path);
                 }
             }));
 
@@ -1144,10 +999,10 @@ namespace DesktopBar
             if (to > from) to--;
             int insert = Math.Min(to, S.Folders.Count);
             S.Folders.Insert(insert, name);
-            Save();
+            App.Save();
             RefreshFolderList();
             _folderList.SelectedIndex = insert;
-            App.Bar?.ApplySettings();
+            App.Bar?.ApplyFolderOrder();
         }
 
         /// <summary>装饰层插入指示线:横贯列表宽度的强调色圆角条,淡入淡出。</summary>
@@ -1589,6 +1444,18 @@ namespace DesktopBar
             b1.Children.Add(Row("动画时长", NumberSlider(80, 1200, S.AnimationDurationMs, "ms", v => { S.AnimationDurationMs = (int)Math.Round(v); Save(); })));
             GeneralHost.Children.Add(card1);
 
+            GeneralHost.Children.Add(BuildRevealCard());
+
+            var captureCard = Card("玻璃取景", null, out var captureBody);
+            captureBody.Children.Add(ToggleRow("逐窗口采样", S.ShowInScreenCapture, enabled =>
+            {
+                S.ShowInScreenCapture = enabled;
+                GlassService.ApplyCaptureVisibility();
+                App.Save();
+            }));
+            captureBody.Children.Add(MakeHint("开启后，玻璃实时合成背后的窗口，桌面空白处映出壁纸，录屏和远程画面也能显示顶栏与展开页。关闭后改用整屏采样，屏幕捕获会隐藏顶栏与展开页。"));
+            GeneralHost.Children.Add(captureCard);
+
             var cardSpace = Card("桌面空间", null, out var bs);
             bs.Children.Add(ToggleRow("为顶栏预留桌面空间", S.ReserveDesktopSpace, v => { S.ReserveDesktopSpace = v; DesktopSpaceService.Apply(S); Save(); }));
             bs.Children.Add(Row("预留高度", NumberSlider(38, 160, S.DesktopSpaceHeight, "px", v => { S.DesktopSpaceHeight = (int)Math.Round(v); if (S.ReserveDesktopSpace) DesktopSpaceService.Apply(S); Save(); })));
@@ -1601,6 +1468,104 @@ namespace DesktopBar
             b2.Children.Add(MakeHint("配置文件:" + Path.Combine(App.AppDataDir, "settings.json") +
                                      "\n日志文件:" + Path.Combine(App.AppDataDir, "log.txt")));
             GeneralHost.Children.Add(card2);
+        }
+
+        private Button _revealShortcutButton;
+        private TextBlock _revealShortcutStatus;
+        private bool _recordingRevealShortcut;
+
+        private FrameworkElement BuildRevealCard()
+        {
+            var card = Card("顶栏唤出", null, out var body);
+            body.Children.Add(ToggleRow("鼠标触顶唤出", S.RevealOnTopEdge, enabled =>
+            {
+                S.RevealOnTopEdge = enabled;
+                App.Bar?.SetEdgeReveal(enabled);
+                App.Save();
+            }));
+            body.Children.Add(Row("触顶停留", NumberSlider(0, AppSettings.MaxRevealEdgeDwellMs, S.RevealEdgeDwellMs, "ms", value =>
+            {
+                S.RevealEdgeDwellMs = (int)value;
+                App.Save();
+            }, step: 10)));
+            body.Children.Add(MakeHint("鼠标在主屏顶边停满设定时长后唤出。离开顶栏和展开页后收起。", 4));
+
+            ToggleButton hotkeyToggle = null;
+            body.Children.Add(ToggleRow("全局快捷键唤出", S.RevealWithHotkey, enabled =>
+            {
+                if (App.Bar?.TrySetRevealHotkey(enabled, BarHotkey.FromSettings(S)) != true)
+                {
+                    hotkeyToggle?.SetCurrentValue(ToggleButton.IsCheckedProperty, S.RevealWithHotkey);
+                    ShowRevealShortcutStatus("这个快捷键无法注册，可能已被 Windows 或其他应用占用。");
+                    return;
+                }
+                S.RevealWithHotkey = enabled;
+                App.Save();
+                ShowRevealShortcutStatus("");
+            }, onCreated: toggle => hotkeyToggle = toggle));
+            _revealShortcutButton = new Button
+            {
+                Content = BarHotkey.FromSettings(S).Display,
+                Style = (Style)FindResource("Btn"),
+                HorizontalAlignment = HorizontalAlignment.Right,
+                ToolTip = "点击后按下所需的快捷键"
+            };
+            _revealShortcutButton.Click += (_, _) =>
+            {
+                _revealShortcutButton.Focus();
+                _recordingRevealShortcut = true;
+                _revealShortcutButton.Content = "按下快捷键…";
+                ShowRevealShortcutStatus("按组合键或功能键。按 Esc 取消。");
+                App.Bar?.CaptureRevealHotkey(SetRevealShortcut);
+            };
+            _revealShortcutButton.LostKeyboardFocus += (_, _) => EndRevealShortcutCapture();
+            body.Children.Add(Row("唤出快捷键", _revealShortcutButton));
+            _revealShortcutStatus = MakeHint("", 4);
+            body.Children.Add(_revealShortcutStatus);
+            ShowRevealShortcutStatus(S.RevealWithHotkey && App.Bar?.RevealHotkeyRegistered == false
+                ? "当前快捷键无法注册，请换一个组合。" : "");
+            body.Children.Add(Row("快捷键停留", NumberSlider(AppSettings.MinRevealDurationSeconds,
+                AppSettings.MaxRevealDurationSeconds, S.RevealDurationSeconds, "秒", value =>
+            {
+                S.RevealDurationSeconds = (int)value;
+                App.Save();
+            })));
+            return card;
+        }
+
+        private void SetRevealShortcut(BarHotkey shortcut)
+        {
+            if (!_recordingRevealShortcut) return;
+            if (!shortcut.IsValid)
+            {
+                ShowRevealShortcutStatus("请使用有效的组合键或功能键。按 Esc 取消。");
+                return;
+            }
+            if (S.RevealWithHotkey && App.Bar?.TrySetRevealHotkey(true, shortcut) != true)
+            {
+                ShowRevealShortcutStatus("这个快捷键无法注册，请试试其他组合。按 Esc 取消。");
+                return;
+            }
+            S.RevealHotkeyKey = shortcut.Key;
+            S.RevealHotkeyModifiers = shortcut.Modifiers;
+            App.Save();
+            EndRevealShortcutCapture();
+        }
+
+        private void EndRevealShortcutCapture()
+        {
+            if (!_recordingRevealShortcut) return;
+            _recordingRevealShortcut = false;
+            App.Bar?.CaptureRevealHotkey(null);
+            _revealShortcutButton.Content = BarHotkey.FromSettings(S).Display;
+            ShowRevealShortcutStatus(S.RevealWithHotkey && App.Bar?.RevealHotkeyRegistered == false
+                ? "当前快捷键无法注册，请换一个组合。" : "");
+        }
+
+        private void ShowRevealShortcutStatus(string text)
+        {
+            _revealShortcutStatus.Text = text;
+            _revealShortcutStatus.Visibility = text.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
         }
 
         // ---------- 关于 ----------

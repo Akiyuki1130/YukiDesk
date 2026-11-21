@@ -115,6 +115,14 @@ namespace DesktopBar.Services
             s.DesktopSpaceHeight = Math.Clamp(s.DesktopSpaceHeight, 38, 160);
             s.HoverCloseDelayMs = Math.Clamp(s.HoverCloseDelayMs, 80, 2000);
             s.AnimationDurationMs = Math.Clamp(s.AnimationDurationMs, 60, 1200);
+            s.RevealEdgeDwellMs = Math.Clamp(s.RevealEdgeDwellMs, 0, AppSettings.MaxRevealEdgeDwellMs);
+            s.RevealDurationSeconds = Math.Clamp(s.RevealDurationSeconds,
+                AppSettings.MinRevealDurationSeconds, AppSettings.MaxRevealDurationSeconds);
+            if (!UI.BarHotkey.FromSettings(s).IsValid)
+            {
+                s.RevealHotkeyKey = UI.BarHotkey.Default.Key;
+                s.RevealHotkeyModifiers = UI.BarHotkey.Default.Modifiers;
+            }
             if (s.SettingsThemeMode < 0 || s.SettingsThemeMode > 2) s.SettingsThemeMode = 0;
             // 胶囊材质档位:0=纯色 3=实时玻璃 4=液态玻璃。云母(1)/亚克力(2)已从设置 UI 下架,
             // 存量配置迁移到玻璃;后端烘焙代码保留,老版本回滚后读 3/4 会因 >2 钳制回落纯色(优雅降级)。

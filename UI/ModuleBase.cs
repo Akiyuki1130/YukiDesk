@@ -38,8 +38,16 @@ namespace DesktopBar.UI
         private int _animationVersion;
         private bool _closing;
         private bool _disposed;
+        private int _shellInteractions;
+        private int _fileDropTargets;
+        private DispatcherTimer _dropSettleTimer;
+        private bool _checkDropPointer;
+        protected bool FileDropInteractionActive => _fileDropTargets > 0 || _dropSettleTimer?.IsEnabled == true;
         protected bool Open;
         private static ModuleBase _active;
+        internal static bool ActivePanelKeepsBarRevealed => _active?.PanelWindow.IsVisible == true
+            && (_active.PanelWindow.IsMouseOver || _active.PanelWindow.IsMouseCaptureWithin
+                || _active._openMenu?.IsOpen == true || _active._shellInteractions > 0 || _active.FileDropInteractionActive);
 
         // 玻璃使用固定捕获纹理。开合时只更新对应当前屏幕矩形的采样坐标。
         private readonly Rectangle _panelGlass;
@@ -92,7 +100,7 @@ namespace DesktopBar.UI
             CreatePanelWindow();
 
             _closeTimer = new DispatcherTimer();
-            _closeTimer.Tick += (s, e) => { _closeTimer.Stop(); HidePanel(); };
+            _closeTimer.Tick += OnCloseTimer;
             Root.MouseEnter += (s, e) =>
             {
                 _closeTimer.Stop();
@@ -135,6 +143,7 @@ namespace DesktopBar.UI
         protected virtual bool CenterPanelOnPill => false;
         protected virtual void OnPanelShown() { }
         protected virtual void OnPanelHidden() { }
+        protected virtual void OnFileDropSettled() { }
 
         private void CreatePanelWindow()
         {
@@ -156,7 +165,7 @@ namespace DesktopBar.UI
             {
                 var h = new System.Windows.Interop.WindowInteropHelper(w).Handle;
                 NativeMethods.ApplyNoActivateToolStyle(h);
-                // 面板横跨顶栏条带,玻璃启用时必须排除出屏幕捕获,否则会污染捕获画面。
+                // 实时模式下登记为排除窗口，避免面板进入顶栏或展开页自己的采样。
                 // 窗口懒创建:SourceInitialized 在首次 ShowPanel 时才触发,正合适。
                 GlassService.RegisterWindow(h);
             };
@@ -177,13 +186,92 @@ namespace DesktopBar.UI
 
         private void StartCloseTimer()
         {
-            if (_openMenu != null) return; // 右键菜单打开期间保持展开页
+            if (_openMenu != null || _shellInteractions > 0 || FileDropInteractionActive) return;
             _closeTimer.Interval = TimeSpan.FromMilliseconds(Math.Max(80, App.Settings?.HoverCloseDelayMs ?? 250));
             _closeTimer.Stop();
             _closeTimer.Start();
         }
 
+        private void OnCloseTimer(object sender, EventArgs e)
+        {
+            if (_checkDropPointer && NativeMethods.TryGetCursorPosition(out int x, out int y))
+            {
+                var point = new Point(x, y);
+                if (ContainsScreenPoint(Pill, point) || ContainsScreenPoint(Panel, point))
+                {
+                    if (Root.IsMouseOver || PanelWindow.IsMouseOver) _closeTimer.Stop();
+                    return;
+                }
+            }
+
+            _closeTimer.Stop();
+            _checkDropPointer = false;
+            if (!FileDropInteractionActive && _openMenu == null && _shellInteractions == 0) HidePanel();
+        }
+
+        private static bool ContainsScreenPoint(FrameworkElement element, Point point)
+            => element.IsVisible && PresentationSource.FromVisual(element) != null
+                && new Rect(element.RenderSize).Contains(element.PointFromScreen(point));
+
         private Popup _openMenu;
+
+        protected IntPtr FileOperationOwner => new System.Windows.Interop.WindowInteropHelper(
+            PanelWindow.IsVisible ? PanelWindow : Window.GetWindow(this) ?? PanelWindow).Handle;
+
+        protected void WireFileDrop(FrameworkElement target, string path, Action<Action> runDrop)
+            => ShellDropTarget.Wire(target, path, runDrop, SetFileDropActive);
+
+        private void SetFileDropActive(bool active)
+        {
+            _fileDropTargets += active ? 1 : -1;
+            if (active)
+            {
+                _dropSettleTimer?.Stop();
+                _closeTimer.Stop();
+                if (_closing && PanelWindow.IsVisible)
+                {
+                    _animationVersion++;
+                    _closing = false;
+                    Open = true;
+                    ClearPanelAnimations();
+                    RefreshLivePanelRect();
+                }
+                GlassService.SetPanelCapturePaused(Panel, true);
+            }
+            else if (_fileDropTargets == 0 && !_disposed)
+            {
+                if (_dropSettleTimer == null)
+                {
+                    _dropSettleTimer = new DispatcherTimer(DispatcherPriority.Background, Dispatcher)
+                    {
+                        Interval = TimeSpan.FromMilliseconds(150)
+                    };
+                    _dropSettleTimer.Tick += (_, _) =>
+                    {
+                        _dropSettleTimer.Stop();
+                        GlassService.SetPanelCapturePaused(Panel, false);
+                        if (!Open) return;
+                        // OLE can leave WPF's hover state stale until the next mouse message.
+                        _checkDropPointer = true;
+                        StartCloseTimer();
+                        OnFileDropSettled();
+                    };
+                }
+                _dropSettleTimer.Start();
+            }
+        }
+
+        protected void RunFileOperation(Action action)
+        {
+            _closeTimer.Stop();
+            _shellInteractions++;
+            try { ShellFileActions.Run(action); }
+            finally
+            {
+                _shellInteractions--;
+                if (Open && !Root.IsMouseOver && !Panel.IsMouseOver) StartCloseTimer();
+            }
+        }
 
         /// <summary>登记正在打开的右键菜单：期间不自动收起面板，菜单关闭后恢复。</summary>
         protected void TrackFlyout(Popup menu)
@@ -522,6 +610,7 @@ namespace DesktopBar.UI
             {
                 // 在后台准备好首帧后再显形；采集不可用时用主题底色及时打开。
                 GlassService.StartLivePanel(Panel, _panelGlass, left, targetTop, width, height, Reveal);
+                if (FileDropInteractionActive) GlassService.SetPanelCapturePaused(Panel, true);
                 if (!revealed) RevealOnTimeout();
             }
             else
@@ -675,6 +764,7 @@ namespace DesktopBar.UI
         {
             bool wasOpen = Open || _closing || PanelWindow.Visibility == Visibility.Visible;
             _closeTimer.Stop();
+            _checkDropPointer = false;
             Open = false;
             _closing = false;
             if (_openMenu != null)
@@ -705,6 +795,7 @@ namespace DesktopBar.UI
         {
             if (_disposed) return;
             _disposed = true;
+            _dropSettleTimer?.Stop();
             CancelPendingPillInk();
             _animationVersion++;
             _closeTimer.Stop();

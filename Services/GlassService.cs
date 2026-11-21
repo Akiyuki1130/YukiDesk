@@ -6,6 +6,7 @@ using System.Runtime.InteropServices;
 using System.Threading;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Media.Media3D;
@@ -28,7 +29,7 @@ namespace DesktopBar.Services
     ///   - 展开页实时采样固定区域；开合时移动纹理视口，静止不重新模糊或上传。
     ///
     /// 捕获配方(根因报告 §9.12.1):GetDC(NULL)+CreateDIBSection(top-down)+BitBlt(SRCCOPY);
-    /// 自家窗口(主窗+面板)全部 WDA_EXCLUDEFROMCAPTURE 排除,否则玻璃把自己拍进去(正反馈);
+    /// 截图兼容模式只采集玻璃下方的窗口并与壁纸合成。整屏模式排除自家窗口以防自采。
     /// BitBlt 不写 alpha → 全程 Bgr32。WriteableBitmap 只在 UI 线程创建与写入(DispatcherObject 亲和)。
     /// </summary>
     public static class GlassService
@@ -52,6 +53,7 @@ namespace DesktopBar.Services
             public int FpsMs;            // 捕获基础间隔
             public int WallpaperFadeMs;
             public bool Liquid;
+            public bool UseWindowBackdrop;
             public int DisplayGeneration;
             public int MidY;             // 遮挡探测采样点的物理 y(胶囊中线)
             public double ImageHeightDip;
@@ -73,7 +75,11 @@ namespace DesktopBar.Services
 
         private static bool _started;
         private static volatile bool _stopped, _enabled, _active = true, _stopThread;
+        // 偶数为桌面底图，奇数为前台底图。编号同时区分快速连续的唤出。
+        private static volatile int _barBackdropGeneration;
+        private static volatile bool _revealNeedsWindow;
         private static long _holdUntil;
+        private static IntPtr _barWindow;
 
         // ---- 诊断/取证 ----(双用途:YUKI_GLASS_DUMP 与 --glassshot;常开计数开销可忽略)
         /// <summary>取证抓图期间暂停采样:抓图必须先恢复 WDA 让顶栏可被捕获,
@@ -108,6 +114,7 @@ namespace DesktopBar.Services
         private static byte[] _latest, _latestSharp;
         private static long _latestSequence, _consumedSequence, _latestCaptureTick;
         private static bool _latestSlideBlending;
+        private static int _latestBackdropGeneration;
         private static int _latestW, _latestH, _displayGeneration;
         private static GlassSpec _latestSpec;
 
@@ -117,6 +124,7 @@ namespace DesktopBar.Services
         private static Border _tint;
         private static WriteableBitmap _wb, _wbSharp;
         private static bool _bodyReady;
+        private static int _appliedBackdropGeneration;
         // UI 泵由"发布"驱动:捕获线程发布新帧后才 BeginInvoke 一次(合并去重)。
         // 曾经是 30fps 常开 DispatcherTimer,静止桌面下每拍都唤醒 UI 线程纯属浪费(实测约 0.5% 单核)。
         private static int _pumpQueued;
@@ -130,6 +138,7 @@ namespace DesktopBar.Services
 
         /// <summary>当前材质是否走玻璃管线(3=高斯玻璃 4=液态玻璃,共用同一条捕获)。</summary>
         private static bool IsGlass => App.Settings?.PillMaterial == 3 || App.Settings?.PillMaterial == 4;
+        private static bool ShouldExcludeWindows => _enabled && App.Settings?.ShowInScreenCapture == false;
 
         // 捕获线程的静止计数(自适应降频:静止越久采样越稀)
         // 静止程度用"距离上次发布多久"衡量(TickCount64 毫秒),不用帧数:
@@ -384,6 +393,17 @@ namespace DesktopBar.Services
             RefreshPanelMaterial(s);
         }
 
+        internal static void ApplyCaptureVisibility()
+        {
+            if (_stopped || !_enabled || App.Settings == null) return;
+            // Arm the capture delay and hide these windows before enabling the screen-backed readers.
+            if (!_shotPause) ApplyExclusionAll();
+            RefreshSpec();
+            RefreshPanelMaterial(App.Settings);
+            if (!ShouldExcludeWindows) RestoreExclusionAll();
+            _panelWake.Set();
+        }
+
         private static bool _liquidAttempted;
         private static int _wallpaperGeneration;
 
@@ -428,6 +448,7 @@ namespace DesktopBar.Services
         {
             Interlocked.Increment(ref _wallpaperGeneration);
             _wake.Set();
+            _panelWake.Set();
         }
 
         internal static int EffectiveFps(int configured, bool panel) => configured > 0 ? configured : panel ? 36 : 48;
@@ -519,14 +540,15 @@ namespace DesktopBar.Services
             ShowGlassEffect(effect);
             lock (Gate)
             {
-                if (!_latestSlideBlending && SameCaptureSpec(spec, _latestSpec))
+                if (!_latestSlideBlending && _latestBackdropGeneration == _barBackdropGeneration
+                    && SameCaptureSpec(spec, _latestSpec))
                     RefreshPillInk(_latest, _latestW, _latestH, spec);
             }
         }
 
         private static void ShowGlassEffect(LiquidGlassEffect effect)
         {
-            var visible = _bodyReady ? effect : null;
+            var visible = _bodyReady && _image.Visibility == Visibility.Visible ? effect : null;
             if (_image.Effect != visible) _image.Effect = visible;
             if (_tint != null) _tint.Visibility = visible == null ? Visibility.Visible : Visibility.Collapsed;
         }
@@ -587,12 +609,14 @@ namespace DesktopBar.Services
                 _excluded.Add(hwnd);
                 _wdaReady[hwnd] = Environment.TickCount64 + HoldMs;
             }
-            if (_enabled && NativeMethods.ExcludeFromCapture(hwnd))
+            if (ShouldExcludeWindows && !_shotPause && NativeMethods.ExcludeFromCapture(hwnd))
             {
-                _holdUntil = Environment.TickCount64 + HoldMs;
+                Volatile.Write(ref _holdUntil, Environment.TickCount64 + HoldMs);
                 _wake.Set();
             }
         }
+
+        internal static void SetBarWindow(IntPtr hwnd) => Volatile.Write(ref _barWindow, hwnd);
 
         /// <summary>窗口销毁前注销(悬停面板 Dispose 路径),防止句柄表膨胀。</summary>
         internal static void ForgetWindow(IntPtr hwnd)
@@ -612,6 +636,35 @@ namespace DesktopBar.Services
             if (_stopped) return;
             _active = active;
             _wake.Set();
+        }
+
+        internal static void SetBarRevealed(bool revealed)
+        {
+            if (_stopped || ((_barBackdropGeneration & 1) != 0) == revealed) return;
+            _barBackdropGeneration++;
+            _wake.Set();
+        }
+
+        internal static void PrepareRevealBackdrop(bool covered)
+        {
+            _revealNeedsWindow = covered;
+            SetBarRevealed(true);
+        }
+
+        internal static bool IsRevealFrameReady => !_enabled || _testSrc
+            || (_bodyReady && _appliedBackdropGeneration == _barBackdropGeneration);
+
+        internal static void UseTintIfRevealFrameMissing()
+        {
+            if (IsRevealFrameReady || _image == null) return;
+            _image.Visibility = Visibility.Hidden;
+            if (_tint != null)
+            {
+                _tint.Background = Ui.Brush(ThemeService.Background);
+                _tint.Opacity = Math.Max(0.60, App.Settings.ThemeOpacity);
+                _tint.Visibility = Visibility.Visible;
+            }
+            MainWindow.Bar?.ResetGlassInk();
         }
 
         /// <summary>设置胶囊并集裁剪几何(主窗 LayoutUpdated 防抖后调用);rects 同时喂给液态玻璃着色器。</summary>
@@ -694,9 +747,9 @@ namespace DesktopBar.Services
 
         // ---------- 展开页玻璃(实时) ----------
 
-        private sealed record PanelOptions(bool Liquid, int Blur, Color Tint, double TintOpacity);
+        private sealed record PanelOptions(bool Liquid, int Blur, Color Tint, double TintOpacity, bool UseWindowBackdrop);
         private enum PanelRead { Failed, Unchanged, Changed }
-        private sealed record PanelRequest(Int32Rect Bounds, double Dpi, int Session, PanelOptions Options);
+        private sealed record PanelRequest(Int32Rect Bounds, double Dpi, int Session, IntPtr Window, PanelOptions Options);
 
         private sealed class PanelFrame
         {
@@ -715,12 +768,41 @@ namespace DesktopBar.Services
             private byte[] _raw, _previous, _blurScratch;
             private PanelRequest _previousRequest;
             private Int32Rect _previousRegion;
+            private WallpaperMonitor.Snapshot _previousWallpaper;
+            private Int32Rect _wallpaperRegion;
+            private readonly WindowBackdrop _backdrop = new();
+            private byte[] _wallpaperPixels;
 
             public PanelRead Read(PanelRequest request, Int32Rect region)
             {
+                if (request.Options.UseWindowBackdrop)
+                {
+                    var wallpaper = ThemeService.CurrentWallpaper;
+                    if (wallpaper == null) return PanelRead.Failed;
+                    if (wallpaper != _previousWallpaper || _wallpaperPixels == null || region != _wallpaperRegion)
+                    {
+                        _wallpaperPixels = WallpaperMonitor.ReadWallpaperRegion(
+                            wallpaper, region.X, region.Y, region.Width / 2, region.Height / 2);
+                        _wallpaperRegion = region;
+                        _previousWallpaper = wallpaper;
+                    }
+                    if (_wallpaperPixels == null) return PanelRead.Failed;
+                    var pixels = _backdrop.Composite(request.Window, region, _wallpaperPixels);
+                    if (pixels == null) return PanelRead.Failed;
+                    if (ReferenceEquals(request, _previousRequest) && region == _previousRegion
+                        && pixels.AsSpan().SequenceEqual(_previous)) return PanelRead.Unchanged;
+                    if (_dib != IntPtr.Zero) DestroyScreenCapture();
+                    _width = region.Width;
+                    _height = region.Height;
+                    Resize(ref _raw, pixels.Length);
+                    pixels.CopyTo(_raw, 0);
+                    Resize(ref _blurScratch, _width * _height / 4);
+                    return PanelRead.Changed;
+                }
+                _backdrop.Suspend();
                 if (_dib == IntPtr.Zero || _width != region.Width || _height != region.Height)
                 {
-                    Dispose();
+                    DestroyScreenCapture();
                     _width = region.Width;
                     _height = region.Height;
                     if (!NativeMethods.CreateStripCapture(_width, _height, out _screenDc, out _memoryDc, out _dib, out _bits))
@@ -772,7 +854,15 @@ namespace DesktopBar.Services
                 if (buffer == null || buffer.Length != length) buffer = new byte[length];
             }
 
-            public void Dispose() => NativeMethods.DestroyStripCapture(ref _screenDc, ref _memoryDc, ref _dib);
+            internal void SuspendWindows() => _backdrop.Suspend();
+
+            private void DestroyScreenCapture() => NativeMethods.DestroyStripCapture(ref _screenDc, ref _memoryDc, ref _dib);
+
+            public void Dispose()
+            {
+                _backdrop.Dispose();
+                DestroyScreenCapture();
+            }
         }
 
         private static Border _panelTarget;
@@ -786,6 +876,7 @@ namespace DesktopBar.Services
         private static volatile int _panelFps;
         private static volatile int _loopPhase;
         private static volatile PanelRequest _panelRequest;
+        private static volatile bool _panelCapturePaused;
         private static PanelRequest _panelDisplayedRequest;
         private static Int32Rect _panelDisplayedRegion, _panelVisibleRect;
         private static long _panelDisplayedAt, _panelSequence, _panelConsumedSequence;
@@ -807,7 +898,7 @@ namespace DesktopBar.Services
             bool liquid = settings.PillMaterial == 4 && _panelEffect != null;
             var look = CurrentLook(settings);
             return new PanelOptions(liquid, BoxRadiusFor(look.Blur * dpi, 4),
-                liquid ? Colors.Transparent : look.Tint, liquid ? 0 : look.TintOpacity);
+                liquid ? Colors.Transparent : look.Tint, liquid ? 0 : look.TintOpacity, settings.ShowInScreenCapture);
         }
 
         internal static void StartLivePanel(Border panel, Rectangle surface, double dipX, double dipY,
@@ -825,11 +916,14 @@ namespace DesktopBar.Services
                 _panelSurface.Fill = Brushes.Transparent;
             }
             _panelTarget = panel;
+            _panelCapturePaused = false;
             _panelSurface = surface;
             _panelReady = ready;
             var dpi = VisualTreeHelper.GetDpi(panel);
             var bounds = DipRectToPixels(dpi, dipX, dipY, dipW, dipH);
+            var window = Window.GetWindow(panel);
             var request = new PanelRequest(bounds, dpi.DpiScaleX, ++_panelSession,
+                window == null ? IntPtr.Zero : new WindowInteropHelper(window).Handle,
                 GetPanelOptions(App.Settings, dpi.DpiScaleX));
             _panelVisibleRect = bounds;
             _panelScale = 1;
@@ -926,6 +1020,7 @@ namespace DesktopBar.Services
         {
             if (panel != null && !ReferenceEquals(_panelTarget, panel)) return;
             _panelRequest = null;
+            _panelCapturePaused = false;
             _panelReady = null;
             if (_panelSurface != null)
             {
@@ -934,6 +1029,16 @@ namespace DesktopBar.Services
             }
             _panelTarget = null;
             _panelSurface = null;
+            _panelWake.Set();
+        }
+
+        internal static void SetPanelCapturePaused(Border panel, bool paused)
+        {
+            var request = _panelRequest;
+            if (request == null || !ReferenceEquals(_panelTarget, panel) || _panelCapturePaused == paused) return;
+            // Keep the displayed texture and discard queued frames from the drag image's lifetime.
+            if (!paused) _panelRequest = request with { };
+            _panelCapturePaused = paused;
             _panelWake.Set();
         }
 
@@ -978,9 +1083,16 @@ namespace DesktopBar.Services
             while (!_panelThreadStop)
             {
                 var request = _panelRequest;
-                if (request == null || _shotPause)
+                if (request == null || _shotPause || _panelCapturePaused)
                 {
+                    if (request == null) capture.SuspendWindows();
                     _panelWake.WaitOne();
+                    continue;
+                }
+                long hold = Volatile.Read(ref _holdUntil) - Environment.TickCount64;
+                if (!request.Options.UseWindowBackdrop && hold > 0)
+                {
+                    _panelWake.WaitOne((int)Math.Min(hold, 100));
                     continue;
                 }
 
@@ -1003,7 +1115,7 @@ namespace DesktopBar.Services
                         Interlocked.Increment(ref StatPanelBlurs);
                         lock (Gate)
                         {
-                            if (!ReferenceEquals(_panelRequest, request)) continue;
+                            if (_shotPause || _panelCapturePaused || !ReferenceEquals(_panelRequest, request)) continue;
                             frame.Request = request;
                             frame.Region = region;
                             frame.CaptureTick = start;
@@ -1036,6 +1148,7 @@ namespace DesktopBar.Services
 
                 int fps = EffectiveFps(_panelFps, panel: true);
                 int budget = (1000 + fps - 1) / fps;
+                if (request.Options.UseWindowBackdrop) budget = Math.Max(50, budget);
                 long idle = Environment.TickCount64 - lastPublish;
                 if (idle > 350) budget = Math.Max(budget, idle > 1000 ? 100 : 55);
                 int spent = (int)Stopwatch.GetElapsedTime(start).TotalMilliseconds;
@@ -1062,7 +1175,7 @@ namespace DesktopBar.Services
         private static void PanelPumpTick()
         {
             var request = _panelRequest;
-            if (_stopped || request == null || _panelSurface == null) return;
+            if (_stopped || _shotPause || request == null || _panelSurface == null || _panelCapturePaused) return;
             lock (Gate)
             {
                 var frame = _panelPending;
@@ -1199,6 +1312,7 @@ namespace DesktopBar.Services
                 WallpaperFadeMs = SystemParameters.ClientAreaAnimation ? s?.WallpaperFadeDurationMs ?? 360 : 0,
                 MidY = Math.Max(4, (int)Math.Ceiling(barPhysH / 2)),
                 Liquid = s?.PillMaterial == 4,
+                UseWindowBackdrop = s?.ShowInScreenCapture == true,
                 DisplayGeneration = _displayGeneration,
             };
             spec.HalfWidth = spec.Width / 2;
@@ -1242,8 +1356,7 @@ namespace DesktopBar.Services
             _enabled = on;
             if (on)
             {
-                ApplyExclusionAll();
-                _holdUntil = Environment.TickCount64 + HoldMs;
+                if (!_shotPause) ApplyExclusionAll();
                 if (_thread == null)
                 {
                     _thread = new Thread(CaptureLoop) { IsBackground = true, Name = "YukiDesk.GlassCapture" };
@@ -1263,6 +1376,8 @@ namespace DesktopBar.Services
 
         private static void ApplyExclusionAll()
         {
+            if (!ShouldExcludeWindows) return;
+            Volatile.Write(ref _holdUntil, Environment.TickCount64 + HoldMs);
             IntPtr[] list;
             lock (Gate) list = new List<IntPtr>(_excluded).ToArray();
             foreach (var h in list) NativeMethods.ExcludeFromCapture(h);
@@ -1325,7 +1440,7 @@ namespace DesktopBar.Services
 
         private static void PumpTick(object sender, EventArgs e)
         {
-            if (!_enabled || _stopped) return;
+            if (!_enabled || _stopped || _shotPause) return;
             if (_testSrc) return;   // 合成图案模式:不让捕获帧覆盖图案
             Interlocked.Increment(ref StatPumps);
             bool wroteFrame = false;
@@ -1343,7 +1458,7 @@ namespace DesktopBar.Services
                     var f = _latest;
                     if (f == null || _latestSequence == _consumedSequence || _image == null) return;
                     var spec = _spec;
-                    if (!SameCaptureSpec(spec, _latestSpec)) return;
+                    if (_latestBackdropGeneration != _barBackdropGeneration || !SameCaptureSpec(spec, _latestSpec)) return;
                     if (_wb == null || _wb.PixelWidth != _latestW || _wb.PixelHeight != _latestH)
                     {
                         _wb = new WriteableBitmap(_latestW, _latestH, 96, 96, PixelFormats.Bgra32, null);
@@ -1355,6 +1470,12 @@ namespace DesktopBar.Services
                     }
                     _wb.WritePixels(new Int32Rect(0, 0, _latestW, _latestH), f, _latestW * 4, 0);
                     _bodyReady = true;
+                    _appliedBackdropGeneration = _latestBackdropGeneration;
+                    if (_image.Visibility != Visibility.Visible)
+                    {
+                        SetFallbackTint(App.Settings);
+                        _image.Visibility = Visibility.Visible;
+                    }
                     ShowGlassEffect(App.Settings?.PillMaterial == 4 ? _liquid : null);
                     Interlocked.Increment(ref StatWrites);
                     var sf = _latestSharp;
@@ -1485,7 +1606,8 @@ namespace DesktopBar.Services
         private static bool SameCaptureSpec(GlassSpec a, GlassSpec b)
         {
             return a != null && b != null && a.Width == b.Width && a.Height == b.Height
-                && a.BlurQuarter == b.BlurQuarter && a.Liquid == b.Liquid && a.DisplayGeneration == b.DisplayGeneration;
+                && a.BlurQuarter == b.BlurQuarter && a.Liquid == b.Liquid && a.DisplayGeneration == b.DisplayGeneration
+                && a.UseWindowBackdrop == b.UseWindowBackdrop;
         }
 
         private static void EnsureDxgi()
@@ -1504,6 +1626,7 @@ namespace DesktopBar.Services
         private static void CaptureLoop()
         {
             GlassDiagnostics.TagThread("玻璃捕获");
+            using var windowBackdrop = new WindowBackdrop();
             IntPtr screenDc = IntPtr.Zero, memoryDc = IntPtr.Zero, dib = IntPtr.Zero, bits = IntPtr.Zero;
             int capW = 0, capH = 0, hw = 0, hh = 0;
             byte[] full = null, halfRaw = null, halfBase = null, workB = null;
@@ -1517,6 +1640,7 @@ namespace DesktopBar.Services
             int fadeDurationMs = 0;
             long retrySlideAt = 0;
             bool covered = false;
+            int previousBackdropGeneration = _barBackdropGeneration;
             long nextCoverageCheck = 0;
             try
             {
@@ -1525,13 +1649,14 @@ namespace DesktopBar.Services
                     var spec = _spec;
                     if (!_enabled || !_active || spec == null)
                     {
+                        windowBackdrop.Suspend();
                         _loopPhase = 1;
                         hasBaseline = false;
                         deferredFrame = false;
                         _wake.WaitOne(400);
                         continue;
                     }
-                    if (Environment.TickCount64 < Volatile.Read(ref _holdUntil))
+                    if (!spec.UseWindowBackdrop && Environment.TickCount64 < Volatile.Read(ref _holdUntil))
                     {
                         _loopPhase = 2;
                         Thread.Sleep(100);
@@ -1546,15 +1671,31 @@ namespace DesktopBar.Services
                         continue;
                     }
                     int wallpaper = Volatile.Read(ref _wallpaperGeneration);
-                    if (wallpaperGeneration != wallpaper || !SameCaptureSpec(spec, previousSpec))
+                    int backdropGeneration = _barBackdropGeneration;
+                    bool revealed = (backdropGeneration & 1) != 0;
+                    if (wallpaperGeneration != wallpaper || !SameCaptureSpec(spec, previousSpec)
+                        || backdropGeneration != previousBackdropGeneration)
                     {
+                        if (backdropGeneration != previousBackdropGeneration)
+                        {
+                            if (spec.UseWindowBackdrop) windowBackdrop.InvalidateLayers();
+                            else
+                            {
+                                hasDxgiPixels = false;
+                                renderedSlide = null;
+                                fadeFrom = fadeTo = null;
+                            }
+                        }
+                        previousBackdropGeneration = backdropGeneration;
                         wallpaperGeneration = wallpaper;
                         hasBaseline = false;
                         deferredFrame = false;
                         nextCoverageCheck = 0;
                     }
-                    if (previousSpec != null && spec.DisplayGeneration != previousSpec.DisplayGeneration)
+                    if (previousSpec != null && (spec.DisplayGeneration != previousSpec.DisplayGeneration
+                        || spec.UseWindowBackdrop != previousSpec.UseWindowBackdrop))
                     {
+                        windowBackdrop.Suspend();
                         ResetDxgi(true);
                         hasDxgiPixels = false;
                         renderedSlide = null;
@@ -1588,7 +1729,13 @@ namespace DesktopBar.Services
                     }
 
                     var slide = ThemeService.CurrentWallpaper;
-                    bool useWallpaper = slide?.IsSlideshow == true;
+                    if (spec.UseWindowBackdrop && slide == null)
+                    {
+                        _wake.WaitOne(300);
+                        continue;
+                    }
+                    // 截图兼容模式在壁纸上合成后方窗口。旧整屏模式的幻灯片路径仍做平滑切换。
+                    bool useWallpaper = spec.UseWindowBackdrop || (!revealed && slide?.IsSlideshow == true);
                     bool slideCompleted = false;
                     if (useWallpaper)
                     {
@@ -1597,7 +1744,9 @@ namespace DesktopBar.Services
                             long now = Environment.TickCount64;
                             if (slide != unreadableSlide || now >= retrySlideAt)
                             {
-                                var next = WallpaperMonitor.ReadSlideshowStrip(slide, hw, hh);
+                                var next = spec.UseWindowBackdrop
+                                    ? WallpaperMonitor.ReadWallpaperRegion(slide, slide.Monitor.Left, slide.Monitor.Top, hw, hh)
+                                    : WallpaperMonitor.ReadSlideshowStrip(slide, hw, hh);
                                 if (next != null)
                                 {
                                     if (renderedSlide != null && spec.WallpaperFadeMs > 0)
@@ -1627,7 +1776,7 @@ namespace DesktopBar.Services
                             }
                             if (slide != renderedSlide && fadeTo == null)
                             {
-                                if (renderedSlide != null)
+                                if (spec.UseWindowBackdrop || renderedSlide != null)
                                 {
                                     _wake.WaitOne(300);
                                     continue;
@@ -1648,7 +1797,7 @@ namespace DesktopBar.Services
                             }
                             else BlendWallpaperStrip(fadeFrom, fadeTo, halfRaw, progress);
                         }
-                        if (useWallpaper && hasBaseline && fadeTo == null && !slideCompleted)
+                        if (!spec.UseWindowBackdrop && useWallpaper && hasBaseline && fadeTo == null && !slideCompleted)
                         {
                             _wake.WaitOne(300);
                             continue;
@@ -1663,12 +1812,12 @@ namespace DesktopBar.Services
                     }
 
                     long checkAt = Environment.TickCount64;
-                    if (!useWallpaper && checkAt >= nextCoverageCheck)
+                    if (!useWallpaper && !revealed && checkAt >= nextCoverageCheck)
                     {
                         covered = IsCovered(spec);
                         nextCoverageCheck = checkAt + 150;
                     }
-                    if (!useWallpaper && covered)
+                    if (!useWallpaper && !revealed && covered)
                     {
                         hasBaseline = false;
                         deferredFrame = false;
@@ -1690,9 +1839,16 @@ namespace DesktopBar.Services
                         if (acquired == 1)
                         {
                             Interlocked.Increment(ref StatDxgiIdle);
-                            if (!hasDxgiPixels || (hasBaseline && !deferredFrame)) continue;
-                            // 等待超时不是采集失败。补发上一帧，避免混进缺少合成层的 GDI 画面。
-                            reusePixels = true;
+                            if (!hasDxgiPixels)
+                            {
+                                // 静止的最大化窗口可能没有新的 DXGI 帧。唤出首帧先取当前屏幕。
+                                if (!revealed || hasBaseline) continue;
+                            }
+                            else
+                            {
+                                if (hasBaseline && !deferredFrame) continue;
+                                reusePixels = true;
+                            }
                         }
                         else if (acquired != 0)
                         {
@@ -1726,6 +1882,12 @@ namespace DesktopBar.Services
                                 App.Log("玻璃:DXGI 条带读回失败，回退 GDI BitBlt");
                                 ResetDxgi(false);
                                 hasBaseline = false;
+                                hasDxgiPixels = false;
+                            }
+                            else if (revealed && !hasBaseline && IsBlackCaptureBand(full))
+                            {
+                                // DXGI 刚开始采集时可能先交付空纹理。用 GDI 确认当前画面，再决定首帧。
+                                copied = false;
                                 hasDxgiPixels = false;
                             }
                             else hasDxgiPixels = true;
@@ -1765,11 +1927,22 @@ namespace DesktopBar.Services
                         Interlocked.Add(ref StatDownTicks, Stopwatch.GetTimestamp() - tDown);
                     }
 
+                    var backdrop = spec.UseWindowBackdrop
+                        ? windowBackdrop.Composite(Volatile.Read(ref _barWindow), new Int32Rect(0, 0, capW, capH), halfRaw)
+                        : halfRaw;
+                    if (revealed && !hasBaseline && spec.UseWindowBackdrop &&
+                        (windowBackdrop.WaitingForWindowFrame
+                            || ReferenceEquals(backdrop, halfRaw) && (_revealNeedsWindow || windowBackdrop.HasSources)))
+                    {
+                        _wake.WaitOne(50);
+                        continue;
+                    }
                     long tDiff = System.Diagnostics.Stopwatch.GetTimestamp();
-                    double diff = hasBaseline ? MeanAbsDiff(halfBase, halfRaw, hw, hh, 16) : 1e9;
+                    double diff = hasBaseline ? MeanAbsDiff(halfBase, backdrop, hw, hh, 16) : 1e9;
                     Interlocked.Add(ref StatDiffTicks, System.Diagnostics.Stopwatch.GetTimestamp() - tDiff);
                     long nowTick = Environment.TickCount64;
-                    bool publish = slideCompleted || _alwaysPub || diff >= DiffThreshold;
+                    bool windowRegionChanged = spec.UseWindowBackdrop && !backdrop.AsSpan().SequenceEqual(halfBase);
+                    bool publish = slideCompleted || _alwaysPub || diff >= DiffThreshold || windowRegionChanged;
                     // 小幅漂移(例如慢速滚动、小面积动画)不必按满帧率发布:每次发布都要整条窗口重呈。
                     // 但 100ms 的闸门(10fps)在液态玻璃下能看出卡顿,收到 50ms(20fps)——
                     // 折中:CPU 只多一半,肉眼基本连续。
@@ -1789,16 +1962,18 @@ namespace DesktopBar.Services
                             workA = _rotate[slot];
                             sharpA = spec.Liquid ? _rotateSharp[slot] ??= new byte[halfRaw.Length] : null;
                         }
-                        Downsample2x(halfRaw, hw, hh, workA, spec.BodyWidth, spec.BodyHeight);
+                        Downsample2x(backdrop, hw, hh, workA, spec.BodyWidth, spec.BodyHeight);
                         // 未模糊帧只做降采样拷贝(无模糊),供轮廓折射采样;与模糊帧同槽位轮换,杜绝撕裂。
-                        if (sharpA != null) Array.Copy(halfRaw, sharpA, sharpA.Length);
+                        if (sharpA != null) Array.Copy(backdrop, sharpA, sharpA.Length);
                         long tBlur = System.Diagnostics.Stopwatch.GetTimestamp();
                         BoxBlur3(workA, workB, spec.BodyWidth, spec.BodyHeight, spec.BlurQuarter);
                         Interlocked.Add(ref StatBlurTicks, System.Diagnostics.Stopwatch.GetTimestamp() - tBlur);
                         lock (Gate)
                         {
-                            if (_stopThread || !_enabled || !SameCaptureSpec(_spec, spec)) continue;
+                            if (_stopThread || !_enabled || _shotPause || backdropGeneration != _barBackdropGeneration
+                                || !SameCaptureSpec(_spec, spec)) continue;
                             _latestSpec = spec;
+                            _latestBackdropGeneration = backdropGeneration;
                             _latestSequence++;
                             _latestCaptureTick = reusePixels ? 0 : busyStart;
                             _latestSlideBlending = fadeTo != null;
@@ -1808,7 +1983,7 @@ namespace DesktopBar.Services
                             _latestH = spec.BodyHeight;
                         }
                         _lastPubTick = nowTick;
-                        Array.Copy(halfRaw, halfBase, halfBase.Length);
+                        Array.Copy(backdrop, halfBase, halfBase.Length);
                         hasBaseline = true;
                         Interlocked.Increment(ref StatPublishes);
                         SchedulePump();   // 有新帧才唤醒 UI 线程(静止时 0 唤醒)
@@ -1827,6 +2002,8 @@ namespace DesktopBar.Services
                     long idle = Environment.TickCount64 - _lastPubTick;
                     int delay = fadeTo != null ? Math.Max(spec.FpsMs, 16)
                         : Math.Max(spec.FpsMs, idle > 1000 ? 70 : idle > 350 ? 40 : 0);
+                    if (spec.UseWindowBackdrop)
+                        delay = Math.Max(delay, windowBackdrop.HasSources || fadeTo != null ? 50 : 140);
                     // DXGI 的本轮等待也算在帧间隔内。
                     int spent = (int)Stopwatch.GetElapsedTime(iterationStart).TotalMilliseconds;
                     if (delay > spent) _wake.WaitOne(delay - spent);
@@ -1840,6 +2017,13 @@ namespace DesktopBar.Services
             {
                 NativeMethods.DestroyStripCapture(ref screenDc, ref memoryDc, ref dib);
             }
+        }
+
+        private static bool IsBlackCaptureBand(byte[] pixels)
+        {
+            foreach (uint pixel in MemoryMarshal.Cast<byte, uint>(pixels.AsSpan()))
+                if ((pixel & 0x00FFFFFF) != 0) return false;
+            return true;
         }
 
         private static void BlendWallpaperStrip(byte[] from, byte[] to, byte[] pixels, double progress)

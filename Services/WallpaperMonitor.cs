@@ -7,7 +7,7 @@ using DesktopBar.Interop;
 
 namespace DesktopBar.Services
 {
-    /// <summary>读取 Windows 正在主屏显示的幻灯片图片，按桌面填充方式采样顶栏所在区域。</summary>
+    /// <summary>读取 Windows 正在主屏显示的壁纸，按桌面填充方式采样指定区域。</summary>
     internal static class WallpaperMonitor
     {
         private static readonly Type DesktopWallpaperClass = Type.GetTypeFromCLSID(
@@ -106,26 +106,31 @@ namespace DesktopBar.Services
 
         // 每张幻灯片只取一次条带。直接在半分辨率采样，供模糊主体和折射边缘共用。
         internal static byte[] ReadSlideshowStrip(Snapshot state, int width, int height)
+            => ReadRegion(state, state.Monitor.Left, state.Monitor.Top, width, height, allowSolidFallback: false);
+
+        internal static byte[] ReadWallpaperRegion(Snapshot state, int x, int y, int width, int height)
+            => ReadRegion(state, x, y, width, height, allowSolidFallback: true);
+
+        private static byte[] ReadRegion(Snapshot state, int x, int y, int width, int height, bool allowSolidFallback)
         {
-            if (string.IsNullOrEmpty(state.Path)) return null;
             try
             {
-                using var wallpaper = TryOpen(state.Path);
-                if (wallpaper == null) return null;
+                using var wallpaper = string.IsNullOrEmpty(state.Path) ? null : TryOpen(state.Path);
+                if (wallpaper == null && !allowSolidFallback) return null;
                 var pixels = new byte[width * height * 4];
                 int red = (int)(state.Background & 255);
                 int green = (int)((state.Background >> 8) & 255);
                 int blue = (int)((state.Background >> 16) & 255);
-                int offsetX = state.Monitor.Left - state.Canvas.Left;
-                int offsetY = state.Monitor.Top - state.Canvas.Top;
-                for (int y = 0; y < height; y++)
-                for (int x = 0; x < width; x++)
+                int offsetX = x - state.Canvas.Left;
+                int offsetY = y - state.Canvas.Top;
+                for (int row = 0; row < height; row++)
+                for (int column = 0; column < width; column++)
                 {
-                    var pixel = MicaService.MapWallpaper(state.Style, state.Style == 0, state.OriginX, state.OriginY,
+                    var pixel = wallpaper != null && MicaService.MapWallpaper(state.Style, state.Style == 0, state.OriginX, state.OriginY,
                         state.Canvas.Width, state.Canvas.Height, wallpaper.Width, wallpaper.Height,
-                        offsetX + x * 2 + 0.5, offsetY + y * 2 + 0.5, out var wx, out var wy)
+                        offsetX + column * 2 + 0.5, offsetY + row * 2 + 0.5, out var wx, out var wy)
                         ? wallpaper.GetPixel((int)wx, (int)wy) : Color.Transparent;
-                    int i = (y * width + x) * 4;
+                    int i = (row * width + column) * 4;
                     pixels[i] = (byte)((blue * (255 - pixel.A) + pixel.B * pixel.A) / 255);
                     pixels[i + 1] = (byte)((green * (255 - pixel.A) + pixel.G * pixel.A) / 255);
                     pixels[i + 2] = (byte)((red * (255 - pixel.A) + pixel.R * pixel.A) / 255);
@@ -175,6 +180,7 @@ namespace DesktopBar.Services
             catch (ArgumentException) { return null; }
             catch (ExternalException) { return null; }
             catch (IOException) { return null; }
+            catch (UnauthorizedAccessException) { return null; }
         }
 
         private static double Lightness(Color color) => (0.2126 * color.R + 0.7152 * color.G + 0.0722 * color.B) / 255;

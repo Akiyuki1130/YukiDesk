@@ -1,5 +1,7 @@
 using System;
 using System.Runtime.InteropServices;
+using Windows.Graphics.DirectX.Direct3D11;
+using WinRT;
 
 namespace DesktopBar.Interop
 {
@@ -16,6 +18,8 @@ namespace DesktopBar.Interop
         private static readonly Guid IID_IDXGIDevice = new Guid("54ec77fa-1377-44e6-8c32-88fd5f44c84c");
         private static readonly Guid IID_IDXGIOutput1 = new Guid("00cddea8-939b-4b83-a340-a685226666cc");
         private static readonly Guid IID_ID3D11Texture2D = new Guid("6f15aaf2-d208-4e89-9ab4-489535d34f9c");
+        private static readonly Guid SurfaceAccess = new Guid("a9b3d012-3df2-4ee3-b8d1-8695f457d3c1");
+        private static readonly Guid D3DMultithread = new Guid("9b7e4e00-342c-4106-a19f-4f2704f689f0");
 
         [StructLayout(LayoutKind.Sequential)]
         private struct Rect
@@ -83,10 +87,13 @@ namespace DesktopBar.Interop
         // 导致整段抓帧全丢(捕获相位=6)且极难复现。
         [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate void UnmapFn(IntPtr self, IntPtr resource, uint sub);
         [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate void CopyFn(IntPtr self, IntPtr dst, uint dstSub, uint dstX, uint dstY, uint dstZ, IntPtr src, uint srcSub, IntPtr box);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int SetMultithreadProtectedFn(IntPtr self, int enabled);
 
         [DllImport("d3d11.dll")]
         private static extern int D3D11CreateDevice(IntPtr adapter, int driverType, IntPtr software, uint flags,
             int[] featureLevels, uint featureLevelCount, uint sdkVersion, out IntPtr device, out int featureLevel, out IntPtr context);
+        [DllImport("d3d11.dll", ExactSpelling = true)]
+        private static extern int CreateDirect3D11DeviceFromDXGIDevice(IntPtr device, out IntPtr result);
 
         private IntPtr _device, _context, _duplication, _resource;
         private int _stageW, _stageH;
@@ -127,9 +134,8 @@ namespace DesktopBar.Interop
 
         private string Init()
         {
-            int[] levels = new int[] { 0xb000 /*11_0*/, 0xa000 /*10_0*/ };
-            int hr = D3D11CreateDevice(IntPtr.Zero, 1 /*HARDWARE*/, IntPtr.Zero, 0x20 /*BGRA_SUPPORT*/, levels, 2, 7, out _device, out _, out _context);
-            if (hr < 0 || _device == IntPtr.Zero || _context == IntPtr.Zero) return "D3D11CreateDevice hr=0x" + ((uint)hr).ToString("X8");
+            int hr = InitReadback();
+            if (hr < 0) return "D3D11CreateDevice hr=0x" + ((uint)hr).ToString("X8");
 
             IntPtr dxgiDevice = QueryInterface(_device, IID_IDXGIDevice);
             if (dxgiDevice == IntPtr.Zero) return "QI IDXGIDevice 失败";
@@ -166,21 +172,74 @@ namespace DesktopBar.Interop
             }
             finally { Marshal.FreeHGlobal(descBuffer); }
 
-            _stageDesc = Marshal.AllocHGlobal(Marshal.SizeOf<TextureDesc>());
             _frameInfo = Marshal.AllocHGlobal(Marshal.SizeOf<FrameInfo>());
-            _mapBuf = Marshal.AllocHGlobal(Marshal.SizeOf<MappedResource>());
-            _boxBuf = Marshal.AllocHGlobal(6 * sizeof(uint));   // D3D11_BOX
             _dirtyBufSize = 8192;
             _dirtyBuf = Marshal.AllocHGlobal((int)_dirtyBufSize);
             _acquire = Fn<AcquireNextFrameFn>(_duplication, 8);
             _dirtyRects = Fn<GetFrameRectsFn>(_duplication, 9);
             _moveRects = Fn<GetFrameRectsFn>(_duplication, 10);
             _idupReleaseFrame = Fn<ReleaseFrameFn>(_duplication, 14);
+            return null;
+        }
+
+        private int InitReadback()
+        {
+            int[] levels = { 0xb000, 0xa000 };
+            int hr = D3D11CreateDevice(IntPtr.Zero, 1, IntPtr.Zero, 0x20, levels, 2, 7, out _device, out _, out _context);
+            if (hr < 0) return hr;
+            _stageDesc = Marshal.AllocHGlobal(Marshal.SizeOf<TextureDesc>());
+            _mapBuf = Marshal.AllocHGlobal(Marshal.SizeOf<MappedResource>());
+            _boxBuf = Marshal.AllocHGlobal(6 * sizeof(uint));
             _createTexture = Fn<CreateTexture2DFn>(_device, 5);
             _copyRegion = Fn<CopyFn>(_context, 46);
             _map = Fn<MapFn>(_context, 14);
             _unmap = Fn<UnmapFn>(_context, 15);
-            return null;
+            return 0;
+        }
+
+        internal static DxgiCapture CreateWindowReader(out IDirect3DDevice device)
+        {
+            var reader = new DxgiCapture();
+            try
+            {
+                Marshal.ThrowExceptionForHR(reader.InitReadback());
+                IntPtr threading = reader.QueryInterface(reader._context, D3DMultithread);
+                if (threading != IntPtr.Zero)
+                {
+                    try { Fn<SetMultithreadProtectedFn>(threading, 5)(threading, 1); }
+                    finally { Release(threading); }
+                }
+                IntPtr dxgi = reader.QueryInterface(reader._device, IID_IDXGIDevice);
+                if (dxgi == IntPtr.Zero) throw new InvalidOperationException("IDXGIDevice unavailable");
+                try
+                {
+                    Marshal.ThrowExceptionForHR(CreateDirect3D11DeviceFromDXGIDevice(dxgi, out var result));
+                    try { device = MarshalInterface<IDirect3DDevice>.FromAbi(result); }
+                    finally { Release(result); }
+                }
+                finally { Release(dxgi); }
+                return reader;
+            }
+            catch { reader.Dispose(); throw; }
+        }
+
+        internal bool CopyWindowBand(IDirect3DSurface surface, int x, int y, int width, int height, byte[] pixels)
+        {
+            var inspectable = MarshalInterface<IDirect3DSurface>.FromManaged(surface);
+            try
+            {
+                var access = QueryInterface(inspectable, SurfaceAccess);
+                if (access == IntPtr.Zero) return false;
+                try
+                {
+                    var iid = IID_ID3D11Texture2D;
+                    if (Fn<QueryInterfaceFn>(access, 3)(access, ref iid, out var texture) < 0) return false;
+                    try { return CopyTextureBand(texture, x, y, width, height, pixels); }
+                    finally { Release(texture); }
+                }
+                finally { Release(access); }
+            }
+            finally { Release(inspectable); }
         }
 
         private static IntPtr FindPrimaryOutput(IntPtr adapter)
@@ -253,55 +312,58 @@ namespace DesktopBar.Interop
             if (!_hasFrame || _resource == IntPtr.Zero || dst == null) return false;
             if (x < 0 || y < 0 || width <= 0 || height <= 0 || x > Width - width || y > Height - height)
                 return false;
-            int rowBytes = width * 4;
-            if (dst.Length < (long)rowBytes * height) return false;
-
             IntPtr src = ResourceToTexture(_resource);
             if (src == IntPtr.Zero) { Diag("ResourceToTexture 失败"); return false; }
+            try { return CopyTextureBand(src, x, y, width, height, dst); }
+            finally { _relTexture(src); }
+        }
+
+        private bool CopyTextureBand(IntPtr src, int x, int y, int width, int height, byte[] dst)
+        {
+            int rowBytes = width * 4;
+            if (dst.Length < (long)rowBytes * height) return false;
+            if (_stage == IntPtr.Zero || _stageW < width || _stageH < height)
+            {
+                if (_stage != IntPtr.Zero) { Release(_stage); _stage = IntPtr.Zero; }
+                int stagingWidth = Math.Max(_stageW, width);
+                int stagingHeight = Math.Max(_stageH, height);
+                FillTextureDesc(stagingWidth, stagingHeight);
+                IntPtr tex;
+                int hrc = _createTexture(_device, _stageDesc, IntPtr.Zero, out tex);
+                if (hrc >= 0 && tex != IntPtr.Zero)
+                {
+                    _stage = tex;
+                    _stageW = stagingWidth;
+                    _stageH = stagingHeight;
+                }
+                else Diag("CreateTexture2D 失败 hr=0x" + hrc.ToString("X8") + " tex=" + tex);
+            }
+            if (_stage == IntPtr.Zero) return false;
+
+            Marshal.WriteInt32(_boxBuf, 0, x);              // left
+            Marshal.WriteInt32(_boxBuf, 4, y);              // top
+            Marshal.WriteInt32(_boxBuf, 8, 0);              // front
+            Marshal.WriteInt32(_boxBuf, 12, x + width);     // right
+            Marshal.WriteInt32(_boxBuf, 16, y + height);    // bottom
+            Marshal.WriteInt32(_boxBuf, 20, 1);             // back
+            _copyRegion(_context, _stage, 0, 0, 0, 0, src, 0, _boxBuf);
+
+            int hr = _map(_context, _stage, 0, D3D11_MAP_READ, 0, _mapBuf);
+            if (hr < 0) { Diag("Map 失败 hr=0x" + hr.ToString("X8")); return false; }
             try
             {
-                if (_stage == IntPtr.Zero || _stageW != width || _stageH != height)
+                var mapped = Marshal.PtrToStructure<MappedResource>(_mapBuf);
+                if (mapped.Data == IntPtr.Zero || mapped.RowPitch < rowBytes) return false;
+                if (mapped.RowPitch == rowBytes)
                 {
-                    if (_stage != IntPtr.Zero) { Release(_stage); _stage = IntPtr.Zero; }
-                    FillTextureDesc(width, height);
-                    IntPtr tex;
-                    int hrc = _createTexture(_device, _stageDesc, IntPtr.Zero, out tex);
-                    if (hrc >= 0 && tex != IntPtr.Zero)
-                    {
-                        _stage = tex;
-                        _stageW = width;
-                        _stageH = height;
-                    }
-                    else Diag("CreateTexture2D 失败 hr=0x" + hrc.ToString("X8") + " tex=" + tex);
-                }
-                if (_stage == IntPtr.Zero) return false;
-
-                Marshal.WriteInt32(_boxBuf, 0, x);              // left
-                Marshal.WriteInt32(_boxBuf, 4, y);              // top
-                Marshal.WriteInt32(_boxBuf, 8, 0);              // front
-                Marshal.WriteInt32(_boxBuf, 12, x + width);     // right
-                Marshal.WriteInt32(_boxBuf, 16, y + height);    // bottom
-                Marshal.WriteInt32(_boxBuf, 20, 1);             // back
-                _copyRegion(_context, _stage, 0, 0, 0, 0, src, 0, _boxBuf);
-
-                int hr = _map(_context, _stage, 0, D3D11_MAP_READ, 0, _mapBuf);
-                if (hr < 0) { Diag("Map 失败 hr=0x" + hr.ToString("X8")); return false; }
-                try
-                {
-                    var mapped = Marshal.PtrToStructure<MappedResource>(_mapBuf);
-                    if (mapped.Data == IntPtr.Zero || mapped.RowPitch < rowBytes) return false;
-                    if (mapped.RowPitch == rowBytes)
-                    {
-                        Marshal.Copy(mapped.Data, dst, 0, rowBytes * height);
-                        return true;
-                    }
-                    for (int row = 0; row < height; row++)
-                        Marshal.Copy(IntPtr.Add(mapped.Data, row * mapped.RowPitch), dst, row * rowBytes, rowBytes);
+                    Marshal.Copy(mapped.Data, dst, 0, rowBytes * height);
                     return true;
                 }
-                finally { _unmap(_context, _stage, 0); }
+                for (int row = 0; row < height; row++)
+                    Marshal.Copy(IntPtr.Add(mapped.Data, row * mapped.RowPitch), dst, row * rowBytes, rowBytes);
+                return true;
             }
-            finally { _relTexture(src); }
+            finally { _unmap(_context, _stage, 0); }
         }
 
         /// <summary>脏矩形或移动区域的目标与条带相交时，从当前桌面纹理读回整条带。</summary>

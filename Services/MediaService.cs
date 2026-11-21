@@ -196,19 +196,22 @@ namespace DesktopBar.Services
                 string title = props?.Title ?? "";
                 string artist = props?.Artist ?? "";
                 string sessionKey = session.SourceAppUserModelId ?? "";
-                string trackKey = BuildTrackKey(sessionKey, props, timeline.EndTime);
+                string trackKey = BuildTrackKey(sessionKey, props);
                 bool seekSupported = timeline.MaxSeekTime > timeline.MinSeekTime;
                 GetPlayback(session, timeline, out bool playing, out TimeSpan position);
 
-                Publish(new MediaInfo(NextPublishedGeneration(), true, sessionKey, trackKey, "", title,
-                    artist, null, playing, position, timeline.EndTime, seekSupported));
+                var previous = _current;
+                bool sameTrack = string.Equals(previous.TrackKey, trackKey, StringComparison.Ordinal);
+                Publish(new MediaInfo(NextPublishedGeneration(), true, sessionKey, trackKey, sameTrack ? previous.ThumbnailKey : "", title,
+                    artist, sameTrack ? previous.Cover : null, playing, position, timeline.EndTime, seekSupported));
 
                 var cover = await LoadCoverAsync(props?.Thumbnail);
                 if (!IsCurrent(session, sessionGeneration, refreshGeneration)) return;
+                if (sameTrack && cover.Key == "error" && previous.Cover != null)
+                    cover = new CoverResult(previous.Cover, previous.ThumbnailKey);
 
                 // 封面读取期间时间线可能推进；发布封面前再次读取，避免旧快照回退进度。
                 timeline = session.GetTimelineProperties();
-                trackKey = BuildTrackKey(sessionKey, props, timeline.EndTime);
                 seekSupported = timeline.MaxSeekTime > timeline.MinSeekTime;
                 GetPlayback(session, timeline, out playing, out position);
                 Publish(new MediaInfo(NextPublishedGeneration(), true, sessionKey, trackKey, cover.Key,
@@ -229,12 +232,12 @@ namespace DesktopBar.Services
         }
 
         private static string BuildTrackKey(string sessionKey,
-            GlobalSystemMediaTransportControlsSessionMediaProperties props, TimeSpan duration)
+            GlobalSystemMediaTransportControlsSessionMediaProperties props)
         {
             const string separator = "\u001F";
             return string.Join(separator, sessionKey ?? "", props?.Title ?? "", props?.Artist ?? "",
                 props?.AlbumArtist ?? "", props?.AlbumTitle ?? "", props?.Subtitle ?? "",
-                props?.TrackNumber.ToString() ?? "", duration.Ticks.ToString());
+                props?.TrackNumber.ToString() ?? "");
         }
 
         private void GetPlayback(GlobalSystemMediaTransportControlsSession session,

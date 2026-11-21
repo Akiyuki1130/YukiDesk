@@ -280,17 +280,21 @@ namespace DesktopBar
             Settings = SettingsService.Load(out bool firstRun);
             // 配置是用户的明确偏好；不要用一次可能失败的注册表读取反向覆盖它。
             AutoStartService.Set(Settings.AutoStart);
-            // 上次会话残留在 %TEMP%\YukiDeskClipboard 的临时副本:剪贴板仍引用的保留,其余清掉。
-            try { FileClipboard.CleanupStaleTempCopies(); } catch { }
-            try { Directory.CreateDirectory(Settings.StorageRoot); foreach (var n in Settings.Folders) Directory.CreateDirectory(Path.Combine(Settings.StorageRoot, n)); } catch { }
             // 配置文件损坏时不要用默认值立即覆写(原始内容已在 .corrupt-* 隔离副本里),等用户显式保存。
-            if (Settings.Folders.Count == 0 && !SettingsService.CorruptConfigDetected)
+            if (firstRun && !SettingsService.CorruptConfigDetected)
             {
-                Settings.Folders.Add("常用");
-                try { Directory.CreateDirectory(Path.Combine(Settings.StorageRoot, "常用")); } catch { }
+                try
+                {
+                    Directory.CreateDirectory(Settings.StorageRoot);
+                    if (MiniFolderCatalog.ReadNames(Settings.StorageRoot).Length == 0)
+                    {
+                        Directory.CreateDirectory(Path.Combine(Settings.StorageRoot, "常用"));
+                        Settings.Folders.Add("常用");
+                    }
+                }
+                catch (Exception ex) { Log("初始化小文件夹目录失败: " + ex.Message); }
                 Save();
             }
-            if (firstRun && !SettingsService.CorruptConfigDetected) Save();
             Log("YukiDesk 启动配置已加载");
             // 无界面自检:只烘焙云母位图并写 PNG,不建任何窗口、不占屏幕。
             // 用法: YukiDesk.exe --micadump <输出.png>
@@ -351,7 +355,7 @@ namespace DesktopBar
             // GitHub 更新检查(设置-关于里可开关):首次延迟触发,避免拖慢启动。
             UpdateService.StartAutoCheck();
             // 玻璃可视化取证:用法 YukiDesk.exe --glassshot <输出目录>
-            // 自家窗口全部 WDA_EXCLUDEFROMCAPTURE,外部截图根本拍不到顶栏,只能进程内自证。
+            // 实时采样模式下，取证流程会临时恢复窗口的屏幕捕获。
             // 取证完成后进程自行退出(ShutdownMode 会切成 OnExplicitShutdown)。
             if (Array.IndexOf(e.Args ?? Array.Empty<string>(), "--glassshot") >= 0)
             {
@@ -444,7 +448,6 @@ namespace DesktopBar
             // 判断"进程是正常走完拆解"还是"在拆解途中被原生层带走"。
             try { Log("YukiDesk 退出开始,代码=" + e.ApplicationExitCode); } catch { }
             // 每个拆解步骤都留痕(带毫秒耗时):退出偶发卡死时,一眼就能看出卡在哪一步。
-            // 只阻止新操作;已经在跑的后台复制/移动必须等它收尾,否则进程退出会留下半份文件。
             System.Diagnostics.Stopwatch swExit = System.Diagnostics.Stopwatch.StartNew();
             Action<string, Action> step = (name, act) =>
             {
@@ -452,7 +455,6 @@ namespace DesktopBar
                 try { Services.GlassService.TraceStop("OnExit 步骤 " + name + " 用时=" + swExit.ElapsedMilliseconds + "ms"); } catch { }
                 try { Log("退出步骤 " + name + " 用时=" + swExit.ElapsedMilliseconds + "ms"); } catch { }
             };
-            step("操作对话框", () => { UI.OperationProgressDialog.BeginShutdown(); UI.OperationProgressDialog.WaitForIdle(5000); });
             step("更新检查", () => Services.UpdateService.StopAutoCheck());
             step("主题服务", () => Services.ThemeService.Stop());
             step("云母服务", () => Services.MicaService.Stop());
