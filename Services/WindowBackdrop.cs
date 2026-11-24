@@ -32,7 +32,7 @@ namespace DesktopBar.Services
         private sealed class Layer
         {
             public IntPtr Window;
-            public Int32Rect Frame, WindowBounds, Crop, PixelsAt;
+            public Int32Rect Frame, WindowBounds, Crop, PixelsAt, CapturedArea;
             public WindowCapture Source;
             public long Sequence;
             public byte[] Pixels;
@@ -225,7 +225,8 @@ namespace DesktopBar.Services
                     feed.Source = new WindowCapture(layer.Window, _device);
                 }
                 var source = feed.Source;
-                if (!source.Update())
+                bool haveFrame = source.Update();
+                if (!haveFrame && !source.AwaitingResizedFrame)
                 {
                     _waitingForWindowFrame = true;
                     return false;
@@ -241,9 +242,17 @@ namespace DesktopBar.Services
                 var target = new Int32Rect(left, top, right - left, bottom - top);
                 var crop = new Int32Rect(_area.X + 2 * left - bounds.X, _area.Y + 2 * top - bounds.Y,
                     target.Width * 2 - 1, target.Height * 2 - 1);
+                if (!haveFrame)
+                {
+                    bool retained = layer.Ready && ReferenceEquals(source, layer.Source)
+                        && layer.CapturedArea == _area && layer.Crop == crop && layer.PixelsAt == target;
+                    _waitingForWindowFrame |= !retained;
+                    return retained;
+                }
                 if (ReferenceEquals(source, layer.Source) && source.Sequence == layer.Sequence && crop == layer.Crop)
                 {
                     layer.PixelsAt = target;
+                    layer.CapturedArea = _area;
                     return true;
                 }
                 int bytes = crop.Width * crop.Height * 4;
@@ -253,6 +262,7 @@ namespace DesktopBar.Services
                 layer.Sequence = source.Sequence;
                 layer.Crop = crop;
                 layer.PixelsAt = target;
+                layer.CapturedArea = _area;
                 return true;
             }
             catch (Exception)

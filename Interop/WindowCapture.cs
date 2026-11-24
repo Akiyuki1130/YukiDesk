@@ -17,19 +17,24 @@ namespace DesktopBar.Interop
         private static readonly Guid CaptureItemInterface = new("79C3F95B-31F7-4EC2-A464-632EF5D30760");
         private static readonly Lazy<Task<bool>> BorderlessAccess = new(RequestBorderlessAccessAsync);
         private const DirectXPixelFormat Format = DirectXPixelFormat.B8G8R8A8UIntNormalized;
+        private const int ResizeRetryMs = 120;
+        private const int ResizeHoldMs = 300;
         private readonly IDirect3DDevice _device;
         private readonly GraphicsCaptureItem _item;
-        private readonly Direct3D11CaptureFramePool _pool;
+        private Direct3D11CaptureFramePool _pool;
         private GraphicsCaptureSession _session;
         private SizeInt32 _size;
         private Direct3D11CaptureFrame _frame;
         private bool _borderConfigured;
         private bool _started;
         private readonly long _borderDeadline = Environment.TickCount64 + 250;
+        private long _resizeAt;
+        private bool _restartedAfterResize;
 
         internal long Sequence { get; private set; }
         internal SizeInt32 Size => _size;
         internal long PixelCount => (long)_size.Width * _size.Height;
+        internal bool AwaitingResizedFrame => _resizeAt != 0 && Environment.TickCount64 - _resizeAt < ResizeHoldMs;
 
         internal WindowCapture(IntPtr window, IDirect3DDevice device)
         {
@@ -38,32 +43,52 @@ namespace DesktopBar.Interop
             _size = _item.Size;
             if (_size.Width <= 0 || _size.Height <= 0 || PixelCount > 18_000_000)
                 throw new ArgumentException("Unsupported capture dimensions");
-            _pool = Direct3D11CaptureFramePool.CreateFreeThreaded(device, Format, 2, _size);
-            try
-            {
-                _session = _pool.CreateCaptureSession(_item);
-                if (OperatingSystem.IsWindowsVersionAtLeast(10, 0, 19041)) _session.IsCursorCaptureEnabled = false;
-                PrepareSession();
-            }
+            try { StartSession(); }
             catch { Dispose(); throw; }
+        }
+
+        private void StartSession()
+        {
+            _pool = Direct3D11CaptureFramePool.CreateFreeThreaded(_device, Format, 2, _size);
+            _session = _pool.CreateCaptureSession(_item);
+            if (OperatingSystem.IsWindowsVersionAtLeast(10, 0, 19041)) _session.IsCursorCaptureEnabled = false;
+            _borderConfigured = _started = false;
+            PrepareSession();
         }
 
         internal bool Update()
         {
             if (!PrepareSession()) return false;
             var next = _pool.TryGetNextFrame();
-            if (next == null) return _frame != null;
+            if (next == null)
+            {
+                if (_resizeAt != 0 && !_restartedAfterResize && Environment.TickCount64 - _resizeAt >= ResizeRetryMs)
+                {
+                    // The frame that reported the new size can be the last one a static window submits.
+                    _restartedAfterResize = true;
+                    StopSession();
+                    StartSession();
+                }
+                return _frame != null;
+            }
             _frame?.Dispose();
             _frame = null;
             var size = next.ContentSize;
             if (size.Width != _size.Width || size.Height != _size.Height)
             {
                 next.Dispose();
-                if (size.Width <= 0 || size.Height <= 0 || (long)size.Width * size.Height > 18_000_000) return false;
+                if (size.Width <= 0 || size.Height <= 0 || (long)size.Width * size.Height > 18_000_000)
+                {
+                    _resizeAt = 0;
+                    return false;
+                }
                 _pool.Recreate(_device, Format, 2, size);
                 _size = size;
+                _resizeAt = Environment.TickCount64;
+                _restartedAfterResize = false;
                 return false;
             }
+            _resizeAt = 0;
             _frame = next;
             Sequence++;
             return true;
@@ -145,9 +170,15 @@ namespace DesktopBar.Interop
         {
             Close(_frame);
             _frame = null;
+            StopSession();
+        }
+
+        private void StopSession()
+        {
             Close(_session);
             _session = null;
             Close(_pool);
+            _pool = null;
         }
 
         internal static void Close(IDisposable capture)
