@@ -39,6 +39,7 @@ namespace DesktopBar.UI
         private volatile bool _disposed;
         internal string FolderName => _name;
         internal string FolderPath => _directory;
+        internal bool IsLinkedFolder => _linked;
 
         public FolderModule(string name, TabStyle style, string linkedPath = null) : base(style)
         {

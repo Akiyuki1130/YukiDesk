@@ -288,32 +288,41 @@ namespace DesktopBar
 
         internal void ApplyFolderOrder()
         {
-            foreach (var module in _folderModules)
-            {
-                module.Dispose();
-                _modules.Remove(module);
-            }
-            _folderModules.Clear();
             if (_barLayout == null) return;
-            _folderEntries.Clear();
-            foreach (var name in S.Folders)
+            var previous = _folderEntries.ToDictionary(entry =>
             {
-                AddFolder(new FolderModule(name, S.Folder));
-            }
+                var folder = (FolderModule)entry.Module;
+                return (folder.FolderName, folder.FolderPath, folder.IsLinkedFolder);
+            });
+            _folderEntries.Clear();
+            _folderModules.Clear();
+            foreach (var name in S.Folders)
+                AddFolder(name, MiniFolderCatalog.GetFolderPath(S.StorageRoot, name), linked: false);
             foreach (var path in S.LinkedFolders)
             {
                 var trimmed = System.IO.Path.TrimEndingDirectorySeparator(path);
                 var name = System.IO.Path.GetFileName(trimmed);
-                AddFolder(new FolderModule(string.IsNullOrEmpty(name) ? trimmed : name, S.Folder, path));
+                AddFolder(string.IsNullOrEmpty(name) ? trimmed : name, path, linked: true);
+            }
+            foreach (var entry in previous.Values)
+            {
+                entry.Module.Dispose();
+                _modules.Remove(entry.Module);
             }
 
             UpdateLayoutEntries();
 
-            void AddFolder(FolderModule folder)
+            void AddFolder(string name, string path, bool linked)
             {
+                if (!previous.Remove((name, path, linked), out var entry))
+                {
+                    var next = new FolderModule(name, S.Folder, linked ? path : null);
+                    entry = new BarLayoutPanel.Entry(next, "folders", name);
+                    _modules.Add(next);
+                }
+                var folder = (FolderModule)entry.Module;
                 _folderModules.Add(folder);
-                _modules.Add(folder);
-                _folderEntries.Add(new BarLayoutPanel.Entry(folder, "folders", folder.FolderName));
+                _folderEntries.Add(entry);
                 SetModuleVisibility(folder, App.ActiveSettings.ShowFolders);
             }
         }

@@ -208,10 +208,6 @@ namespace DesktopBar.UI
                 // 窗口懒创建:SourceInitialized 在首次 ShowPanel 时才触发,正合适。
                 GlassService.RegisterWindow(h);
             };
-            // 提前把 HWND 建出来:RegisterWindow(SourceInitialized 里挂)随之在构造期就生效,
-            // 展开页从第一次抓图开始就被排除在屏幕捕获之外。否则面板显示后的头几帧会被
-            // 自己的捕获线程拍进去(采样到自己 → 玻璃变黑,和顶栏同一个坑)。
-            try { new System.Windows.Interop.WindowInteropHelper(w).EnsureHandle(); } catch { }
             w.MouseEnter += (s, e) => _closeTimer.Stop();
             w.MouseLeave += (s, e) => { if (Open) StartCloseTimer(); };
             w.IsMouseCaptureWithinChanged += (_, _) =>
@@ -598,6 +594,14 @@ namespace DesktopBar.UI
                     return;
                 }
                 if (Open) return;
+            }
+            // Register capture affinity on a hidden HWND before the first frame starts.
+            // Modules that are never opened do not need a native flyout window at startup.
+            try { new System.Windows.Interop.WindowInteropHelper(PanelWindow).EnsureHandle(); }
+            catch (Exception ex)
+            {
+                App.Log("无法创建展开页窗口: " + ex.Message);
+                return;
             }
             if (_active != null && !ReferenceEquals(_active, this)) _active.HidePanelImmediate();
             _active = this;
