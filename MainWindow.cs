@@ -36,6 +36,7 @@ namespace DesktopBar
         private readonly DispatcherTimer _folderRefresh;
         private FileSystemWatcher _folderRootWatcher;
         private string _folderRoot;
+        private string _folderInbox;
         private int _folderScanVersion;
         internal event Action FolderCatalogChanged;
         private MediaService _media;
@@ -289,6 +290,8 @@ namespace DesktopBar
         internal void ApplyFolderOrder()
         {
             if (_barLayout == null) return;
+            string previousInbox = _folderInbox;
+            _folderInbox = S.InboxFolder;
             var previous = _folderEntries.ToDictionary(entry =>
             {
                 var folder = (FolderModule)entry.Module;
@@ -314,7 +317,8 @@ namespace DesktopBar
 
             void AddFolder(string name, string path, bool linked)
             {
-                if (!previous.Remove((name, path, linked), out var entry))
+                bool reused = previous.Remove((name, path, linked), out var entry);
+                if (!reused)
                 {
                     var next = new FolderModule(name, S.Folder, linked ? path : null);
                     entry = new BarLayoutPanel.Entry(next, "folders", name);
@@ -324,6 +328,8 @@ namespace DesktopBar
                 _folderModules.Add(folder);
                 _folderEntries.Add(entry);
                 SetModuleVisibility(folder, App.ActiveSettings.ShowFolders);
+                if (reused && !string.Equals(previousInbox, _folderInbox, StringComparison.OrdinalIgnoreCase))
+                    folder.RefreshInboxRole(previousInbox);
             }
         }
 

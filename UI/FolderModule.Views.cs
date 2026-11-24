@@ -46,6 +46,11 @@ namespace DesktopBar.UI
 
         private bool IsInbox => string.Equals(App.Settings.InboxFolder, CurrentDirectory, StringComparison.OrdinalIgnoreCase);
 
+        internal void RefreshInboxRole(string previousInbox)
+        {
+            if (IsInbox != string.Equals(previousInbox, CurrentDirectory, StringComparison.OrdinalIgnoreCase)) RefreshView();
+        }
+
         private FrameworkElement BuildFolderContent()
         {
             var root = new StackPanel();

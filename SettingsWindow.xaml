@@ -12,6 +12,13 @@
         PreviewKeyDown="Settings_PreviewKeyDown"
         ResizeMode="CanResize" MinWidth="760" MinHeight="530">
     <Window.Resources>
+        <DataTemplate x:Key="DesktopTargetRow">
+            <StackPanel ToolTip="{Binding Detail}">
+                <TextBlock Text="{Binding Label}" TextTrimming="CharacterEllipsis" FontWeight="Medium"/>
+                <TextBlock Text="{Binding Detail}" TextTrimming="CharacterEllipsis" FontSize="11"
+                           Foreground="{DynamicResource SettingsSubTextBrush}" Margin="0,2,0,0"/>
+            </StackPanel>
+        </DataTemplate>
         <Style x:Key="NavIcon" TargetType="Path">
             <Setter Property="Width" Value="17"/>
             <Setter Property="Height" Value="17"/>

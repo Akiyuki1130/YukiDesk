@@ -30,9 +30,23 @@ namespace DesktopBar.UI
 
         internal static bool Add(string target, string title = null)
         {
-            if (!IsSupportedTarget(target) || App.Settings.DesktopLinks.Any(link => SameTarget(link.Target, target))) return false;
-            App.Settings.DesktopLinks.Add(new DesktopLink { Target = target, Title = string.IsNullOrWhiteSpace(title) ? Title(target) : title.Trim() });
-            SaveLinks();
+            if (!AddLink(target, title)) return false;
+            SaveLinks(refreshBar: false);
+            return true;
+        }
+
+        internal static void AddFiles(IEnumerable<string> paths)
+        {
+            bool changed = false;
+            foreach (var path in paths) changed |= AddLink(path, null);
+            if (changed) SaveLinks(refreshBar: false);
+        }
+
+        private static bool AddLink(string target, string title)
+        {
+            var links = App.Settings.DesktopLinks;
+            if (!IsSupportedTarget(target) || links.Any(link => SameTarget(link.Target, target))) return false;
+            links.Add(new DesktopLink { Target = target, Title = string.IsNullOrWhiteSpace(title) ? Title(target) : title.Trim() });
             return true;
         }
 
@@ -96,10 +110,10 @@ namespace DesktopBar.UI
             }
         }
 
-        internal static void SaveLinks()
+        internal static void SaveLinks(bool refreshBar = true)
         {
             App.Save();
-            App.Bar?.RefreshFavorites();
+            if (refreshBar) App.Bar?.RefreshFavorites();
             Changed?.Invoke();
         }
 

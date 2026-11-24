@@ -133,8 +133,9 @@ namespace DesktopBar
                 S.ShowFavorites = value;
                 DesktopActions.SaveLinks();
             }));
-            var list = new ListBox { Height = 125, AllowDrop = true };
+            var list = new ListBox { Height = 130, AllowDrop = true, ItemTemplate = (DataTemplate)FindResource("DesktopTargetRow") };
             list.SetResourceReference(StyleProperty, "DarkList");
+            ScrollViewer.SetHorizontalScrollBarVisibility(list, ScrollBarVisibility.Disabled);
             body.Children.Add(list);
             void Refresh()
             {
@@ -142,7 +143,6 @@ namespace DesktopBar
                 list.ItemsSource = S.DesktopLinks.Select(link => new LinkRow(link)).ToArray();
                 list.SelectedItem = list.Items.OfType<LinkRow>().FirstOrDefault(row => ReferenceEquals(row.Link, selected));
             }
-            list.DisplayMemberPath = nameof(LinkRow.Label);
             list.DragOver += (_, e) =>
             {
                 e.Effects = e.Data.GetDataPresent(DataFormats.FileDrop) ? DragDropEffects.Link : DragDropEffects.None;
@@ -150,16 +150,14 @@ namespace DesktopBar
             };
             list.Drop += (_, e) =>
             {
-                if (e.Data.GetData(DataFormats.FileDrop) is string[] files)
-                    foreach (var path in files) DesktopActions.Add(path);
+                if (e.Data.GetData(DataFormats.FileDrop) is string[] files) DesktopActions.AddFiles(files);
                 e.Handled = true;
             };
             var actions = new WrapPanel();
             actions.Children.Add(PanelControls.Button("添加文件…", () =>
             {
                 var picker = new OpenFileDialog { Title = "选择文件或快捷方式", Multiselect = true };
-                if (picker.ShowDialog(this) == true)
-                    foreach (var path in picker.FileNames) DesktopActions.Add(path);
+                if (picker.ShowDialog(this) == true) DesktopActions.AddFiles(picker.FileNames);
             }));
             actions.Children.Add(PanelControls.Button("添加网址…", () =>
             {
@@ -168,26 +166,37 @@ namespace DesktopBar
                 if (DesktopActions.IsWeb(address)) DesktopActions.Add(address);
                 else ConfirmDialog.Notice("网址无效", "请输入完整的 HTTP 或 HTTPS 网址。");
             }));
-            actions.Children.Add(PanelControls.Button("固定到顶栏／取消", () =>
+            var pin = PanelControls.Button("固定到顶栏", () =>
             {
                 if (list.SelectedItem is not LinkRow row) return;
                 row.Link.OnBar = !row.Link.OnBar;
                 DesktopActions.SaveLinks();
-            }));
-            actions.Children.Add(PanelControls.Button("改名…", () =>
+            });
+            var rename = PanelControls.Button("改名…", () =>
             {
                 if (list.SelectedItem is not LinkRow row) return;
                 string title = Prompt.Show("常用项名称", "显示名称", row.Link.Title);
                 if (string.IsNullOrWhiteSpace(title)) return;
                 row.Link.Title = title.Trim();
-                DesktopActions.SaveLinks();
-            }));
-            actions.Children.Add(PanelControls.Button("移除常用项", () =>
+                DesktopActions.SaveLinks(refreshBar: row.Link.OnBar);
+            });
+            var remove = PanelControls.Button("移除常用项", () =>
             {
                 if (list.SelectedItem is not LinkRow row) return;
                 S.DesktopLinks.Remove(row.Link);
-                DesktopActions.SaveLinks();
-            }));
+                DesktopActions.SaveLinks(refreshBar: row.Link.OnBar);
+            });
+            void UpdateLinkActions()
+            {
+                var selected = list.SelectedItem as LinkRow;
+                pin.IsEnabled = rename.IsEnabled = remove.IsEnabled = selected != null;
+                pin.Content = selected?.Link.OnBar == true ? "取消固定" : "固定到顶栏";
+            }
+            list.SelectionChanged += (_, _) => UpdateLinkActions();
+            UpdateLinkActions();
+            actions.Children.Add(pin);
+            actions.Children.Add(rename);
+            actions.Children.Add(remove);
             body.Children.Add(actions);
             body.Children.Add(ToggleRow("记录从 YukiDesk 打开的项目", S.TrackRecentDesktopTargets,
                 value => { S.TrackRecentDesktopTargets = value; App.Save(); }));
@@ -199,7 +208,8 @@ namespace DesktopBar
 
         private sealed record LinkRow(DesktopLink Link)
         {
-            public string Label => (Link.OnBar ? "固定 · " : "") + (Link.Title ?? DesktopActions.Title(Link.Target)) + "   " + Link.Target;
+            public string Label => (Link.OnBar ? "固定 · " : "") + (Link.Title ?? DesktopActions.Title(Link.Target));
+            public string Detail => Link.Target;
         }
 
         private FrameworkElement BuildLayoutCard()
@@ -364,64 +374,99 @@ namespace DesktopBar
         private FrameworkElement BuildLinkedFoldersCard()
         {
             var card = Card("直连文件夹", "把已有目录挂到顶栏，也可以指定一个目录作为临时收件箱。", out var body);
-            var list = new ListBox { Height = 118 };
+            var list = new ListBox { Height = 130, ItemTemplate = (DataTemplate)FindResource("DesktopTargetRow") };
             list.SetResourceReference(StyleProperty, "DarkList");
+            ScrollViewer.SetHorizontalScrollBarVisibility(list, ScrollBarVisibility.Disabled);
             body.Children.Add(list);
             var actions = new WrapPanel { Margin = new Thickness(0, 6, 0, 0) };
             body.Children.Add(actions);
             var inbox = MakeHint("");
             body.Children.Add(inbox);
-            void Refresh()
+            Button setInbox = null, sendTo = null, remove = null, relink = null, clearInbox = null;
+            LinkedFolderRow Selected() => list.SelectedItem as LinkedFolderRow;
+            void SelectDirectory(string path)
             {
-                var selected = list.SelectedItem as string;
-                list.ItemsSource = S.LinkedFolders.ToArray();
-                list.SelectedItem = selected;
-                inbox.Text = string.IsNullOrEmpty(S.InboxFolder) ? "收件箱未设置" : "收件箱 · " + S.InboxFolder;
+                list.SelectedItem = list.Items.OfType<LinkedFolderRow>().FirstOrDefault(row => DesktopActions.SameTarget(row.Detail, path));
             }
-            void Pick(bool makeInbox)
+            string PickFolder(string title)
             {
-                var picker = new OpenFolderDialog { Title = makeInbox ? "选一个目录作为收件箱" : "选择要挂到顶栏的目录" };
-                if (picker.ShowDialog(this) != true) return;
-                var path = Path.TrimEndingDirectorySeparator(picker.FolderName);
-                if (makeInbox)
-                {
-                    S.InboxFolder = path;
-                    if (!S.FolderViews.TryGetValue(path, out var view)) S.FolderViews[path] = view = new Models.FolderPreferences();
-                    view.Sort = "arrived";
-                    App.Save();
-                }
-                if (!DesktopActions.LinkFolder(path) && makeInbox) App.Bar?.ApplyFolderOrder();
-                Refresh();
-                list.SelectedItem = path;
+                var picker = new OpenFolderDialog { Title = title };
+                return picker.ShowDialog(this) == true ? Path.TrimEndingDirectorySeparator(picker.FolderName) : null;
             }
-            actions.Children.Add(PanelControls.Button("连接文件夹…", () => Pick(false)));
-            actions.Children.Add(PanelControls.Button("设置收件箱…", () => Pick(true)));
-            actions.Children.Add(PanelControls.Button("加入 Windows「发送到」", DesktopActions.AddInboxToSendTo));
-            var remove = PanelControls.Button("移除入口", () =>
+            actions.Children.Add(PanelControls.Button("连接文件夹…", () =>
             {
-                if (list.SelectedItem is string target) DesktopActions.UnlinkFolder(target);
-            });
-            remove.IsEnabled = false;
-            list.SelectionChanged += (_, _) => remove.IsEnabled = list.SelectedItem is string;
-            actions.Children.Add(remove);
-            actions.Children.Add(PanelControls.Button("重新绑定…", () =>
-            {
-                if (list.SelectedItem is not string previous) return;
-                var picker = new OpenFolderDialog { Title = "选择新的目标文件夹" };
-                if (picker.ShowDialog(this) != true) return;
-                if (!DesktopActions.RelinkFolder(previous, picker.FolderName))
-                    ConfirmDialog.Notice("无法更换", "选择的目录已经挂在顶栏上。");
+                string path = PickFolder("选择要挂到顶栏的目录");
+                if (path == null) return;
+                DesktopActions.LinkFolder(path);
+                SelectDirectory(path);
             }));
-            actions.Children.Add(PanelControls.Button("清除收件箱", () =>
+            setInbox = PanelControls.Button("选择收件箱…", () =>
+            {
+                string path = Selected()?.Detail ?? PickFolder("选一个目录作为收件箱");
+                if (path == null) return;
+                S.InboxFolder = path;
+                if (!S.FolderViews.TryGetValue(path, out var view)) S.FolderViews[path] = view = new Models.FolderPreferences();
+                view.Sort = "arrived";
+                if (!DesktopActions.LinkFolder(path))
+                {
+                    App.Save();
+                    App.Bar?.ApplyFolderOrder();
+                    Refresh();
+                }
+                SelectDirectory(path);
+            });
+            actions.Children.Add(setInbox);
+            sendTo = PanelControls.Button("加入 Windows「发送到」", DesktopActions.AddInboxToSendTo);
+            actions.Children.Add(sendTo);
+            remove = PanelControls.Button("移除入口", () =>
+            {
+                if (Selected() is { } row) DesktopActions.UnlinkFolder(row.Detail);
+            });
+            actions.Children.Add(remove);
+            relink = PanelControls.Button("重新绑定…", () =>
+            {
+                if (Selected() is not { } row || PickFolder("选择新的目标文件夹") is not string path) return;
+                if (DesktopActions.RelinkFolder(row.Detail, path)) SelectDirectory(path);
+                else
+                    ConfirmDialog.Notice("无法更换", "选择的目录已经挂在顶栏上。");
+            });
+            actions.Children.Add(relink);
+            clearInbox = PanelControls.Button("清除收件箱", () =>
             {
                 S.InboxFolder = "";
                 App.Save();
                 App.Bar?.ApplyFolderOrder();
                 Refresh();
-            }));
+            });
+            actions.Children.Add(clearInbox);
+            void UpdateFolderActions()
+            {
+                var row = Selected();
+                remove.IsEnabled = relink.IsEnabled = row != null;
+                setInbox.IsEnabled = row?.IsInbox != true;
+                setInbox.Content = row == null ? "选择收件箱…" : row.IsInbox ? "当前收件箱" : "设为收件箱";
+                sendTo.IsEnabled = clearInbox.IsEnabled = !string.IsNullOrEmpty(S.InboxFolder);
+            }
+            void Refresh()
+            {
+                string currentSelection = Selected()?.Detail;
+                var rows = S.LinkedFolders.Select(path => new LinkedFolderRow(path, DesktopActions.SameTarget(path, S.InboxFolder))).ToArray();
+                list.ItemsSource = rows;
+                SelectDirectory(currentSelection);
+                inbox.Text = string.IsNullOrEmpty(S.InboxFolder) ? "收件箱未设置"
+                    : rows.Any(row => row.IsInbox) ? "" : "收件箱 · " + S.InboxFolder;
+                inbox.Visibility = inbox.Text.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
+                UpdateFolderActions();
+            }
+            list.SelectionChanged += (_, _) => UpdateFolderActions();
             Refresh();
             WatchDesktopChanges(Refresh);
             return card;
+        }
+
+        private sealed record LinkedFolderRow(string Detail, bool IsInbox)
+        {
+            public string Label => (IsInbox ? "收件箱 · " : "") + DesktopActions.Title(Detail);
         }
     }
 }
