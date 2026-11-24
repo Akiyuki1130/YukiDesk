@@ -160,12 +160,18 @@ namespace DesktopBar.Models
         public string MonitorGpuLuid { get; set; } = "";
 
         // 设置窗口外观
+        private int _legacySettingsThemeMode;
+        private int? _explicitSettingsThemeMode;
         public bool SettingsFollowSystemTheme
         {
             get => SettingsThemeMode == 0;
-            set => SettingsThemeMode = value ? 0 : 2;
+            set => _legacySettingsThemeMode = value ? 0 : 2;
         }
         /// <summary>设置窗口主题模式:0=跟随系统(默认) 1=浅色 2=深色。</summary>
-        public int SettingsThemeMode { get; set; } = 0;
+        public int SettingsThemeMode
+        {
+            get => _explicitSettingsThemeMode ?? _legacySettingsThemeMode;
+            set => _explicitSettingsThemeMode = value;
+        }
     }
 }

@@ -232,7 +232,7 @@ namespace DesktopBar.Services
             {
                 s = Normalize(s);
                 Directory.CreateDirectory(Dir);
-                WriteSettingsFile(FilePath, BackupFilePath, JsonSerializer.Serialize(s, JsonOptions), _primaryNeedsRecovery);
+                WriteAtomicText(FilePath, JsonSerializer.Serialize(s, JsonOptions), _primaryNeedsRecovery ? null : BackupFilePath);
                 _primaryNeedsRecovery = false;
             }
             catch (Exception ex)
@@ -247,14 +247,14 @@ namespace DesktopBar.Services
             }
         }
 
-        private static void WriteSettingsFile(string path, string backup, string content, bool preserveBackup)
+        internal static void WriteAtomicText(string path, string content, string backup = null)
         {
             string temp = path + ".tmp-" + Guid.NewGuid().ToString("N");
             try
             {
                 File.WriteAllText(temp, content);
                 if (File.Exists(path))
-                    File.Replace(temp, path, preserveBackup ? null : backup, true);
+                    File.Replace(temp, path, backup, true);
                 else
                     File.Move(temp, path);
             }

@@ -168,21 +168,28 @@ namespace DesktopBar
             body.Children.Add(ToggleRow("包含小文件夹偏好和常用项", false, enabled => includeFolders = enabled));
             var actions = new WrapPanel();
             body.Children.Add(actions);
-            actions.Children.Add(PanelControls.Button("导出备份…", () =>
+            actions.Children.Add(PanelControls.Button("导出备份…", async () =>
             {
                 var picker = new SaveFileDialog { FileName = "YukiDesk-layout.json", Filter = "YukiDesk 布局备份|*.json" };
                 if (picker.ShowDialog(this) != true) return;
-                try { DesktopPresets.Export(picker.FileName, includeFolders); }
-                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-                { ConfirmDialog.Notice("导出失败", ex.Message); }
+                actions.IsEnabled = false;
+                try { await DesktopPresets.ExportAsync(picker.FileName, includeFolders); }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or ArgumentException)
+                {
+                    if (IsVisible) ConfirmDialog.Notice("导出失败", ex.Message);
+                    else App.Log("导出备份失败: " + ex.Message);
+                }
+                finally { actions.IsEnabled = true; }
             }));
-            actions.Children.Add(PanelControls.Button("导入备份…", () =>
+            actions.Children.Add(PanelControls.Button("导入备份…", async () =>
             {
                 var picker = new OpenFileDialog { Filter = "YukiDesk 布局备份|*.json" };
                 if (picker.ShowDialog(this) != true) return;
+                actions.IsEnabled = false;
                 try
                 {
-                    var import = DesktopPresets.ReadImport(picker.FileName);
+                    var import = await DesktopPresets.ReadImportAsync(picker.FileName);
+                    if (!IsVisible) return;
                     var options = import.Settings;
                     string material = options.PillMaterial switch { 4 => "液态玻璃", 3 => "高斯模糊", _ => "纯色" };
                     string shortcuts = "顶栏快捷键 " + BarHotkey.FromSettings(options).Display;
@@ -194,7 +201,8 @@ namespace DesktopBar
                     if (DesktopPresets.Apply(import)) RefreshSettingsPages();
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or ArgumentException or InvalidDataException)
-                { ConfirmDialog.Notice("导入失败", ex.Message); }
+                { if (IsVisible) ConfirmDialog.Notice("导入失败", ex.Message); }
+                finally { actions.IsEnabled = true; }
             }));
             return card;
         }

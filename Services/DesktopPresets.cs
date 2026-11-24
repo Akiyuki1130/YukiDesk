@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Text.Json;
+using System.Threading.Tasks;
 using DesktopBar.Models;
 using DesktopBar.UI;
 
@@ -91,22 +92,27 @@ namespace DesktopBar.Services
             { ConfirmDialog.Notice("无法应用预设", ex.Message); return false; }
         }
 
-        internal static void Export(string path) => Export(path, includeFolders: false);
-
-        internal static void Export(string path, bool includeFolders)
+        internal static Task ExportAsync(string path, bool includeFolders)
         {
             var archive = new Archive
             {
                 Format = 1, Settings = Capture(App.Settings, ArchiveFields), Presets = App.Settings.DesktopPresets,
                 Folders = includeFolders ? Capture(App.Settings, FolderFields) : null
             };
-            File.WriteAllText(path, JsonSerializer.Serialize(archive, Options));
+            var content = JsonSerializer.Serialize(archive, Options);
+            return Task.Run(() => SettingsService.WriteAtomicText(path, content));
         }
 
-        internal static ImportData ReadImport(string path)
+        internal static async Task<ImportData> ReadImportAsync(string path)
         {
-            if (new FileInfo(path).Length > 1024 * 1024) throw new InvalidDataException("备份文件超过 1 MB。");
-            var archive = JsonSerializer.Deserialize<Archive>(File.ReadAllText(path), Options);
+            string content = await Task.Run(() =>
+            {
+                using var stream = File.OpenRead(path);
+                if (stream.Length > 1024 * 1024) throw new InvalidDataException("备份文件超过 1 MB。");
+                using var reader = new StreamReader(stream);
+                return reader.ReadToEnd();
+            });
+            var archive = JsonSerializer.Deserialize<Archive>(content, Options);
             if (archive?.Format != 1 || archive.Settings == null || archive.Settings.Keys.All(key => !ArchiveFields.Contains(key)))
                 throw new InvalidDataException("这不是支持的 YukiDesk 布局备份。");
             var values = archive.Settings.Where(pair => ArchiveFields.Contains(pair.Key)).ToDictionary(pair => pair.Key, pair => pair.Value);
