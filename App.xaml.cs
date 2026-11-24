@@ -23,6 +23,7 @@ namespace DesktopBar
         internal static bool IsSettingsOpen => _settingsWin?.IsVisible == true;
         public static MainWindow Bar;
         private static SettingsWindow _settingsWin;
+        private static (string Page, double Offset) _lastSettingsLocation;
         private static readonly object LogGate = new object();
         // 主进程与温度从属进程并发写同一 log.txt,用命名互斥体把"轮转+追加"包成跨进程原子操作。
         private static Mutex _logMutex;
@@ -633,7 +634,11 @@ namespace DesktopBar
                 _settingsWin.Topmost = false;
                 return;
             }
-            var w = new SettingsWindow(); _settingsWin = w; w.Closed += (s, e) => _settingsWin = null;
+            var w = new SettingsWindow();
+            _settingsWin = w;
+            w.RestoreLocation(_lastSettingsLocation);
+            w.Closing += (s, e) => _lastSettingsLocation = w.LocationInSettings;
+            w.Closed += (s, e) => _settingsWin = null;
             // 首帧前整窗透明,避免"直接闪出来"。
             w.Opacity = 0;
             // Topmost 短暂置顶把窗口带到最前，随后恢复普通层级（点别处可正常被遮挡）。

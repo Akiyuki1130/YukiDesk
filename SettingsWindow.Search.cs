@@ -152,7 +152,7 @@ namespace DesktopBar
         private void OpenSearchHit(SearchHit hit)
         {
             NavigateTo(hit.Page);
-            var view = PagesGrid.Children.OfType<ScrollViewer>().FirstOrDefault(page => Equals(page.Tag, hit.Page));
+            var view = FindPage(hit.Page);
             if (view == null) return;
             if (hit.Target == null)
             {

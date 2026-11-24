@@ -122,6 +122,23 @@ namespace DesktopBar
             if (entry != null) entry.IsChecked = true;
         }
 
+        internal (string Page, double Offset) LocationInSettings => (_currentPage, FindPage(_currentPage)?.VerticalOffset ?? 0);
+
+        internal void RestoreLocation((string Page, double Offset) location)
+        {
+            var view = FindPage(location.Page);
+            if (view == null) return;
+            NavigateTo(location.Page);
+            if (location.Offset > 0)
+                Dispatcher.BeginInvoke(DispatcherPriority.Loaded, new Action(() =>
+                {
+                    if (_currentPage == location.Page) view.ScrollToVerticalOffset(location.Offset);
+                }));
+        }
+
+        private ScrollViewer FindPage(string page) => PagesGrid.Children.OfType<ScrollViewer>()
+            .FirstOrDefault(view => Equals(view.Tag, page));
+
         private void Close_Click(object sender, RoutedEventArgs e) => Close();
         private void Minimize_Click(object sender, RoutedEventArgs e) => WindowState = WindowState.Minimized;
 

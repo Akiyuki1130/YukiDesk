@@ -254,7 +254,7 @@ namespace DesktopBar
 
         private void RefreshSettingsPages()
         {
-            var view = PagesGrid.Children.OfType<ScrollViewer>().FirstOrDefault(item => Equals(item.Tag, _currentPage));
+            var view = FindPage(_currentPage);
             double offset = view?.VerticalOffset ?? 0;
             EndRevealShortcutCapture();
             RemoveDesktopObservers();
