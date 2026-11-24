@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -2110,81 +2111,92 @@ namespace DesktopBar.Services
         /// <summary>2×2 平均降采样(只动 BGR,alpha 补 255)。半分辨率域做模糊,大半径下视觉无差。</summary>
         private static void Downsample2x(byte[] src, int sw, int sh, byte[] dst, int w, int h)
         {
+            ReadOnlySpan<uint> source = MemoryMarshal.Cast<byte, uint>(src.AsSpan());
+            Span<uint> output = MemoryMarshal.Cast<byte, uint>(dst.AsSpan());
+            const uint redBlue = 0x00FF00FF, green = 0x0000FF00;
             for (int y = 0; y < h; y++)
             {
-                int r0 = (y * 2) * sw * 4;
-                int r1 = (y * 2 + 1 < sh ? y * 2 + 1 : y * 2) * sw * 4;
-                int d = y * w * 4;
+                int row = y * 2;
+                int top = row * sw, bottom = Math.Min(row + 1, sh - 1) * sw;
+                int target = y * w;
                 for (int x = 0; x < w; x++)
                 {
-                    int x0 = x * 2, x1 = x * 2 + 1 < sw ? x * 2 + 1 : x * 2;
-                    int s00 = r0 + x0 * 4, s01 = r0 + x1 * 4, s10 = r1 + x0 * 4, s11 = r1 + x1 * 4;
-                    dst[d] = (byte)((src[s00] + src[s01] + src[s10] + src[s11]) >> 2);
-                    dst[d + 1] = (byte)((src[s00 + 1] + src[s01 + 1] + src[s10 + 1] + src[s11 + 1]) >> 2);
-                    dst[d + 2] = (byte)((src[s00 + 2] + src[s01 + 2] + src[s10 + 2] + src[s11 + 2]) >> 2);
-                    dst[d + 3] = 255;
-                    d += 4;
+                    int left = x * 2, right = Math.Min(left + 1, sw - 1);
+                    uint a = source[top + left], b = source[top + right];
+                    uint c = source[bottom + left], d = source[bottom + right];
+                    // The two lanes in redBlue are wide enough to sum four byte values independently.
+                    uint rb = (a & redBlue) + (b & redBlue) + (c & redBlue) + (d & redBlue);
+                    uint g = (a & green) + (b & green) + (c & green) + (d & green);
+                    output[target + x] = ((rb >> 2) & redBlue) | ((g >> 2) & green) | 0xFF000000;
                 }
             }
         }
 
+        private const int BlurShift = 24;
+
+        private static byte BlurAverage(int sum, uint reciprocal) => (byte)(((uint)sum * reciprocal) >> BlurShift);
+
         /// <summary>滑动和盒式模糊(水平+垂直一趟,只动 BGR)。O(n) 与半径无关,边 replicate。</summary>
-        private static void BlurPassH(byte[] src, byte[] dst, int w, int h, int r)
+        private static void BlurPassH(byte[] src, byte[] dst, int w, int h, int r, uint reciprocal)
         {
-            int win = 2 * r + 1;
-            var sum = new int[3];
+            int stride = w * 4;
             for (int y = 0; y < h; y++)
             {
-                int row = y * w * 4;
-                sum[0] = sum[1] = sum[2] = 0;
-                for (int k = -r; k <= r; k++)
+                int row = y * stride;
+                int blue = src[row] * (r + 1), green = src[row + 1] * (r + 1), red = src[row + 2] * (r + 1);
+                for (int k = 1; k <= r; k++)
                 {
-                    int x = k < 0 ? 0 : (k >= w ? w - 1 : k);
-                    int i = row + x * 4;
-                    sum[0] += src[i]; sum[1] += src[i + 1]; sum[2] += src[i + 2];
+                    int source = row + Math.Min(k, w - 1) * 4;
+                    blue += src[source]; green += src[source + 1]; red += src[source + 2];
                 }
                 for (int x = 0; x < w; x++)
                 {
                     int o = row + x * 4;
-                    dst[o] = (byte)(sum[0] / win);
-                    dst[o + 1] = (byte)(sum[1] / win);
-                    dst[o + 2] = (byte)(sum[2] / win);
-                    int addX = x + r + 1, remX = x - r;
-                    int ai = row + (addX >= w ? w - 1 : addX) * 4;
-                    int ri = row + (remX < 0 ? 0 : remX) * 4;
-                    sum[0] += src[ai] - src[ri];
-                    sum[1] += src[ai + 1] - src[ri + 1];
-                    sum[2] += src[ai + 2] - src[ri + 2];
+                    dst[o] = BlurAverage(blue, reciprocal);
+                    dst[o + 1] = BlurAverage(green, reciprocal);
+                    dst[o + 2] = BlurAverage(red, reciprocal);
+                    int ai = row + Math.Min(x + r + 1, w - 1) * 4;
+                    int ri = row + Math.Max(x - r, 0) * 4;
+                    blue += src[ai] - src[ri];
+                    green += src[ai + 1] - src[ri + 1];
+                    red += src[ai + 2] - src[ri + 2];
                 }
             }
         }
 
-        private static void BlurPassV(byte[] src, byte[] dst, int w, int h, int r)
+        private static void BlurPassV(byte[] src, byte[] dst, int w, int h, int r, uint reciprocal, Span<int> sums)
         {
-            int win = 2 * r + 1;
-            var sum = new int[3];
-            for (int x = 0; x < w; x++)
+            int stride = w * 4;
+            for (int col = 0, s = 0; col < stride; col += 4, s += 3)
             {
-                int col = x * 4;
-                sum[0] = sum[1] = sum[2] = 0;
-                for (int k = -r; k <= r; k++)
+                sums[s] = src[col] * (r + 1);
+                sums[s + 1] = src[col + 1] * (r + 1);
+                sums[s + 2] = src[col + 2] * (r + 1);
+            }
+            for (int k = 1; k <= r; k++)
+            {
+                int row = Math.Min(k, h - 1) * stride;
+                for (int col = 0, s = 0; col < stride; col += 4, s += 3)
                 {
-                    int y = k < 0 ? 0 : (k >= h ? h - 1 : k);
-                    int i = y * w * 4 + col;
-                    sum[0] += src[i]; sum[1] += src[i + 1]; sum[2] += src[i + 2];
+                    sums[s] += src[row + col];
+                    sums[s + 1] += src[row + col + 1];
+                    sums[s + 2] += src[row + col + 2];
                 }
-                for (int y = 0; y < h; y++)
+            }
+            for (int y = 0; y < h; y++)
+            {
+                int row = y * stride;
+                int add = Math.Min(y + r + 1, h - 1) * stride;
+                int remove = Math.Max(y - r, 0) * stride;
+                for (int col = 0, s = 0; col < stride; col += 4, s += 3)
                 {
-                    int o = y * w * 4 + col;
-                    dst[o] = (byte)(sum[0] / win);
-                    dst[o + 1] = (byte)(sum[1] / win);
-                    dst[o + 2] = (byte)(sum[2] / win);
-                    int addY = y + r + 1, remY = y - r;
-                    int ai = (addY >= h ? h - 1 : addY) * w * 4 + col;
-                    int ri = (remY < 0 ? 0 : remY) * w * 4 + col;
-                    sum[0] += src[ai] - src[ri];
-                    sum[1] += src[ai + 1] - src[ri + 1];
-                    sum[2] += src[ai + 2] - src[ri + 2];
+                    int o = row + col, ai = add + col, ri = remove + col;
+                    dst[o] = BlurAverage(sums[s], reciprocal);
+                    dst[o + 1] = BlurAverage(sums[s + 1], reciprocal);
+                    dst[o + 2] = BlurAverage(sums[s + 2], reciprocal);
+                    sums[s] += src[ai] - src[ri];
+                    sums[s + 1] += src[ai + 1] - src[ri + 1];
+                    sums[s + 2] += src[ai + 2] - src[ri + 2];
                 }
             }
         }
@@ -2193,11 +2205,20 @@ namespace DesktopBar.Services
         private static void BoxBlur3(byte[] a, byte[] b, int w, int h, int r)
         {
             if (r < 1) return;
-            for (int it = 0; it < 3; it++)
+            uint window = (uint)(2 * r + 1);
+            // With r <= 96, rounding the reciprocal upward preserves the exact integer quotient
+            // for every channel sum in [0, 255 * window].
+            uint reciprocal = ((1u << BlurShift) + window - 1) / window;
+            int[] sums = ArrayPool<int>.Shared.Rent(w * 3);
+            try
             {
-                BlurPassH(a, b, w, h, r);
-                BlurPassV(b, a, w, h, r);
+                for (int it = 0; it < 3; it++)
+                {
+                    BlurPassH(a, b, w, h, r, reciprocal);
+                    BlurPassV(b, a, w, h, r, reciprocal, sums.AsSpan(0, w * 3));
+                }
             }
+            finally { ArrayPool<int>.Shared.Return(sums); }
             // 模糊只写 BGR,alpha 位停留在池里的旧值(新池为 0)。
             // WPF 把它当纹理采样时会按"预乘 alpha"解释:alpha=0 → rgb 全被抹成 0,
             // 表现就是液态玻璃胶囊内部一片死黑(只剩边缘光)。这里统一补成不透明。
@@ -2233,10 +2254,9 @@ namespace DesktopBar.Services
             if (previous.Length != current.Length) return 255;
             long sum = 0;
             long count = 0;
-            int[] rows = { height / 8, height * 3 / 8, height * 5 / 8, height * 7 / 8 };
-            foreach (int y in rows)
+            for (int band = 1; band < 8; band += 2)
             {
-                int rowStart = y * width * 4;
+                int rowStart = height * band / 8 * width * 4;
                 for (int x = 0; x < width; x += stepX)
                 {
                     int i = rowStart + x * 4;
