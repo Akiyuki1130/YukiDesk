@@ -235,9 +235,9 @@
                                 <ListBox.ItemTemplate>
                                     <DataTemplate>
                                         <StackPanel>
-                                            <TextBlock Text="{Binding Label}" TextTrimming="CharacterEllipsis"
+                                            <TextBlock Text="{Binding Label, Mode=OneTime}" TextTrimming="CharacterEllipsis"
                                                        Foreground="{DynamicResource SettingsTextBrush}"/>
-                                            <TextBlock Text="{Binding Context}" FontSize="11.5" Margin="0,3,0,0" TextTrimming="CharacterEllipsis"
+                                            <TextBlock Text="{Binding Context, Mode=OneTime}" FontSize="11.5" Margin="0,3,0,0" TextTrimming="CharacterEllipsis"
                                                        Foreground="{DynamicResource SettingsSubTextBrush}"/>
                                         </StackPanel>
                                     </DataTemplate>

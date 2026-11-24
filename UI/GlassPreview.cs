@@ -37,6 +37,8 @@ namespace DesktopBar.UI
             private const int Height = 84;
             private const int PillWidth = 118;
             private const int PillHeight = 38;
+            private static readonly Lazy<BitmapSource> LightBackdrop = new(() => DrawBackdrop(false));
+            private static readonly Lazy<BitmapSource> DarkBackdrop = new(() => DrawBackdrop(true));
             private readonly BitmapSource _backdrop;
             private readonly bool _dark;
             private readonly ImageBrush _blurred = new ImageBrush { Stretch = Stretch.Fill };
@@ -56,7 +58,7 @@ namespace DesktopBar.UI
             public Sample(bool dark)
             {
                 _dark = dark;
-                _backdrop = DrawBackdrop(dark);
+                _backdrop = dark ? DarkBackdrop.Value : LightBackdrop.Value;
                 double radius = PillHeight * 0.5;
                 _glass = new Rectangle { Width = PillWidth, Height = PillHeight, RadiusX = radius, RadiusY = radius };
                 _tint = new Rectangle

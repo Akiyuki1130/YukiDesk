@@ -15,7 +15,7 @@ namespace DesktopBar.UI
     public sealed class LiquidGlassEffect : ShaderEffect
     {
         private readonly PillGlassGeometry _pillGeometry;
-        private static PixelShader _pillsShader, _panelShader;
+        private static byte[] _pillsBytecode, _panelBytecode;
         private static bool _pillsAttempted, _panelAttempted;
 
         // ---- 标量参数寄存器(滑杆可实时调) ----
@@ -148,10 +148,11 @@ namespace DesktopBar.UI
 
         private static LiquidGlassEffect CreateCore(bool panel, double radiusPx, double texW, double texH)
         {
-            ref PixelShader shader = ref (panel ? ref _panelShader : ref _pillsShader);
+            ref byte[] bytecode = ref (panel ? ref _panelBytecode : ref _pillsBytecode);
             ref bool attempted = ref (panel ? ref _panelAttempted : ref _pillsAttempted);
             try
             {
+                string cacheWritePath = null;
                 if (!attempted)
                 {
                     attempted = true;
@@ -162,17 +163,22 @@ namespace DesktopBar.UI
                         || RenderOptions.ProcessRenderMode == System.Windows.Interop.RenderMode.SoftwareOnly))
                         throw new NotSupportedException("当前 WPF 渲染设备不支持 Pixel Shader 3.0");
                     string path = CachePath(hlsl + "\n// target=" + target);
-                    byte[] bytecode = LoadCached(path, target);
-                    bool loadedFromCache = bytecode != null;
-                    bytecode ??= NativeMethods.CompilePs(hlsl, target);
-                    shader = CreateShader(bytecode);
-                    if (!loadedFromCache) SaveCached(path, bytecode);
+                    bytecode = LoadCached(path, target);
+                    if (bytecode == null)
+                    {
+                        bytecode = NativeMethods.CompilePs(hlsl, target);
+                        cacheWritePath = path;
+                    }
                 }
-                return shader == null ? null : new LiquidGlassEffect(shader, radiusPx, texW, texH, panel);
+                if (bytecode == null) return null;
+                // ShaderEffect subscribes to its PixelShader even after it is frozen.
+                var shader = CreateShader(bytecode);
+                if (cacheWritePath != null) SaveCached(cacheWritePath, bytecode);
+                return new LiquidGlassEffect(shader, radiusPx, texW, texH, panel);
             }
             catch (Exception ex)
             {
-                shader = null;
+                bytecode = null;
                 App.Log("液态玻璃着色器不可用,降级为普通玻璃: " + ex);
                 return null;
             }

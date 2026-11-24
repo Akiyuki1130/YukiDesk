@@ -19,7 +19,11 @@ namespace DesktopBar
             "SearchSection", typeof(string), typeof(SettingsWindow));
         private static readonly DependencyProperty SearchAliasesProperty = DependencyProperty.RegisterAttached(
             "SearchAliases", typeof(string), typeof(SettingsWindow));
-        private sealed record SearchHit(string Page, string Label, string Context, FrameworkElement Target);
+        // WPF can keep an inactive results view alive after the settings window closes.
+        private sealed record SearchHit(string Page, string Label, string Context, WeakReference<FrameworkElement> Anchor)
+        {
+            public FrameworkElement Target => Anchor?.TryGetTarget(out var target) == true ? target : null;
+        }
 
         private static readonly Dictionary<string, string> PageKeywords = new(StringComparer.Ordinal)
         {
@@ -80,7 +84,7 @@ namespace DesktopBar
                     int score = label.Equals(query, StringComparison.OrdinalIgnoreCase) ? 100
                         : label.StartsWith(query, StringComparison.OrdinalIgnoreCase) ? 70
                         : label.Contains(query, StringComparison.OrdinalIgnoreCase) ? 60 : 45;
-                    candidates.Add((new SearchHit(page, label, name, element), score));
+                    candidates.Add((new SearchHit(page, label, name, new WeakReference<FrameworkElement>(element)), score));
                     hasAnchor = true;
                 }
                 if (!hasAnchor && PageKeywords.TryGetValue(page, out var keywords) && terms.All(
@@ -154,23 +158,24 @@ namespace DesktopBar
             NavigateTo(hit.Page);
             var view = FindPage(hit.Page);
             if (view == null) return;
-            if (hit.Target == null)
+            var target = hit.Target;
+            if (target == null)
             {
                 view.ScrollToTop();
                 view.Focus();
                 return;
             }
-            for (var ancestor = LogicalTreeHelper.GetParent(hit.Target); ancestor != null && ancestor != view;
+            for (var ancestor = LogicalTreeHelper.GetParent(target); ancestor != null && ancestor != view;
                  ancestor = LogicalTreeHelper.GetParent(ancestor))
                 if (ancestor is Expander expander) expander.IsExpanded = true;
 
             Dispatcher.BeginInvoke(DispatcherPriority.Loaded, new Action(() =>
             {
-                if (_currentPage != hit.Page || !hit.Target.IsVisible) return;
-                hit.Target.BringIntoView();
-                if (hit.Target is Grid) hit.Target.MoveFocus(new TraversalRequest(FocusNavigationDirection.First));
+                if (_currentPage != hit.Page || !target.IsVisible) return;
+                target.BringIntoView();
+                if (target is Grid) target.MoveFocus(new TraversalRequest(FocusNavigationDirection.First));
                 if (SystemParameters.ClientAreaAnimation)
-                    hit.Target.BeginAnimation(OpacityProperty, new DoubleAnimation(.60, 1, TimeSpan.FromMilliseconds(265))
+                    target.BeginAnimation(OpacityProperty, new DoubleAnimation(.60, 1, TimeSpan.FromMilliseconds(265))
                     { FillBehavior = FillBehavior.Stop });
             }));
         }
