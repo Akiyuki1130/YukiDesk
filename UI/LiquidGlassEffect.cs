@@ -311,19 +311,9 @@ float field(float2 p)
     if (DEBUG_MODE == 7) { float4 c0 = tex2D(Input, uv); c0.rgb = pow(saturate(c0.rgb), 0.45454544); c0.a = 1.0; return c0; }
     if (DEBUG_MODE == 8) { float4 c0 = tex2D(Input, uv); return c0; }
 ");
-            if (panel)
-            {
-                // 展开页:窗口没有几何裁剪,圆角与边缘柔化直接由距离场给 alpha。
-                // (WPF 对带 Effect 的元素按整体包围盒跑像素着色器,形状必须自己画,否则四角是方的)
-                sb.AppendLine(@"    float pa = saturate(0.5 - d);
-    return float4(col * pa, pa);
+            // 展开页用 WPF 裁剪形状，着色器只负责玻璃的光学效果。
+            sb.AppendLine(@"    return float4(col, 1);
 }");
-            }
-            else
-            {
-                sb.AppendLine(@"    return float4(col, 1);
-}");
-            }
             // 调试档号填进模板里的 DEBUG_MODE 占位符;不认识的号码一律按 0(正常路径)
             string mode = dbg == null ? "0" : dbg;
             switch (mode)

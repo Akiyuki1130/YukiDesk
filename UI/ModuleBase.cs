@@ -61,7 +61,7 @@ namespace DesktopBar.UI
         private readonly Rectangle _panelBackdropFade;
         private readonly Border _panelChrome;
         private readonly Grid _panelSurface;
-        private readonly RectangleGeometry _panelMotionClip = new();
+        private readonly RectangleGeometry _panelClip = new();
         private double _panelMotionInset;
         private double _fallbackOpacity, _fallbackAlpha;
         private bool _blendingBackdrop;
@@ -100,22 +100,15 @@ namespace DesktopBar.UI
                 RenderTransform = _panelContentScale
             };
             _panelChrome = new Border { CornerRadius = Panel.CornerRadius, IsHitTestVisible = false };
-            // 玻璃层垫在面板底下,铺满整个展开页。命中测试交给面板(Rectangle 不吃鼠标),
-            // 圆角由 WPF 和着色器输出的透明像素决定，窗口本身留出动画空间。
+            // 背景填满展开页。整页共用 WPF 裁剪，首帧、玻璃和备用背景的外轮廓一致。
             _panelGlass = new Rectangle
             {
-                // 初始必须"什么都不画":以前这里是纯黑填充,一旦着色器/位图还没到位,
-                // 展开页显形的那一帧就是整块黑玻璃(用户报的"面板由黑变成液态玻璃,中间闪一下黑色")。
                 Fill = Brushes.Transparent,
-                IsHitTestVisible = false,
-                RadiusX = 16 * scale,
-                RadiusY = 16 * scale
+                IsHitTestVisible = false
             };
             _panelBackdropFade = new Rectangle
             {
                 IsHitTestVisible = false,
-                RadiusX = _panelGlass.RadiusX,
-                RadiusY = _panelGlass.RadiusY,
                 Visibility = Visibility.Collapsed
             };
             _panelLiveLayer = new Grid { IsHitTestVisible = false };
@@ -123,7 +116,7 @@ namespace DesktopBar.UI
             var transforms = new TransformGroup();
             transforms.Children.Add(_panelScale);
             transforms.Children.Add(_panelTransform);
-            _panelSurface = new Grid { RenderTransform = transforms, Opacity = 0 };
+            _panelSurface = new Grid { RenderTransform = transforms, Clip = _panelClip, Opacity = 0 };
             _panelSurface.Children.Add(_panelLiveLayer);
             _panelSurface.Children.Add(_panelBackdropFade);
             _panelSurface.Children.Add(_panelChrome);
@@ -808,14 +801,9 @@ namespace DesktopBar.UI
             Panel.Opacity = PanelMotion.Ease(Math.Clamp((progress - .08) / .64, 0, 1));
 
             double radius = Math.Min(Math.Min(bounds.Width, height) / 2, Panel.CornerRadius.TopLeft);
-            if (progress < 1)
-            {
-                _panelMotionClip.Rect = new Rect(bounds.Size);
-                _panelMotionClip.RadiusX = radius;
-                _panelMotionClip.RadiusY = radius / _panelScale.ScaleY;
-                _panelSurface.Clip = _panelMotionClip;
-            }
-            else _panelSurface.Clip = null;
+            _panelClip.Rect = new Rect(bounds.Size);
+            _panelClip.RadiusX = radius;
+            _panelClip.RadiusY = radius / _panelScale.ScaleY;
             return radius;
         }
 
@@ -967,7 +955,6 @@ namespace DesktopBar.UI
             }
             _panelMotion.Reset(0);
             _panelSurface.Opacity = 0;
-            _panelSurface.Clip = null;
             StopPanelTracking();
             ClearPanelBackdropFade();
             PanelWindow.Visibility = Visibility.Hidden;

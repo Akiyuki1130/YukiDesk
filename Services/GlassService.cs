@@ -1319,7 +1319,8 @@ namespace DesktopBar.Services
             var effect = request.Options.Liquid && shown.Options.Liquid ? _panelEffect : null;
             if (effect != null)
             {
-                SetGeometry(effect, _panelCornerRadius * 0.5, width * 0.5, height * 0.5);
+                // 采样可能被屏幕边界截短，折射轮廓始终按展开页实际尺寸计算。
+                SetGeometry(effect, _panelCornerRadius * 0.5, visible.Width * 0.5, visible.Height * 0.5);
                 effect.SharpUv = new Point4D(viewbox.Width, viewbox.Height, viewbox.X, viewbox.Y);
                 if (effect.Input != _panelBodyBrush) effect.Input = _panelBodyBrush;
                 if (effect.Sharp != _panelSharpBrush) effect.Sharp = _panelSharpBrush;
