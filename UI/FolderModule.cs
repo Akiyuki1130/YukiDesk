@@ -36,6 +36,7 @@ namespace DesktopBar.UI
         private int _loadVersion, _readingVersion = -1;
         private string _readingDirectory;
         private bool _readAgain;
+        private volatile bool _catalogDemand;
         private volatile bool _disposed;
         internal string FolderName => _name;
         internal string FolderPath => _directory;
@@ -86,13 +87,28 @@ namespace DesktopBar.UI
                 Interlocked.Exchange(ref _reloadQueued, 0);
                 _ = LoadFilesAsync(contentsChanged: true);
             };
-            _ = LoadFilesAsync();
+            SetCatalogDemand(App.ActiveSettings.ShowFolders);
         }
 
         protected override void OnPanelShown()
         {
-            if (_files != null && _watcher == null) _ = LoadFilesAsync();
+            if (_watcher == null) _ = LoadFilesAsync();
             _ = ShowFilesAsync();
+        }
+
+        internal void SetCatalogDemand(bool active)
+        {
+            if (_disposed || active == _catalogDemand) return;
+            _catalogDemand = active;
+            if (active) _ = LoadFilesAsync();
+            else
+            {
+                _loadVersion++;
+                _debounce.Stop();
+                Interlocked.Exchange(ref _reloadQueued, 0);
+                _watcher?.Dispose();
+                _watcher = null;
+            }
         }
 
         protected override bool KeepPanelOpenOnPointerExit => _panelPinned;
@@ -112,7 +128,7 @@ namespace DesktopBar.UI
 
         private async Task LoadFilesAsync(bool contentsChanged = false)
         {
-            if (_directory == null || _disposed) return;
+            if (_directory == null || _disposed || !_catalogDemand) return;
             string path = CurrentDirectory;
             if (_readingVersion == _loadVersion && string.Equals(_readingDirectory, path, StringComparison.OrdinalIgnoreCase))
             {
@@ -233,10 +249,10 @@ namespace DesktopBar.UI
                 ScheduleReload();
                 return;
             }
-            if (_disposed || Dispatcher.HasShutdownStarted) return;
+            if (_disposed || !_catalogDemand || Dispatcher.HasShutdownStarted) return;
             Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() =>
             {
-                if (_disposed || (_watcher != null && !ReferenceEquals(_watcher, watcher))) return;
+                if (_disposed || !_catalogDemand || (_watcher != null && !ReferenceEquals(_watcher, watcher))) return;
                 watcher.Dispose();
                 _watcher = null;
                 _loadVersion++;
@@ -246,12 +262,12 @@ namespace DesktopBar.UI
 
         private void ScheduleReload()
         {
-            if (_disposed || Dispatcher.HasShutdownStarted) return;
+            if (_disposed || !_catalogDemand || Dispatcher.HasShutdownStarted) return;
             Interlocked.Exchange(ref _lastFolderChange, Environment.TickCount64);
             if (Interlocked.Exchange(ref _reloadQueued, 1) != 0) return;
             Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() =>
             {
-                if (!_disposed) _debounce.Start();
+                if (!_disposed && _catalogDemand) _debounce.Start();
             }));
         }
 

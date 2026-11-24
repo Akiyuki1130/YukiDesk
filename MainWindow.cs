@@ -583,6 +583,7 @@ namespace DesktopBar
             if (module == null) return;
             if (!visible) module.ClosePanelImmediately();
             module.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
+            if (module is FolderModule folder) folder.SetCatalogDemand(visible);
         }
 
         private void DisposeModules()
