@@ -12,6 +12,7 @@ namespace DesktopBar.UI
 {
     public partial class MusicModule
     {
+        private const int SeekSettlingMs = 750;
         private AnimatedPanelSection _timelineSection;
         private Slider _position;
         private TextBlock _elapsed, _duration;
@@ -168,7 +169,7 @@ namespace DesktopBar.UI
                 return;
             }
             _seekTarget = Math.Clamp(_position.Value, _timelineInfo.SeekFrom.TotalSeconds, _timelineInfo.SeekTo.TotalSeconds);
-            _seekUntil = Environment.TickCount64 + 750;
+            _seekUntil = Environment.TickCount64 + SeekSettlingMs;
             RenderProgress();
             UpdateTimelineTimer();
             var target = _seekTarget >= TimeSpan.MaxValue.TotalSeconds ? TimeSpan.MaxValue : TimeSpan.FromSeconds(_seekTarget);
@@ -178,8 +179,8 @@ namespace DesktopBar.UI
         private async Task SeekAsync(MediaInfo expected, TimeSpan target, int version)
         {
             bool accepted = await _controller.SeekAsync(expected, target);
-            if (accepted || version != _seekVersion) return;
-            _seekUntil = 0;
+            if (version != _seekVersion) return;
+            _seekUntil = accepted ? Environment.TickCount64 + SeekSettlingMs : 0;
             RenderProgress();
             UpdateTimelineTimer();
         }

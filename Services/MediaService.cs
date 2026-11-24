@@ -70,6 +70,8 @@ namespace DesktopBar.Services
         private bool _started;
         private bool _disposed;
         private bool _progressDemand;
+        private bool _seeking;
+        private SeekRequest _queuedSeek;
         private string _sessionKey = "";
         private MediaInfo _current = new MediaInfo(0, false, "", "", "", "", "", null,
             false, TimeSpan.Zero, TimeSpan.Zero, false);
@@ -86,18 +88,48 @@ namespace DesktopBar.Services
 
         public MediaService(Dispatcher dispatcher) { _dispatcher = dispatcher; }
 
-        internal async Task<bool> SeekAsync(MediaInfo expected, TimeSpan position)
+        private sealed record SeekRequest(Func<Task<bool>> Apply, TaskCompletionSource<bool> Completion);
+
+        internal Task<bool> SeekAsync(MediaInfo expected, TimeSpan position)
+            => EnqueueSeek(() => ApplySeekAsync(expected, position));
+
+        private Task<bool> EnqueueSeek(Func<Task<bool>> apply)
+        {
+            if (_disposed) return Task.FromResult(false);
+            _queuedSeek?.Completion.TrySetResult(false);
+            var request = new SeekRequest(apply, new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously));
+            _queuedSeek = request;
+            if (!_seeking) _ = ProcessSeeksAsync();
+            return request.Completion.Task;
+        }
+
+        private async Task ProcessSeeksAsync()
+        {
+            _seeking = true;
+            try
+            {
+                while (_queuedSeek is { } request)
+                {
+                    _queuedSeek = null;
+                    try { request.Completion.TrySetResult(await request.Apply()); }
+                    catch (Exception ex)
+                    {
+                        App.Log("媒体定位失败: " + ex.Message);
+                        request.Completion.TrySetResult(false);
+                    }
+                }
+            }
+            finally { _seeking = false; }
+        }
+
+        private async Task<bool> ApplySeekAsync(MediaInfo expected, TimeSpan position)
         {
             var session = _session;
             if (_disposed || session == null || !_current.SeekSupported || !SameTrack(expected, _current)) return false;
             long ticks = _current.Start.Ticks + Math.Clamp(position.Ticks, _current.SeekFrom.Ticks, _current.SeekTo.Ticks);
-            try
-            {
-                bool changed = await session.TryChangePlaybackPositionAsync(ticks);
-                if (changed) Push(session);
-                return changed;
-            }
-            catch (Exception ex) { App.Log("媒体定位失败: " + ex.Message); return false; }
+            bool changed = await session.TryChangePlaybackPositionAsync(ticks);
+            if (changed) Push(session);
+            return changed;
         }
 
         internal static bool SameTrack(MediaInfo left, MediaInfo right)
@@ -439,6 +471,8 @@ namespace DesktopBar.Services
         {
             if (_disposed) return;
             _disposed = true;
+            _queuedSeek?.Completion.TrySetResult(false);
+            _queuedSeek = null;
             _retryTimer?.Stop();
             _retryTimer = null;
             _sessionGeneration++;
