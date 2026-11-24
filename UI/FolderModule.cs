@@ -113,8 +113,9 @@ namespace DesktopBar.UI
 
         protected override bool KeepPanelOpenOnPointerExit => _panelPinned;
         protected override bool CaptureFullPanelEnvelope => false;
+        // Preview replaces the file list within the same window.
         protected override Size GetPanelEnvelope(Size content) => new(Math.Max(content.Width, 336 * Ui.Scale),
-            Math.Max(content.Height, SystemParameters.PrimaryScreenHeight * .42 + 176 * Ui.Scale + 265));
+            Math.Max(content.Height, SystemParameters.PrimaryScreenHeight * .42 + 176 * Ui.Scale));
 
         protected override void OnPanelHidden()
         {
