@@ -21,6 +21,7 @@ namespace DesktopBar.UI
         private TextBox _filter;
         private Button _sortButton, _viewButton;
         private TextBlock _folderStatus;
+        private StackPanel _folderBrowser;
         private Border _preview;
         private Image _previewImage;
         private TextBlock _previewLabel;
@@ -53,7 +54,7 @@ namespace DesktopBar.UI
 
         private FrameworkElement BuildFolderContent()
         {
-            var root = new StackPanel();
+            var browser = _folderBrowser = new StackPanel();
             var tools = new DockPanel { Margin = new Thickness(3, 2, 3, 5), LastChildFill = true };
             _sortButton = PanelControls.GlassButton("排序", () =>
             {
@@ -97,8 +98,8 @@ namespace DesktopBar.UI
                 }
             };
             tools.Children.Add(_filter);
-            root.Children.Add(tools);
-            root.Children.Add(BuildFolderLocation());
+            browser.Children.Add(tools);
+            browser.Children.Add(BuildFolderLocation());
             _folderStatus = PanelControls.Text("正在读取…");
             _folderStatus.Margin = new Thickness(4 * Ui.Scale, 0, 4 * Ui.Scale, 0);
             _folderStatus.TextTrimming = TextTrimming.CharacterEllipsis;
@@ -110,17 +111,18 @@ namespace DesktopBar.UI
                 MaxHeight = SystemParameters.PrimaryScreenHeight * 0.42,
                 Content = _wrap
             };
-            root.Children.Add(BuildSelectionToolbar());
-            root.Children.Add(_gridScroll);
-            root.Children.Add(BuildVirtualList());
+            browser.Children.Add(BuildSelectionToolbar());
+            browser.Children.Add(_gridScroll);
+            browser.Children.Add(BuildVirtualList());
             SetFolderViewMode();
             _showMore = PanelControls.Button("显示更多", () => { _visibleLimit += 144; RefreshView(); });
             _showMore.Visibility = Visibility.Collapsed;
-            root.Children.Add(_showMore);
+            browser.Children.Add(_showMore);
             _previewLabel = PanelControls.Text("");
             _previewLabel.Focusable = true;
-            _previewLabel.TextWrapping = TextWrapping.Wrap;
-            _previewImage = new Image { MaxHeight = 225, Stretch = Stretch.Uniform, HorizontalAlignment = HorizontalAlignment.Center };
+            _previewLabel.TextTrimming = TextTrimming.CharacterEllipsis;
+            _previewImage = new Image { Stretch = Stretch.Uniform, HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center };
             _previewImage.SizeChanged += (_, args) =>
             {
                 double radius = Math.Min(9 * Ui.Scale, Math.Min(args.NewSize.Width, args.NewSize.Height) / 2);
@@ -128,15 +130,20 @@ namespace DesktopBar.UI
             };
             var previewContent = new StackPanel();
             previewContent.Children.Add(_previewLabel);
-            previewContent.Children.Add(_previewImage);
-            var previewActions = new StackPanel { Orientation = Orientation.Horizontal };
-            _previewPrevious = PanelControls.Button("上一项", () => MovePreview(-1));
-            _previewNext = PanelControls.Button("下一项", () => MovePreview(1));
+            var imageArea = new Grid { Height = Math.Min(225 * Ui.Scale, SystemParameters.WorkArea.Height * .40),
+                Margin = new Thickness(0, 6 * Ui.Scale, 0, 6 * Ui.Scale) };
+            imageArea.Children.Add(_previewImage);
+            previewContent.Children.Add(imageArea);
+            var previewActions = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center };
+            _previewPrevious = PanelControls.GlassButton("上一项", () => MovePreview(-1), compact: true);
+            _previewNext = PanelControls.GlassButton("下一项", () => MovePreview(1), compact: true);
             previewActions.Children.Add(_previewPrevious);
             previewActions.Children.Add(_previewNext);
-            previewActions.Children.Add(PanelControls.Button("关闭预览", CancelPreview));
+            previewActions.Children.Add(PanelControls.GlassButton("关闭预览", CancelPreview, compact: true));
             previewContent.Children.Add(previewActions);
             _preview = new Border { Child = previewContent, Margin = new Thickness(8), Visibility = Visibility.Collapsed };
+            var root = new Grid();
+            root.Children.Add(browser);
             root.Children.Add(_preview);
             PanelWindow.PreviewKeyDown += (_, e) =>
             {
@@ -336,9 +343,11 @@ namespace DesktopBar.UI
 
         private void PreviewFile(FileSystemInfo file)
         {
-            _previewItems = _matchedFiles.Where(item => item is FileInfo).ToArray();
+            bool images = FileImage.IsImage(file.Extension);
+            _previewItems = _matchedFiles.Where(item => item is FileInfo && (!images || FileImage.IsImage(item.Extension))).ToArray();
             _previewIndex = Array.FindIndex(_previewItems, item => item.FullName == file.FullName);
             if (_previewIndex < 0) return;
+            _folderBrowser.Visibility = Visibility.Collapsed;
             _preview.Visibility = Visibility.Visible;
             _previewPrevious.IsEnabled = _previewNext.IsEnabled = _previewItems.Length > 1;
             EnterPanelKeyboardMode(_previewLabel);
@@ -360,6 +369,7 @@ namespace DesktopBar.UI
             _previewRead = read;
             _previewImage.BeginAnimation(OpacityProperty, null);
             string name = Path.GetFileName(path);
+            _previewLabel.ToolTip = name;
             _previewLabel.Text = name + " · 正在读取…";
             try
             {
@@ -376,12 +386,15 @@ namespace DesktopBar.UI
 
         private void CancelPreview()
         {
+            if (_preview.Visibility != Visibility.Visible) return;
             _previewRevision++;
             _previewRead?.Cancel();
             _previewItems = null;
             _previewImage.BeginAnimation(OpacityProperty, null);
             _previewImage.Source = null;
+            if (_previewLabel.IsKeyboardFocusWithin) LeaveKeyboardMode();
             _preview.Visibility = Visibility.Collapsed;
+            _folderBrowser.Visibility = Visibility.Visible;
         }
     }
 }
