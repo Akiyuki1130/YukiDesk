@@ -95,7 +95,7 @@ namespace DesktopBar.Services
         /// <summary>查询最新 Release;无更新返回 null,网络/解析失败抛异常。</summary>
         public static async Task<UpdateInfo> CheckLatestAsync(CancellationToken ct)
         {
-            using var doc = await ReadReleaseAsync(ct);
+            using var doc = await ReadReleaseAsync(ct).ConfigureAwait(false);
             var root = doc.RootElement;
             if (root.GetProperty("prerelease").GetBoolean() || root.GetProperty("draft").GetBoolean())
                 return null;
@@ -119,7 +119,7 @@ namespace DesktopBar.Services
             return new UpdateInfo
             {
                 Version = version,
-                Notes = root.GetProperty("body").GetString() ?? "",
+                Notes = root.TryGetProperty("body", out var notes) ? notes.GetString() ?? "" : "",
                 DownloadUrl = asset.Value.Url,
                 FileName = asset.Value.Name,
                 ChecksumUrl = FindChecksumAsset(root, version, ArchTag)
@@ -128,7 +128,7 @@ namespace DesktopBar.Services
 
         internal static async Task<string> ReadReleaseSummaryAsync(CancellationToken cancellationToken)
         {
-            using var doc = await ReadReleaseAsync(cancellationToken);
+            using var doc = await ReadReleaseAsync(cancellationToken).ConfigureAwait(false);
             var root = doc.RootElement;
             string tag = root.GetProperty("tag_name").GetString() ?? "未知";
             string version = tag.TrimStart('v', 'V');
@@ -141,9 +141,9 @@ namespace DesktopBar.Services
         {
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             cts.CancelAfter(TimeSpan.FromSeconds(30));
-            using var response = await Http.GetAsync(ApiUrl, cts.Token);
+            using var response = await Http.GetAsync(ApiUrl, cts.Token).ConfigureAwait(false);
             response.EnsureSuccessStatusCode();
-            string json = await response.Content.ReadAsStringAsync(cts.Token);
+            string json = await response.Content.ReadAsStringAsync(cts.Token).ConfigureAwait(false);
             return JsonDocument.Parse(json);
         }
 
@@ -167,8 +167,7 @@ namespace DesktopBar.Services
                 int match = Array.FindIndex(names, expected => string.Equals(name, expected, StringComparison.OrdinalIgnoreCase));
                 if (match < 0 || match >= bestMatch) continue;
                 string url = asset.GetProperty("browser_download_url").GetString() ?? "";
-                if (Uri.TryCreate(url, UriKind.Absolute, out var uri)
-                    && string.Equals(uri.Host, "github.com", StringComparison.OrdinalIgnoreCase))
+                if (IsReleaseAssetUrl(url, name))
                 {
                     bestMatch = match;
                     bestUrl = url;
@@ -189,12 +188,20 @@ namespace DesktopBar.Services
                 string url = asset.GetProperty("browser_download_url").GetString() ?? "";
                 bool versionMatch = string.Equals(name, expectedShort, StringComparison.OrdinalIgnoreCase)
                     || string.Equals(name, expectedAssembly, StringComparison.OrdinalIgnoreCase);
-                if (versionMatch
-                    && Uri.TryCreate(url, UriKind.Absolute, out var uri)
-                    && string.Equals(uri.Host, "github.com", StringComparison.OrdinalIgnoreCase))
+                if (versionMatch && IsReleaseAssetUrl(url, name))
                     return (name, url);
             }
             return null;
+        }
+
+        private static bool IsReleaseAssetUrl(string url, string name)
+        {
+            if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) || uri.Scheme != Uri.UriSchemeHttps
+                || !uri.IsDefaultPort || uri.UserInfo.Length != 0 || !uri.Host.Equals("github.com", StringComparison.OrdinalIgnoreCase))
+                return false;
+            string path = uri.AbsolutePath;
+            return path.StartsWith("/" + Repo + "/releases/download/", StringComparison.OrdinalIgnoreCase)
+                && path.EndsWith("/" + Uri.EscapeDataString(name), StringComparison.OrdinalIgnoreCase);
         }
 
         // ---------- 下载 ----------
@@ -208,11 +215,11 @@ namespace DesktopBar.Services
 
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             cts.CancelAfter(TimeSpan.FromMinutes(15));
-            using var resp = await Http.GetAsync(info.DownloadUrl, HttpCompletionOption.ResponseHeadersRead, cts.Token);
+            using var resp = await Http.GetAsync(info.DownloadUrl, HttpCompletionOption.ResponseHeadersRead, cts.Token).ConfigureAwait(false);
             resp.EnsureSuccessStatusCode();
 
             long? total = resp.Content.Headers.ContentLength;
-            await using var src = await resp.Content.ReadAsStreamAsync(cts.Token);
+            await using var src = await resp.Content.ReadAsStreamAsync(cts.Token).ConfigureAwait(false);
             try
             {
                 await using var dst = new FileStream(target, FileMode.CreateNew, FileAccess.Write, FileShare.None,
@@ -221,9 +228,9 @@ namespace DesktopBar.Services
                 long readTotal = 0;
                 int lastPercent = -1;
                 int read;
-                while ((read = await src.ReadAsync(buffer, cts.Token)) > 0)
+                while ((read = await src.ReadAsync(buffer, cts.Token).ConfigureAwait(false)) > 0)
                 {
-                    await dst.WriteAsync(buffer.AsMemory(0, read), cts.Token);
+                    await dst.WriteAsync(buffer.AsMemory(0, read), cts.Token).ConfigureAwait(false);
                     readTotal += read;
                     if (progress == null || total is not > 0) continue;
                     int percent = (int)(readTotal * 100.0 / total.Value);
@@ -296,13 +303,13 @@ namespace DesktopBar.Services
                 return;
             }
             using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
-            string text = await Http.GetStringAsync(info.ChecksumUrl, cts.Token);
+            string text = await Http.GetStringAsync(info.ChecksumUrl, cts.Token).ConfigureAwait(false);
             string expected = ParseChecksum(text, info.FileName);
             if (expected == null)
                 throw new InvalidOperationException("校验清单缺少安装包的有效 SHA-256 条目: " + info.FileName);
             await using var fs = new FileStream(installerPath, FileMode.Open, FileAccess.Read, FileShare.Read,
                 64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
-            var digest = await System.Security.Cryptography.SHA256.HashDataAsync(fs, cts.Token);
+            var digest = await System.Security.Cryptography.SHA256.HashDataAsync(fs, cts.Token).ConfigureAwait(false);
             string actual = Convert.ToHexString(digest).ToLowerInvariant();
             if (!string.Equals(actual, expected, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("SHA-256 不匹配(期望 " + expected + ",实际 " + actual + ")");
@@ -312,19 +319,21 @@ namespace DesktopBar.Services
         /// <summary>解析 sha256sum 格式("<哈希>  <文件名>")的清单,返回目标文件的哈希。</summary>
         private static string ParseChecksum(string text, string fileName)
         {
+            string found = null;
             foreach (var raw in (text ?? "").Split('\n'))
             {
-                var line = raw.Trim();
+                var line = raw.Trim().TrimStart('\uFEFF');
                 int sep = line.IndexOfAny(new[] { ' ', '\t' });
                 if (sep <= 0) continue;
                 string hash = line.Substring(0, sep).Trim();
                 string name = line.Substring(sep + 1).Trim().TrimStart('*');
-                if (string.Equals(name, fileName, StringComparison.OrdinalIgnoreCase)
-                    && hash.Length == 64
-                    && hash.All(Uri.IsHexDigit))
-                    return hash.ToLowerInvariant();
+                if (!string.Equals(name, fileName, StringComparison.OrdinalIgnoreCase)
+                    || hash.Length != 64 || !hash.All(Uri.IsHexDigit)) continue;
+                hash = hash.ToLowerInvariant();
+                if (found != null && found != hash) return null;
+                found = hash;
             }
-            return null;
+            return found;
         }
 
         /// <summary>
@@ -381,12 +390,18 @@ namespace DesktopBar.Services
                 }
 
                 string path;
+                int downloading = 1;
                 try
                 {
-                    var progress = new Progress<double>(p => status?.Invoke("正在下载 v" + info.Version + "… " + Math.Round(p) + "%"));
+                    status?.Invoke("正在下载 v" + info.Version + "…");
+                    var progress = status == null ? null : new Progress<double>(p =>
+                    {
+                        if (Volatile.Read(ref downloading) != 0) status("正在下载 v" + info.Version + "… " + Math.Round(p) + "%");
+                    });
                     path = await DownloadAsync(info, progress, CancellationToken.None);
                 }
                 catch (Exception ex) { status?.Invoke("下载失败: " + ex.Message); return; }
+                finally { Volatile.Write(ref downloading, 0); }
 
                 // 完整性校验:Release 附带 SHA256SUMS 时比对安装包哈希,不符即删。
                 try
