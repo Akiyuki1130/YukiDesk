@@ -141,6 +141,11 @@ namespace DesktopBar.UI
                     return;
                 }
                 _watcher ??= watcher;
+                if (files == null && _watcher != null)
+                {
+                    _watcher.Dispose();
+                    _watcher = null;
+                }
                 if (!unchanged)
                 {
                     UpdateFolderSnapshot(files);
@@ -165,8 +170,15 @@ namespace DesktopBar.UI
             => first.Length == second.Length && first.Zip(second).All(pair => SameFileMetadata(pair.First, pair.Second));
 
         private static bool SameFileMetadata(FileSystemInfo first, FileSystemInfo second)
-            => first.Name == second.Name && first.Attributes == second.Attributes
-                && first.LastWriteTimeUtc == second.LastWriteTimeUtc && ReadFileSize(first) == ReadFileSize(second);
+        {
+            if (first.Name != second.Name) return false;
+            try
+            {
+                return first.Attributes == second.Attributes && first.LastWriteTimeUtc == second.LastWriteTimeUtc
+                    && ReadFileSize(first) == ReadFileSize(second);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return false; }
+        }
 
         private (FileSystemInfo[] Files, FileSystemWatcher Watcher) ReadFolder(string path, bool watch)
         {

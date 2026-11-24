@@ -60,9 +60,16 @@ namespace DesktopBar.UI
         {
             bool isDirectory = item is DirectoryInfo;
             bool isImage = !isDirectory && FileImage.IsImage(item.Extension);
-            bool placeholder = FileImage.NeedsLocalData(item.Attributes);
+            bool placeholder;
+            long modified;
+            try
+            {
+                placeholder = FileImage.NeedsLocalData(item.Attributes);
+                modified = item.LastWriteTimeUtc.Ticks;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return; }
             int pixels = IconPixelSize();
-            string key = (isDirectory ? "dir:" : "file:") + item.FullName + "|" + pixels + "|" + item.LastWriteTimeUtc.Ticks
+            string key = (isDirectory ? "dir:" : "file:") + item.FullName + "|" + pixels + "|" + modified
                 + (placeholder ? "|offline" : "");
             BitmapSource icon;
             lock (Gate)
