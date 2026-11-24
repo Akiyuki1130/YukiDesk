@@ -548,9 +548,11 @@ namespace DesktopBar.UI
         private bool _syncing;
         private bool _muted;
         private bool _volumeWritesEnabled;
+        private bool _outputDemand;
         private volatile bool _disposed;
         public VolumeModule(TabStyle st) : base(st)
         {
+            _outputDemand = App.ActiveSettings.ShowVolume;
             Pill.Width = 38 * Ui.Scale;
             Pill.MinWidth = Pill.MaxWidth = 38 * Ui.Scale;
             Pill.Padding = new Thickness(0);
@@ -631,8 +633,32 @@ namespace DesktopBar.UI
 
         private void StartOutput()
         {
-            if (!_disposed && IsLoaded && IsVisible && _outputWorker == null)
+            if (!_disposed && _outputDemand && IsLoaded && IsVisible && _outputWorker == null)
                 _outputWorker = new AudioOutput(QueueOutputUpdate);
+        }
+
+        internal void SetOutputDemand(bool active)
+        {
+            if (_disposed || _outputDemand == active) return;
+            _outputDemand = active;
+            if (active)
+            {
+                StartOutput();
+                return;
+            }
+
+            _outputWorker?.Dispose();
+            _outputWorker = null;
+            _mixerWorker?.Dispose();
+            _mixerWorker = null;
+            _outputId = null;
+            _requestedVolume = _requestedMute = 0;
+            _muted = _volumeWritesEnabled = false;
+            _slider.IsEnabled = _muteButton.IsEnabled = false;
+            _output.Text = "正在读取输出设备…";
+            _output.ToolTip = null;
+            _value.Text = "—";
+            UpdateIcon(0);
         }
 
         private void QueueOutputUpdate()

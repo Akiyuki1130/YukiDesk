@@ -138,8 +138,7 @@ namespace DesktopBar
                 Microsoft.Win32.SystemEvents.SessionSwitch -= OnSessionSwitch;
                 Microsoft.Win32.SystemEvents.PowerModeChanged -= OnPowerModeChanged;
                 DisposeModules();
-                try { _media?.Dispose(); } catch { }
-                _media = null;
+                StopMedia();
             };
         }
 
@@ -269,7 +268,6 @@ namespace DesktopBar
             ApplyModuleVisibility();
             Content = root;
             App.Log("YukiDesk 主栏布局已构建");
-            WireMedia();
             if (glassHost != null)
             {
                 // 胶囊并集裁剪随布局变化重算(模块显隐/文件夹增删/时钟重排都走这里)。
@@ -537,7 +535,10 @@ namespace DesktopBar
             SetModuleVisibility(_recycle, App.ActiveSettings.ShowRecycleBin);
             foreach (var fm in _folderModules)
                 SetModuleVisibility(fm, App.ActiveSettings.ShowFolders);
-            SetModuleVisibility(_music, App.ActiveSettings.ShowMusic && _mediaAvailable);
+            bool musicEnabled = App.ActiveSettings.ShowMusic;
+            if (musicEnabled && _mediaHandler == null) WireMedia();
+            SetModuleVisibility(_music, musicEnabled && _mediaAvailable);
+            if (!musicEnabled) StopMedia();
             if (_spectrum != null)
             {
                 _spectrum.Visibility = App.ActiveSettings.ShowSpectrum ? Visibility.Visible : Visibility.Collapsed;
@@ -584,11 +585,13 @@ namespace DesktopBar
             if (!visible) module.ClosePanelImmediately();
             module.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
             if (module is FolderModule folder) folder.SetCatalogDemand(visible);
+            else if (module is VolumeModule volume) volume.SetOutputDemand(visible);
         }
 
         private void DisposeModules()
         {
             ClosePanels();
+            UnwireMedia();
             foreach (var module in _modules)
                 module.Dispose();
             _modules.Clear();
@@ -614,14 +617,7 @@ namespace DesktopBar
 
         private void WireMedia()
         {
-            if (_media == null)
-            {
-                _media = new MediaService(Dispatcher);
-                _ = _media.StartAsync();
-            }
-            if (_mediaHandler != null) _media.Updated -= _mediaHandler;
-            if (_mediaLost != null) _media.SessionLost -= _mediaLost;
-
+            _media ??= new MediaService(Dispatcher);
             var music = _music;
             music?.UseMediaService(_media);
             _mediaHandler = info =>
@@ -640,6 +636,28 @@ namespace DesktopBar
             _media.Updated += _mediaHandler;
             _media.SessionLost += _mediaLost;
             _mediaHandler(_media.Current);
+            _ = _media.StartAsync();
+        }
+
+        private void UnwireMedia()
+        {
+            if (_media == null) return;
+            _media.Updated -= _mediaHandler;
+            _media.SessionLost -= _mediaLost;
+            _mediaHandler = null;
+            _mediaLost = null;
+        }
+
+        private void StopMedia()
+        {
+            var service = _media;
+            if (service == null) return;
+            UnwireMedia();
+            _music?.UseMediaService(null);
+            _media = null;
+            _mediaAvailable = false;
+            try { service.Dispose(); }
+            catch (Exception ex) { App.Log("停止音乐会话失败: " + ex.Message); }
         }
     }
 }
