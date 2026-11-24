@@ -139,7 +139,9 @@ namespace DesktopBar.UI
             _previewNext = PanelControls.GlassButton("下一项", () => MovePreview(1), compact: true);
             previewActions.Children.Add(_previewPrevious);
             previewActions.Children.Add(_previewNext);
-            previewActions.Children.Add(PanelControls.GlassButton("关闭预览", CancelPreview, compact: true));
+            var closePreview = PanelControls.GlassButton("关闭预览", CancelPreview, compact: true);
+            closePreview.ToolTip = "关闭预览（空格或 Esc）";
+            previewActions.Children.Add(closePreview);
             previewContent.Children.Add(previewActions);
             _preview = new Border { Child = previewContent, Margin = new Thickness(8), Visibility = Visibility.Collapsed };
             var root = new Grid();
@@ -149,19 +151,20 @@ namespace DesktopBar.UI
             {
                 if (HandleSelectionKey(e)) return;
                 var key = e.Key == Key.System ? e.SystemKey : e.Key;
-                if (e.Key == Key.Escape)
+                bool previewing = _preview.Visibility == Visibility.Visible;
+                if (e.Key == Key.Escape || previewing && e.Key == Key.Space)
                 {
-                    if (_preview.Visibility == Visibility.Visible) CancelPreview();
+                    if (previewing) CancelPreview();
                     else if (_filter.Text.Length != 0) _filter.Clear();
                     else HidePanel();
                     e.Handled = true;
                 }
-                else if (_preview.Visibility == Visibility.Visible && (e.Key == Key.Left || e.Key == Key.Right))
+                else if (previewing && (e.Key == Key.Left || e.Key == Key.Right))
                 {
                     MovePreview(e.Key == Key.Left ? -1 : 1);
                     e.Handled = true;
                 }
-                else if (_preview.Visibility != Visibility.Visible && (key == Key.Up && Keyboard.Modifiers == ModifierKeys.Alt
+                else if (!previewing && (key == Key.Up && Keyboard.Modifiers == ModifierKeys.Alt
                     || key == Key.Back && Keyboard.Modifiers == ModifierKeys.None && !_filter.IsKeyboardFocusWithin))
                 {
                     e.Handled = NavigateUp();
