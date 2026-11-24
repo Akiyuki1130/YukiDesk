@@ -191,10 +191,10 @@
                                     </StackPanel>
                                 </RadioButton>
                                 <RadioButton Style="{StaticResource NavRadio}" GroupName="SettingsPages"
-                                             AutomationProperties.Name="模块显示" Checked="Nav_Checked" Tag="Modules">
+                                             AutomationProperties.Name="顶栏布局" Checked="Nav_Checked" Tag="Modules">
                                     <StackPanel Orientation="Horizontal">
                                         <Path Style="{StaticResource NavIcon}" Data="M 2,2 L 6.5,2 L 6.5,6.5 L 2,6.5 Z M 9.5,2 L 14,2 L 14,6.5 L 9.5,6.5 Z M 2,9.5 L 6.5,9.5 L 6.5,14 L 2,14 Z M 9.5,9.5 L 14,9.5 L 14,14 L 9.5,14 Z"/>
-                                        <TextBlock Text="模块显示" VerticalAlignment="Center"/>
+                                        <TextBlock Text="顶栏布局" VerticalAlignment="Center"/>
                                     </StackPanel>
                                 </RadioButton>
                                 <RadioButton Style="{StaticResource NavRadio}" GroupName="SettingsPages"

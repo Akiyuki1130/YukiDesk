@@ -5,6 +5,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Threading;
 using DesktopBar.Interop;
@@ -18,8 +19,13 @@ namespace DesktopBar.UI
         private readonly TextBlock _status;
         private readonly DispatcherTimer _refreshTimer;
         private List<ShellFiles.RecycledItem> _snapshot = new();
+        private readonly HashSet<string> _selection = new(StringComparer.Ordinal);
+        private readonly TextBox _filter;
+        private readonly Button _restoreSelected, _selectMode, _dateFilter;
+        private bool _selecting, _recentOnly;
         private bool _refreshing;
         private bool _refreshRequested;
+        private int _binOperations;
         private bool _disposed;
 
         public RecycleBinModule(TabStyle style) : base(style)
@@ -56,15 +62,53 @@ namespace DesktopBar.UI
             _status.HorizontalAlignment = HorizontalAlignment.Center;
             _status.Opacity = 0.72;
             _status.Margin = new Thickness(0, 12 * Ui.Scale, 0, 12 * Ui.Scale);
-            var clear = new Button
-            {
-                Content = "清空回收站",
-                Style = TryFindResource("BtnTheme") as Style,
-                HorizontalAlignment = HorizontalAlignment.Stretch
-            };
-            clear.Click += (_, _) => Empty();
+            var clear = PanelControls.GlassButton("清空回收站", Empty);
+            clear.HorizontalContentAlignment = HorizontalAlignment.Center;
             var body = new StackPanel();
-            body.Children.Add(clear);
+            var actions = new DockPanel();
+            var sort = PanelControls.GlassButton(App.Settings.RecycleNewestFirst ? "最近删除" : "名称", () =>
+            {
+                App.Settings.RecycleNewestFirst = !App.Settings.RecycleNewestFirst;
+                App.Save();
+                Refresh();
+            });
+            sort.Margin = new Thickness(6 * Ui.Scale, 4 * Ui.Scale, 0, 0);
+            sort.Click += (_, _) => sort.Content = App.Settings.RecycleNewestFirst ? "最近删除" : "名称";
+            DockPanel.SetDock(sort, Dock.Right);
+            actions.Children.Add(sort);
+            actions.Children.Add(clear);
+            body.Children.Add(actions);
+            var filters = new DockPanel { Margin = new Thickness(0, 5, 0, 4), LastChildFill = true };
+            _dateFilter = PanelControls.GlassButton("全部日期", () =>
+            {
+                _recentOnly = !_recentOnly;
+                _dateFilter.Content = _recentOnly ? "近七天" : "全部日期";
+                Refresh();
+            }, compact: true);
+            DockPanel.SetDock(_dateFilter, Dock.Right);
+            filters.Children.Add(_dateFilter);
+            _filter = new TextBox { Height = 26 * Ui.Scale, MinHeight = 0, Padding = new Thickness(7, 1, 7, 1),
+                ToolTip = "按名称或原目录筛选" };
+            _filter.SetResourceReference(StyleProperty, "DarkBox");
+            _filter.SetResourceReference(BackgroundProperty, "ThemePanelHover");
+            _filter.SetResourceReference(ForegroundProperty, "ThemePanelText");
+            _filter.SetResourceReference(TextBox.CaretBrushProperty, "ThemePanelText");
+            _filter.PreviewMouseLeftButtonDown += (_, _) => EnterPanelKeyboardMode(_filter);
+            _filter.TextChanged += (_, _) => Refresh();
+            filters.Children.Add(_filter);
+            body.Children.Add(filters);
+            var selectionActions = new WrapPanel();
+            _selectMode = PanelControls.GlassButton("多选", () =>
+            {
+                _selecting = !_selecting;
+                if (!_selecting) _selection.Clear();
+                UpdateSelection();
+            }, compact: true);
+            _restoreSelected = PanelControls.GlassButton("还原已选", RestoreSelection, compact: true);
+            _restoreSelected.Visibility = Visibility.Collapsed;
+            selectionActions.Children.Add(_selectMode);
+            selectionActions.Children.Add(_restoreSelected);
+            body.Children.Add(selectionActions);
             body.Children.Add(_status);
             body.Children.Add(new ScrollViewer
             {
@@ -73,7 +117,7 @@ namespace DesktopBar.UI
                 MaxHeight = SystemParameters.PrimaryScreenHeight * 0.5,
                 Content = _items
             });
-            Panel.Width = 190 * Ui.Scale;
+            Panel.Width = 260 * Ui.Scale;
             Panel.Child = body;
             _refreshTimer = new DispatcherTimer(DispatcherPriority.Background, Dispatcher) { Interval = TimeSpan.FromSeconds(2) };
             _refreshTimer.Tick += (_, _) => Refresh();
@@ -82,6 +126,9 @@ namespace DesktopBar.UI
         }
 
         protected override bool HoverOpensPanel => false;
+        protected override bool CaptureFullPanelEnvelope => false;
+        protected override Size GetPanelEnvelope(Size content) => new(Math.Max(content.Width, 330 * Ui.Scale),
+            Math.Max(content.Height, SystemParameters.PrimaryScreenHeight * .5 + 180 * Ui.Scale));
 
         protected override void OnPanelShown()
         {
@@ -89,7 +136,13 @@ namespace DesktopBar.UI
             Refresh();
         }
 
-        protected override void OnPanelHidden() => _refreshTimer.Stop();
+        protected override void OnPanelHidden()
+        {
+            _refreshTimer.Stop();
+            _selection.Clear();
+            _selecting = false;
+            UpdateSelection();
+        }
 
         private void Empty() => RunBinOperation(() => ShellFiles.EmptyRecycleBin(FileOperationOwner));
 
@@ -101,18 +154,36 @@ namespace DesktopBar.UI
 
         private void RunBinOperation(Action action)
         {
-            RunFileOperation(action);
-            if (Open) Refresh();
+            _binOperations++;
+            try { RunFileOperation(action); }
+            finally
+            {
+                _binOperations--;
+                if (Open) Refresh();
+            }
+        }
+
+        protected override void OnFileDropSettled() => Refresh();
+
+        private bool FileTransferActive => FileDropInteractionActive || _binOperations > 0;
+
+        private bool CanApplySnapshot()
+        {
+            if (_disposed || !Open) return false;
+            if (!FileTransferActive) return true;
+            _refreshRequested = true;
+            return false;
         }
 
         private async void Refresh()
         {
-            if (_disposed || !Open) return;
+            if (!CanApplySnapshot()) return;
             if (_refreshing)
             {
                 _refreshRequested = true;
                 return;
             }
+            _refreshRequested = false;
             _refreshing = true;
             try
             {
@@ -125,13 +196,21 @@ namespace DesktopBar.UI
                 thread.SetApartmentState(ApartmentState.STA);
                 thread.Start();
                 var entries = await completion.Task;
-                if (_disposed || !Open) return;
-                entries = entries.OrderBy(item => item.Name, StringComparer.CurrentCultureIgnoreCase).ToList();
+                if (!CanApplySnapshot()) return;
+                string search = _filter.Text.Trim();
+                DateTime cutoff = _recentOnly ? DateTime.Now.AddDays(-7) : DateTime.MinValue;
+                entries = entries.Where(item =>
+                    (search.Length == 0 || item.Name.Contains(search, StringComparison.CurrentCultureIgnoreCase)
+                        || item.OriginalFolder?.Contains(search, StringComparison.CurrentCultureIgnoreCase) == true)
+                    && (!_recentOnly || (DateTime.TryParse(item.DeletedAt, out var deleted) && deleted >= cutoff)))
+                    .OrderByDescending(item => App.Settings.RecycleNewestFirst
+                        && DateTime.TryParse(item.DeletedAt, out var date) ? date : DateTime.MinValue)
+                    .ThenBy(item => item.Name, StringComparer.CurrentCultureIgnoreCase).ToList();
                 var status = entries.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
                 if (entries.Count == _snapshot.Count && entries.Zip(_snapshot,
                         (current, previous) => current.Id.AsSpan().SequenceEqual(previous.Id)).All(same => same))
                 {
-                    _status.Text = "回收站是空的";
+                    _status.Text = search.Length > 0 || _recentOnly ? "没有匹配的项目" : "回收站是空的";
                     _status.Visibility = status;
                     return;
                 }
@@ -143,32 +222,33 @@ namespace DesktopBar.UI
                     if (i % 12 == 11 && i + 1 < entries.Count)
                     {
                         await Dispatcher.Yield(DispatcherPriority.Background);
-                        if (_disposed || !Open) return;
+                        if (!CanApplySnapshot()) return;
                     }
                 }
                 int cols = Math.Min(4, Math.Max(1, entries.Count));
                 _items.Width = cols * 76 * Ui.Scale;
-                Panel.Width = Math.Max(190, cols * 76 + 26) * Ui.Scale;
+                SetPanelWidth(Math.Max(260, cols * 76 + 26) * Ui.Scale);
                 _items.Children.Clear();
                 foreach (var view in views) _items.Children.Add(view);
                 _snapshot = entries;
-                _status.Text = "回收站是空的";
+                _selection.IntersectWith(entries.Select(RecycledKey));
+                UpdateSelection();
+                _status.Text = search.Length > 0 || _recentOnly ? "没有匹配的项目" : "回收站是空的";
                 _status.Visibility = status;
             }
             catch (Exception ex)
             {
                 App.Log("Windows 回收站读取失败: " + ex.Message);
-                _status.Text = "无法读取回收站";
-                _status.Visibility = Visibility.Visible;
+                if (CanApplySnapshot())
+                {
+                    _status.Text = "无法读取回收站";
+                    _status.Visibility = Visibility.Visible;
+                }
             }
             finally
             {
                 _refreshing = false;
-                if (_refreshRequested)
-                {
-                    _refreshRequested = false;
-                    Refresh();
-                }
+                if (_refreshRequested) Refresh();
             }
         }
 
@@ -198,12 +278,23 @@ namespace DesktopBar.UI
                     .Where(value => !string.IsNullOrEmpty(value))),
                 Child = body
             };
-            tile.MouseEnter += (_, _) => tile.SetResourceReference(Border.BackgroundProperty, "ThemePanelControl");
-            tile.MouseLeave += (_, _) => tile.Background = Brushes.Transparent;
+            string key = RecycledKey(item);
+            tile.Tag = key;
+            tile.MouseEnter += (_, _) => PaintSelection(tile);
+            tile.MouseLeave += (_, _) => PaintSelection(tile);
             void Restore() => RunBinOperation(() => ShellFiles.Invoke(FileOperationOwner, item, "undelete"));
             ShellFileActions.WireDrag(tile,
                 () => RunBinOperation(() => ShellFiles.Drag(FileOperationOwner, item)),
-                clicks => { if (clicks == 2) Restore(); });
+                clicks =>
+                {
+                    if (_selecting || (Keyboard.Modifiers & ModifierKeys.Control) != 0)
+                    {
+                        _selecting = true;
+                        if (!_selection.Add(key)) _selection.Remove(key);
+                        UpdateSelection();
+                    }
+                    else if (clicks == 2) Restore();
+                });
             tile.MouseRightButtonUp += (_, e) =>
             {
                 e.Handled = true;
@@ -215,6 +306,29 @@ namespace DesktopBar.UI
                 }, item.Name));
             };
             return tile;
+        }
+
+        private static string RecycledKey(ShellFiles.RecycledItem item) => Convert.ToBase64String(item.Id);
+
+        private void RestoreSelection()
+        {
+            var items = _snapshot.Where(item => _selection.Contains(RecycledKey(item))).ToArray();
+            if (items.Length > 0) RunBinOperation(() => ShellFiles.Invoke(FileOperationOwner, items, "undelete"));
+        }
+
+        private void UpdateSelection()
+        {
+            _selectMode.Content = _selecting ? $"已选 {_selection.Count} 项 · 退出" : "多选";
+            _restoreSelected.Visibility = _selection.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+            foreach (var tile in _items.Children.OfType<Border>()) PaintSelection(tile);
+        }
+
+        private void PaintSelection(Border tile)
+        {
+            if (tile.Tag is string id && _selection.Contains(id))
+                tile.SetResourceReference(Border.BackgroundProperty, "ThemePanelSelected");
+            else if (tile.IsMouseOver) tile.SetResourceReference(Border.BackgroundProperty, "ThemePanelControl");
+            else tile.Background = Brushes.Transparent;
         }
 
         public override void Dispose()

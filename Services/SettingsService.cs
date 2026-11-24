@@ -13,6 +13,7 @@ namespace DesktopBar.Services
         private const int CurrentSchemaVersion = 2;
         /// <summary>本轮启动是否发现过损坏配置(已被隔离);此时不要用默认值自动覆写 settings.json。</summary>
         public static bool CorruptConfigDetected { get; private set; }
+        private static bool _primaryNeedsRecovery;
         private static readonly string Dir = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "YukiDesk");
         private static readonly string FilePath = Path.Combine(Dir, "settings.json");
@@ -29,7 +30,12 @@ namespace DesktopBar.Services
         public static AppSettings Load(out bool firstRun)
         {
             firstRun = false;
-            if (TryLoad(FilePath, out var current)) return current;
+            if (TryLoad(FilePath, out var current))
+            {
+                _primaryNeedsRecovery = false;
+                return current;
+            }
+            _primaryNeedsRecovery = File.Exists(FilePath);
             if (TryLoad(BackupFilePath, out var backup)) return backup;
             if (TryLoad(LegacyFilePath, out var legacy))
             {
@@ -81,7 +87,7 @@ namespace DesktopBar.Services
             return true;
         }
 
-        private static AppSettings Normalize(AppSettings s)
+        internal static AppSettings Normalize(AppSettings s)
         {
             if (s == null) s = new AppSettings();
             s.Folders ??= new List<string>();
@@ -103,6 +109,30 @@ namespace DesktopBar.Services
             }
 
             s.StorageRoot = NormalizeRoot(s.StorageRoot);
+            s.LinkedFolders = (s.LinkedFolders ?? new List<string>()).Where(path => !string.IsNullOrWhiteSpace(path) && Path.IsPathFullyQualified(path))
+                .Select(path => Path.TrimEndingDirectorySeparator(path)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            s.FolderViews = new Dictionary<string, FolderPreferences>(
+                (s.FolderViews ?? new()).Where(pair => pair.Value != null)
+                    .GroupBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase)
+                    .ToDictionary(group => group.Key, group => group.Last().Value),
+                StringComparer.OrdinalIgnoreCase);
+            foreach (var view in s.FolderViews.Values)
+            {
+                view.Pinned = (view.Pinned ?? new()).Where(IsValidFolderName).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+                view.Arrivals = new Dictionary<string, DateTime>(view.Arrivals ?? new(), StringComparer.OrdinalIgnoreCase);
+            }
+            s.InboxFolder ??= "";
+            s.DesktopLinks = (s.DesktopLinks ?? new()).Where(link => link != null && UI.DesktopActions.IsSupportedTarget(link.Target)).ToList();
+            s.RecentDesktopTargets = (s.RecentDesktopTargets ?? new()).Where(UI.DesktopActions.IsSupportedTarget).Take(20).ToList();
+            s.BarLayout ??= new();
+            s.EdgeExcludedApps = (s.EdgeExcludedApps ?? new()).Where(IsValidFolderName).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            s.DesktopPresets = (s.DesktopPresets ?? new()).Where(item => item != null && !string.IsNullOrWhiteSpace(item.Name) && item.Values != null).ToList();
+            s.SecondTimeZoneId ??= "";
+            s.AppScenes = (s.AppScenes ?? new()).Where(rule => rule != null && IsValidFolderName(rule.Program)
+                && !string.IsNullOrWhiteSpace(rule.Preset)).ToList();
+            s.FolderShortcuts = (s.FolderShortcuts ?? Array.Empty<string>()).Take(3)
+                .Concat(new string[3]).Take(3).ToArray();
+            s.PreferredMediaSource ??= "";
             s.BarBgColor = NormalizeColor(s.BarBgColor, "#000000");
             s.ThemeColor = NormalizeColor(s.ThemeColor, "#14141C");
             s.ThemeTextColor = NormalizeColor(s.ThemeTextColor, "#FFFFFF");
@@ -201,13 +231,8 @@ namespace DesktopBar.Services
             {
                 s = Normalize(s);
                 Directory.CreateDirectory(Dir);
-                // 随机 tmp 名:并发写或杀软短暂锁定 .tmp 时不会互相踩文件。
-                string temp = FilePath + ".tmp-" + Guid.NewGuid().ToString("N");
-                File.WriteAllText(temp, JsonSerializer.Serialize(s, JsonOptions));
-                if (File.Exists(FilePath))
-                    File.Replace(temp, FilePath, BackupFilePath, true);
-                else
-                    File.Move(temp, FilePath);
+                WriteSettingsFile(FilePath, BackupFilePath, JsonSerializer.Serialize(s, JsonOptions), _primaryNeedsRecovery);
+                _primaryNeedsRecovery = false;
             }
             catch (Exception ex)
             {
@@ -218,6 +243,25 @@ namespace DesktopBar.Services
                     DesktopBar.App.ShowConfigSaveFailure(ex);
                 }
                 catch { }
+            }
+        }
+
+        private static void WriteSettingsFile(string path, string backup, string content, bool preserveBackup)
+        {
+            string temp = path + ".tmp-" + Guid.NewGuid().ToString("N");
+            try
+            {
+                File.WriteAllText(temp, content);
+                if (File.Exists(path))
+                    File.Replace(temp, path, preserveBackup ? null : backup, true);
+                else
+                    File.Move(temp, path);
+            }
+            finally
+            {
+                try { File.Delete(temp); }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
             }
         }
     }

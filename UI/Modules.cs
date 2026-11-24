@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Net.NetworkInformation;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
@@ -53,23 +55,45 @@ namespace DesktopBar.UI
             AddPowerButton(body, "睡眠", "进入睡眠模式", NativeMethods.Sleep, true, false);
             AddPowerButton(body, "锁定", "锁定当前会话", NativeMethods.Lock, false, false);
             AddPowerButton(body, "息屏", "关闭显示器，移动鼠标可唤醒", NativeMethods.DisplayOff, false, false);
+            Button awake = null;
+            awake = PanelControls.GlassButton(AwakeSession.Label, ShowAwakeChoices);
+            body.Children.Add(awake);
             Panel.Child = body;
+
+            void ShowAwakeChoices()
+            {
+                var actions = new List<FlyoutItem>
+                {
+                    new("30 分钟", () => SetAwake(TimeSpan.FromMinutes(30))),
+                    new("直到取消", () => SetAwake(null))
+                };
+                if (AwakeSession.Enabled) actions.Add(new("取消保持唤醒", () =>
+                {
+                    AwakeSession.Stop();
+                    awake.Content = AwakeSession.Label;
+                }));
+                TrackFlyout(FlyoutMenu.Show(actions, "保持唤醒", awake));
+            }
+
+            void SetAwake(TimeSpan? duration)
+            {
+                if (AwakeSession.Start(duration)) awake.Content = AwakeSession.Label;
+                else ConfirmDialog.Notice("保持唤醒未生效", "Windows 未接受此次设置。");
+            }
         }
 
         private void AddPowerButton(StackPanel body, string title, string sub, Func<bool> action,
             bool confirm, bool danger)
         {
-            // 半透明玻璃底（同右键菜单行），不再是实心黑色。
-            var b = new Button { Content = title, Style = (Style)Application.Current.FindResource("BtnGlass"), HorizontalContentAlignment = HorizontalAlignment.Left, Margin = new Thickness(0, 4, 0, 0) };
-            b.ToolTip = sub;
-            b.Click += (s, e) =>
+            var b = PanelControls.GlassButton(title, () =>
             {
                 bool allowed = !confirm || (danger
                     ? ConfirmDialog.ShowDanger(title, "确定要" + title + "吗？", title)
                     : ConfirmDialog.Show(title, "确定要" + title + "吗？", title));
                 if (!allowed) return;
                 if (!action()) ConfirmDialog.Notice(title + "失败", title + "操作未能完成。");
-            };
+            });
+            b.ToolTip = sub;
             body.Children.Add(b);
         }
     }
@@ -104,6 +128,7 @@ namespace DesktopBar.UI
         private static readonly string[] WeekNames = { "星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六" };
         private readonly TextBlock _pillText, _pTime, _pWeek, _pDate, _pLunar, _pFest;
         private readonly DispatcherTimer _timer;
+        private readonly ClockTools _clockTools;
         public ClockModule(TabStyle st) : base(st)
         {
             _pillText = MakePillText("");
@@ -116,7 +141,10 @@ namespace DesktopBar.UI
             _pTime.Margin = new Thickness(4, 2, 4, 6); _pWeek.Margin = new Thickness(4, 2, 4, 2); _pDate.Margin = new Thickness(4, 2, 4, 2); _pLunar.Margin = new Thickness(4, 2, 4, 2);
             _pFest.Margin = new Thickness(4, 0, 4, 4);
             _pFest.FontSize = Math.Max(9, 13 * Ui.Scale);
-            body.Children.Add(_pTime); body.Children.Add(_pWeek); body.Children.Add(_pDate); body.Children.Add(_pLunar); body.Children.Add(_pFest); Panel.Child = body;
+            body.Children.Add(_pTime); body.Children.Add(_pWeek); body.Children.Add(_pDate); body.Children.Add(_pLunar); body.Children.Add(_pFest);
+            _clockTools = new ClockTools();
+            body.Children.Add(_clockTools);
+            Panel.Child = body;
             _timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(250) }; _timer.Tick += (s, e) => Refresh(); _timer.Start(); Refresh();
             // 模块隐藏(或整条顶栏隐藏)时停表,不再空转刷新 5 个 TextBlock。
             IsVisibleChanged += (s, e) =>
@@ -126,17 +154,20 @@ namespace DesktopBar.UI
             };
         }
         protected override bool CenterPanelOnPill => true;
+        protected override Size GetPanelEnvelope(Size content) => new(content.Width, content.Height + 252 * Ui.Scale);
         private void Refresh()
         {
             var now = DateTime.Now;
             var parts = new List<string> { now.ToString(App.Settings.ShowSeconds ? "HH:mm:ss" : "HH:mm") };
             if (App.Settings.ShowDate) parts.Add(now.ToString("M月d日"));
             if (App.Settings.ShowWeekday) parts.Add("周" + "日一二三四五六"[(int)now.DayOfWeek]);
+            if (ClockTools.CapsuleCountdown is string timer) parts.Add(timer);
             string pill = string.Join("  ", parts);
             // 只在文字真的变了才赋值:分层窗口每次被弄脏都会整条重呈,同值赋值是纯浪费。
             if (_pillText.Text != pill) _pillText.Text = pill;
             // 面板没打开时不刷面板那 5 个 TextBlock(打开时 OnPanelShown 会补一次)。
             if (Panel == null || !Panel.IsVisible) return;
+            _clockTools.Refresh(now);
             string time = now.ToString("HH:mm:ss"), week = WeekNames[(int)now.DayOfWeek], date = now.ToString("yyyy年M月d日"), lunar = Lunar.ToLunarString(now);
             if (_pTime.Text != time) _pTime.Text = time;
             if (_pWeek.Text != week) _pWeek.Text = week;
@@ -154,6 +185,7 @@ namespace DesktopBar.UI
             base.OnPanelShown();
             Refresh();
         }
+        protected override void OnPanelHidden() => _clockTools.CloseCalendar();
         public override void Dispose() { _timer.Stop(); base.Dispose(); }
     }
 
@@ -168,6 +200,8 @@ namespace DesktopBar.UI
         private long _skipExpiresAt;
         private int _skipDirection;
         private string _lastTitle = "暂无音乐";
+        private readonly Button _sourceButton;
+        private MediaService _controller;
         public MusicModule(TabStyle st) : base(st)
         {
             var coverBorder = BuildCover(26, 7, 14, out _smallImg);
@@ -203,12 +237,38 @@ namespace DesktopBar.UI
             };
             buttons.Children.Add(ShellButton(Glyph("⏮", 19), () => Skip(-1), pressFeedback: true));
             _playGlyph = Glyph("▶", 19);
-            buttons.Children.Add(ShellButton(_playGlyph, () => NativeMethods.SendMediaKey(NativeMethods.VK_MEDIA_PLAY_PAUSE)));
+            buttons.Children.Add(ShellButton(_playGlyph, () => _ = SendMediaCommandAsync(0)));
             buttons.Children.Add(ShellButton(Glyph("⏭", 19), () => Skip(1), pressFeedback: true));
             var body = new StackPanel { Width = 300 * Ui.Scale };
             body.Children.Add(_panelTransition);
             body.Children.Add(buttons);
+            _sourceButton = PanelControls.GlassButton("播放来源", ShowSources);
+            _sourceButton.HorizontalAlignment = HorizontalAlignment.Center;
+            _sourceButton.Margin = new Thickness(0, 9 * Ui.Scale, 0, 0);
+            body.Children.Add(_sourceButton);
             Panel.Child = body;
+        }
+
+        internal void UseMediaService(MediaService service) => _controller = service;
+
+        private void ShowSources()
+        {
+            if (_controller == null) return;
+            var preferred = App.Settings.PreferredMediaSource;
+            var actions = new List<FlyoutItem> { new FlyoutItem(
+                (string.IsNullOrEmpty(preferred) ? "✓  " : "") + "跟随系统", () => _controller.ChooseSource("")) };
+            foreach (var source in _controller.Sources())
+                actions.Add(new FlyoutItem((string.Equals(source.Id, preferred, StringComparison.OrdinalIgnoreCase) ? "✓  " : "")
+                    + source.Title, () => _controller.ChooseSource(source.Id)));
+            TrackFlyout(FlyoutMenu.Show(actions.ToArray(), "播放来源", _sourceButton));
+        }
+
+        private async System.Threading.Tasks.Task SendMediaCommandAsync(int direction)
+        {
+            if (_controller != null && await _controller.ControlAsync(direction)) return;
+            if (App.Settings.PreferredMediaSource.Length == 0)
+                NativeMethods.SendMediaKey(direction < 0 ? NativeMethods.VK_MEDIA_PREV
+                    : direction > 0 ? NativeMethods.VK_MEDIA_NEXT : NativeMethods.VK_MEDIA_PLAY_PAUSE);
         }
 
         private Border BuildCover(double size, double radius, double glyphSize, out Image image)
@@ -230,12 +290,14 @@ namespace DesktopBar.UI
         {
             _skipDirection = direction;
             _skipExpiresAt = Environment.TickCount64 + 3000;
-            NativeMethods.SendMediaKey(direction < 0 ? NativeMethods.VK_MEDIA_PREV : NativeMethods.VK_MEDIA_NEXT);
+            _ = SendMediaCommandAsync(direction);
         }
 
         public void Update(MediaInfo info)
         {
             if (info == null || info.Generation <= _lastMediaGeneration) return;
+            string sourceLabel = "来源 · " + MediaService.SourceTitle(info.SessionKey);
+            if (!Equals(_sourceButton.Content, sourceLabel)) _sourceButton.Content = sourceLabel;
             _lastMediaGeneration = info.Generation;
             if (info.HasSession && info.TrackKey.Length == 0) return;
 
@@ -427,9 +489,13 @@ namespace DesktopBar.UI
         private readonly System.Windows.Shapes.Path _speakerWave1, _speakerWave2;
         private readonly TextBlock _value;
         private readonly Slider _slider;
+        private readonly TextBlock _output;
+        private readonly AnimatedPanelSection _mixer;
+        private AudioMixer _mixerWorker;
+        private int _mixerRequest;
         private DispatcherTimer _poll;
         private DispatcherTimer _writeTimer;
-        private float? _pendingVolume;
+        private (float Value, string OutputId)? _pendingVolume;
         private DateTime _lastUserAdjustUtc;
         private bool _syncing;
         private bool _muted;
@@ -454,6 +520,10 @@ namespace DesktopBar.UI
             _syncing = false;
             var body = new StackPanel { Width = 230 * Ui.Scale };
             body.Children.Add(MakePanelTitle("音量"));
+            _output = MakeText("默认输出", -1);
+            _output.TextTrimming = TextTrimming.CharacterEllipsis;
+            _output.Margin = new Thickness(0, 3, 0, 5);
+            body.Children.Add(_output);
             _slider = new Slider
             {
                 Minimum = 0,
@@ -464,10 +534,38 @@ namespace DesktopBar.UI
                 SmallChange = 0.01
             };
             _slider.SetResourceReference(Control.BackgroundProperty, "ThemePanelControl");
+            PanelControls.ReleasePointerFocus(_slider);
             System.Windows.Automation.AutomationProperties.SetName(_slider, "音量");
             _value = MakeText(initialVolumeAvailable ? Math.Round(initialVolume * 100) + "%" : "读取失败");
             _value.FontWeight = FontWeights.Bold;
             body.Children.Add(Ui.SliderWithValue(_slider, _value, 52 * Ui.Scale, panel: true));
+            body.Children.Add(PanelControls.GlassButton("Windows 声音设置", () => NativeMethods.ShellExecuteOpen("ms-settings:sound")));
+            _mixer = new AnimatedPanelSection();
+            var applicationMixer = PanelControls.GlassButton("应用混音", () =>
+            {
+                if (_mixer.Expanded) CloseMixer(animate: true);
+                else
+                {
+                    SetMixerContent(null, "正在读取应用音量…");
+                    _mixer.SetExpanded(true);
+                    UpdateMixer();
+                }
+            });
+            applicationMixer.Margin = new Thickness(0, 10 * Ui.Scale, 0, 0);
+            body.Children.Add(applicationMixer);
+            body.Children.Add(_mixer);
+            _volume.OutputChanged += () =>
+            {
+                if (_disposed || Dispatcher.HasShutdownStarted) return;
+                Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    if (_disposed || !Open) return;
+                    _volume.SyncDefaultIfChanged();
+                    SyncFromDevice();
+                    UpdateOutputName();
+                    if (_mixer.Expanded) UpdateMixer();
+                }));
+            };
             _slider.IsEnabled = initialVolumeAvailable;
             Panel.Child = body;
             // 写音量经 120ms 合并:一次拖动只落一次系统写,不逐刻度跨进程写。
@@ -475,12 +573,14 @@ namespace DesktopBar.UI
             _writeTimer.Tick += (s, e) =>
             {
                 _writeTimer.Stop();
-                if (_pendingVolume.HasValue && _volumeAvailable && _volumeWritesEnabled && IsLoaded)
+                var pending = _pendingVolume;
+                _pendingVolume = null;
+                if (pending is { } write && _volumeAvailable && _volumeWritesEnabled && IsLoaded
+                    && !_volume.SetVolumeForOutput(write.Value, write.OutputId))
                 {
                     _volume.SyncDefaultIfChanged();
-                    _volume.SetVolume(_pendingVolume.Value);
+                    SyncFromDevice();
                 }
-                _pendingVolume = null;
             };
             _slider.ValueChanged += (s, e) =>
             {
@@ -488,7 +588,7 @@ namespace DesktopBar.UI
                 UpdateIcon(e.NewValue, _muted);
                 if (!_syncing && _volumeAvailable && _volumeWritesEnabled && IsLoaded)
                 {
-                    _pendingVolume = (float)e.NewValue;
+                    _pendingVolume = ((float)e.NewValue, _volume.OutputId);
                     _lastUserAdjustUtc = DateTime.UtcNow;
                     _writeTimer.Stop();
                     _writeTimer.Start();
@@ -536,17 +636,94 @@ namespace DesktopBar.UI
                 if (muted.HasValue) _muted = muted.Value;
             };
             Pill.MouseWheel += (s, e) => { _volumeWritesEnabled = true; Adjust(e.Delta); };
-            Panel.MouseWheel += (s, e) => { _volumeWritesEnabled = true; Adjust(e.Delta); };
+            Panel.MouseWheel += (s, e) =>
+            {
+                if (_mixer.IsMouseOver) return;
+                _volumeWritesEnabled = true;
+                Adjust(e.Delta);
+            };
         }
 
         protected override void OnPanelShown()
         {
             _volume.SyncDefaultIfChanged();
             SyncFromDevice();
+            _volume.WatchOutput();
+            UpdateOutputName();
             _poll.Start();
         }
 
-        protected override void OnPanelHidden() => _poll.Stop();
+        private void UpdateOutputName()
+        {
+            _output.Text = _volume.DefaultOutputName() ?? "暂无默认播放设备";
+            _output.ToolTip = _output.Text;
+        }
+
+        protected override Size GetPanelEnvelope(Size content) => new(content.Width, content.Height + 265 * Ui.Scale);
+
+        protected override void OnPanelHidden()
+        {
+            _poll.Stop();
+            CloseMixer();
+        }
+
+        private void CloseMixer(bool animate = false)
+        {
+            _mixerRequest++;
+            _mixerWorker?.Clear();
+            _mixer.SetExpanded(false, animate, () =>
+            {
+                _mixer.Content = null;
+            });
+        }
+
+        private async void UpdateMixer()
+        {
+            int request = ++_mixerRequest;
+            _mixerWorker ??= new AudioMixer();
+            if (_mixer.Content is StackPanel content && content.Children.OfType<ScrollViewer>().FirstOrDefault() is { } entries)
+                entries.IsEnabled = false;
+            var snapshot = await _mixerWorker.ReadAsync();
+            if (_disposed || !_mixer.Expanded || request != _mixerRequest) return;
+            SetMixerContent(snapshot, snapshot == null ? "当前设备无法读取应用音量" : "暂无正在播放的应用");
+        }
+
+        private void SetMixerContent(AudioMixer.Snapshot snapshot, string emptyText)
+        {
+            var content = new StackPanel { Margin = new Thickness(0, 8 * Ui.Scale, 0, 0) };
+            var refresh = PanelControls.GlassButton("刷新应用", UpdateMixer, compact: true);
+            refresh.HorizontalAlignment = HorizontalAlignment.Right;
+            refresh.Margin = new Thickness(0, 0, 0, 6 * Ui.Scale);
+            content.Children.Add(refresh);
+            if (snapshot?.Entries.Length > 0)
+                content.Children.Add(BuildMixerEntries(snapshot));
+            else
+                content.Children.Add(PanelControls.Text(emptyText));
+            _mixer.Content = content;
+        }
+
+        private ScrollViewer BuildMixerEntries(AudioMixer.Snapshot snapshot)
+        {
+            var entries = new StackPanel();
+            foreach (var item in snapshot.Entries)
+            {
+                entries.Children.Add(PanelControls.Text(item.Name));
+                var slider = new Slider { Minimum = 0, Maximum = 1, Value = item.Volume, SmallChange = .02,
+                    Style = (Style)Application.Current.FindResource("CapsuleSlider") };
+                slider.SetResourceReference(Control.BackgroundProperty, "ThemePanelControl");
+                PanelControls.ReleasePointerFocus(slider);
+                System.Windows.Automation.AutomationProperties.SetName(slider, item.Name + " 音量");
+                var value = PanelControls.Text(item.Volume.ToString("P0"));
+                slider.ValueChanged += (_, args) =>
+                {
+                    _mixerWorker?.SetVolume(snapshot.Revision, item.Index, (float)args.NewValue);
+                    value.Text = args.NewValue.ToString("P0");
+                };
+                entries.Children.Add(Ui.SliderWithValue(slider, value, 50 * Ui.Scale, panel: true));
+            }
+            return new ScrollViewer { Content = entries, MaxHeight = 215 * Ui.Scale,
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
+        }
 
         private void SyncControls(float value)
         {
@@ -591,6 +768,8 @@ namespace DesktopBar.UI
             _disposed = true;
             _poll.Stop();
             _writeTimer?.Stop();
+            CloseMixer();
+            _mixerWorker?.Dispose();
             _volume.Dispose();
             base.Dispose();
         }
@@ -602,6 +781,7 @@ namespace DesktopBar.UI
         {
             public string Path;
             public bool IsDirectory;
+            public bool IsImage;
             public int PixelSize;
             public string Key;
             public List<Action<BitmapSource>> Subscribers;
@@ -634,6 +814,7 @@ namespace DesktopBar.UI
         internal static void LoadAsync(FileSystemInfo item, Action<BitmapSource> apply = null)
         {
             bool isDirectory = item is DirectoryInfo;
+            bool isImage = !isDirectory && FileImage.IsImage(item.Extension);
             int pixels = IconPixelSize();
             string key = (isDirectory ? "dir:" : "file:") + item.FullName + "|" + pixels + "|" + item.LastWriteTimeUtc.Ticks;
             BitmapSource icon;
@@ -646,7 +827,7 @@ namespace DesktopBar.UI
                         var target = apply == null ? PrefetchQueue : VisibleQueue;
                         node = target.AddLast(new IconRequest
                         {
-                            Path = item.FullName, IsDirectory = isDirectory, PixelSize = pixels, Key = key
+                            Path = item.FullName, IsDirectory = isDirectory, IsImage = isImage, PixelSize = pixels, Key = key
                         });
                         Pending.Add(key, node);
                     }
@@ -688,7 +869,10 @@ namespace DesktopBar.UI
                 BitmapSource icon = null;
                 try
                 {
-                    icon = NativeMethods.GetFileIcon(request.Path, request.IsDirectory, request.PixelSize)
+                    if (request.IsImage)
+                        icon = FileImage.ReadThumbnail(request.Path, request.PixelSize)
+                            ?? NativeMethods.GetShellThumbnail(request.Path, request.PixelSize, cacheOnly: true);
+                    icon ??= NativeMethods.GetFileIcon(request.Path, request.IsDirectory, request.PixelSize)
                         ?? GetFallback(request.IsDirectory, FilePath.GetExtension(request.Path));
                 }
                 catch (Exception ex) { App.Log("提取文件图标失败: " + ex.Message); }
@@ -794,7 +978,7 @@ namespace DesktopBar.UI
         public void SetSpectrumActive(bool active)
         {
             if (_disposed) return;
-            active = active && IsVisible && IsLoaded;
+            active = active && IsVisible && IsLoaded && _presentationDemand;
             if (active == _captureActive) return;
 
             _captureActive = active;
@@ -809,6 +993,15 @@ namespace DesktopBar.UI
 
             _refresh.Stop();
             SpectrumService.Instance.ReleaseRef();
+        }
+
+        private bool _presentationDemand = true;
+
+        internal void SetPresentationDemand(bool active)
+        {
+            if (_presentationDemand == active) return;
+            _presentationDemand = active;
+            SetSpectrumActive(active);
         }
 
         private void OnSpectrumTick(object sender, EventArgs e)
@@ -936,7 +1129,7 @@ namespace DesktopBar.UI
     }
 
     /// <summary>性能监测胶囊指标。</summary>
-    public enum PerfMetric { Cpu, Gpu, Memory, Network }
+    public enum PerfMetric { Cpu, Gpu, Memory, Network, Summary }
 
     /// <summary>性能监测胶囊:数值由 PerfService 每秒采样刷新;四个指标各自独立显隐。
     /// 悬停自动展开数据页:CPU/GPU 显示占用、温度、频率,内存显示占用与容量频率,网络显示上下行速率。</summary>
@@ -945,13 +1138,26 @@ namespace DesktopBar.UI
         private readonly PerfMetric _metric;
         private readonly TextBlock _value;
         private readonly Dictionary<string, TextBlock> _rows = new Dictionary<string, TextBlock>();
+        private PerfTrend _trend;
+        private Button _trendChoice;
+        private TextBlock _trendPeak;
+        private PerfMetric _trendMetric;
+        private PerfSample _panelSample;
+        private DispatcherOperation _panelPreload;
+        private bool _panelLayoutPrepared;
+        private string _networkAdapter;
+        private bool _watchingNetwork;
+        private bool _readingNetwork;
+        private bool _networkReadPending;
         private string _lastPillText;
         private bool _active;
+        private bool _sampleSubscribed;
         private bool _disposed;
 
         public PerfModule(PerfMetric metric, TabStyle st) : base(st)
         {
             _metric = metric;
+            _trendMetric = metric == PerfMetric.Summary ? PerfMetric.Cpu : metric;
             double s = Ui.Scale;
             var sp = new StackPanel
             {
@@ -959,7 +1165,7 @@ namespace DesktopBar.UI
                 HorizontalAlignment = HorizontalAlignment.Center,
                 VerticalAlignment = VerticalAlignment.Center
             };
-            if (metric != PerfMetric.Network)
+            if (metric != PerfMetric.Network && metric != PerfMetric.Summary)
             {
                 // 网络胶囊不带图标:上行/下行各自有箭头标识,省出宽度。
                 sp.Children.Add(metric switch
@@ -975,7 +1181,7 @@ namespace DesktopBar.UI
             Pill.Child = sp;
             Pill.Padding = new Thickness(0);
             // 固定宽度:数值在 "0%" 与 "100%" 间变化时不让胶囊抖动。
-            Pill.Width = (metric == PerfMetric.Network ? 112 : 58) * s;
+            Pill.Width = (metric == PerfMetric.Network ? 112 : metric == PerfMetric.Summary ? 83 : 58) * s;
             System.Windows.Automation.AutomationProperties.SetName(Pill, Caption);
 
             BuildHoverPanel();
@@ -996,8 +1202,115 @@ namespace DesktopBar.UI
         protected override void OnPanelShown()
         {
             base.OnPanelShown();
+            _panelLayoutPrepared = true;
+            UpdateNetworkWatch();
+            if (_networkAdapter != null) SetRow("连接", _networkAdapter);
             var latest = PerfService.Instance.Latest;
             if (latest != null) Apply(latest);
+            UpdateSampleSubscription();
+        }
+
+        protected override void OnPanelHidden()
+        {
+            UpdateNetworkWatch();
+            QueuePanelPreload();
+        }
+
+        private void QueuePanelPreload()
+        {
+            if (!CanPreload || _panelPreload != null || (_panelLayoutPrepared && _panelSample != null)) return;
+            _panelPreload = Dispatcher.BeginInvoke(DispatcherPriority.ApplicationIdle, new Action(() =>
+            {
+                _panelPreload = null;
+                if (!CanPreload || Open || HasVisiblePanel) return;
+                var sample = PerfService.Instance.Latest;
+                if (sample != null) Apply(sample, preload: true);
+                PreparePanelLayout();
+                _panelLayoutPrepared = true;
+                UpdateSampleSubscription();
+            }));
+        }
+
+        private bool CanPreload => !_disposed && IsLoaded && IsVisible;
+
+        private void UpdateSampleSubscription()
+        {
+            var service = PerfService.Instance;
+            bool waitingForFirstSample = CanPreload && _panelSample == null;
+            bool subscribe = !_disposed && (_active || waitingForFirstSample);
+            if (subscribe != _sampleSubscribed)
+            {
+                _sampleSubscribed = subscribe;
+                if (subscribe) service.Updated += OnSample;
+                else service.Updated -= OnSample;
+            }
+            if (waitingForFirstSample) service.RequestInitialSample();
+        }
+
+        private void UpdateNetworkWatch()
+        {
+            bool watch = !_disposed && _metric == PerfMetric.Network
+                && (_active || Open || (CanPreload && _networkAdapter == null));
+            if (_watchingNetwork == watch) return;
+            _watchingNetwork = watch;
+            if (watch)
+            {
+                NetworkChange.NetworkAddressChanged += UpdateNetworkConnection;
+                RefreshNetworkConnection();
+            }
+            else
+                NetworkChange.NetworkAddressChanged -= UpdateNetworkConnection;
+        }
+
+        private void UpdateNetworkConnection(object sender, EventArgs args)
+        {
+            if (!Dispatcher.HasShutdownStarted)
+                Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() =>
+                {
+                    if (_watchingNetwork) RefreshNetworkConnection();
+                }));
+        }
+
+        private async void RefreshNetworkConnection()
+        {
+            if (_readingNetwork)
+            {
+                _networkReadPending = true;
+                return;
+            }
+            _readingNetwork = true;
+            try
+            {
+                do
+                {
+                    _networkReadPending = false;
+                    string label = await Task.Run(ReadNetworkConnection);
+                    if (!_watchingNetwork) return;
+                    if (_networkReadPending) continue;
+                    bool changed = Open && _networkAdapter != null && _networkAdapter != label;
+                    _networkAdapter = label;
+                    SetRow("连接", changed ? "已切换 · " + label : label);
+                    UpdateNetworkWatch();
+                } while (_networkReadPending);
+            }
+            finally { _readingNetwork = false; }
+        }
+
+        private static string ReadNetworkConnection()
+        {
+            try
+            {
+                var interfaces = NetworkInterface.GetAllNetworkInterfaces();
+                var active = interfaces.FirstOrDefault(item =>
+                    item.OperationalStatus == OperationalStatus.Up
+                    && item.NetworkInterfaceType != NetworkInterfaceType.Loopback
+                    && item.GetIPProperties().GatewayAddresses.Count > 0);
+                return active?.Name ?? (NetworkInterface.GetIsNetworkAvailable() ? "适配器已连接" : "无网络连接");
+            }
+            catch (NetworkInformationException)
+            {
+                return "连接状态暂不可用";
+            }
         }
 
         private string Caption => _metric switch
@@ -1005,6 +1318,7 @@ namespace DesktopBar.UI
             PerfMetric.Cpu => "CPU 占用率",
             PerfMetric.Gpu => "GPU 占用率",
             PerfMetric.Memory => "内存占用",
+            PerfMetric.Summary => "综合性能",
             _ => "网络上下行"
         };
 
@@ -1021,10 +1335,11 @@ namespace DesktopBar.UI
             {
                 PerfMetric.Gpu => 210,
                 PerfMetric.Memory => 170,
+                PerfMetric.Summary => 205,
                 _ => 150
             };
             var body = new StackPanel { Width = width * s };
-            string title = _metric == PerfMetric.Memory ? "内存" : _metric == PerfMetric.Network ? "网络" : _metric == PerfMetric.Cpu ? "CPU" : "GPU";
+            string title = MetricName(_metric);
             var titleBlock = MakeText(title, 1.5);
             titleBlock.FontWeight = FontWeights.Bold;
             titleBlock.Margin = new Thickness(2, 0, 2, 6 * s);
@@ -1049,12 +1364,73 @@ namespace DesktopBar.UI
                     AddRow(body, "容量");
                     AddRow(body, "频率");
                     break;
+                case PerfMetric.Summary:
+                    foreach (var metric in EnabledMetrics()) AddRow(body, MetricName(metric));
+                    _trendMetric = EnabledMetrics().FirstOrDefault();
+                    _trendChoice = PanelControls.Button(MetricName(_trendMetric) + " · 最近 60 秒", ChooseTrend);
+                    body.Children.Add(_trendChoice);
+                    break;
                 default:
                     AddRow(body, "下行");
                     AddRow(body, "上行");
+                    AddRow(body, "连接");
                     break;
             }
+            if (_metric != PerfMetric.Summary)
+            {
+                var text = MakeText("最近 60 秒", -1);
+                text.Opacity = 0.72;
+                text.Margin = new Thickness(2, 6, 0, 0);
+                body.Children.Add(text);
+            }
+            _trend = new PerfTrend();
+            body.Children.Add(_trend);
+            _trendPeak = MakeText("峰值 · --", -1);
+            _trendPeak.Margin = new Thickness(2, 4, 0, 1);
+            body.Children.Add(_trendPeak);
+            body.Children.Add(PanelControls.GlassButton(_metric == PerfMetric.Network ? "Windows 网络设置" : "任务管理器",
+                () => NativeMethods.ShellExecuteOpen(_metric == PerfMetric.Network ? "ms-settings:network-status" : "taskmgr.exe"), compact: true));
             Panel.Child = body;
+        }
+
+        internal static IEnumerable<PerfMetric> EnabledMetrics()
+        {
+            if (App.ActiveSettings.ShowMonitorCpu) yield return PerfMetric.Cpu;
+            if (App.ActiveSettings.ShowMonitorGpu) yield return PerfMetric.Gpu;
+            if (App.ActiveSettings.ShowMonitorMemory) yield return PerfMetric.Memory;
+            if (App.ActiveSettings.ShowMonitorNetwork) yield return PerfMetric.Network;
+        }
+
+        private static string MetricName(PerfMetric metric) => metric switch
+        {
+            PerfMetric.Cpu => "CPU", PerfMetric.Gpu => "GPU", PerfMetric.Memory => "内存",
+            PerfMetric.Network => "网络", _ => "性能"
+        };
+
+        private void ChooseTrend()
+        {
+            TrackFlyout(FlyoutMenu.Show(EnabledMetrics().Select(metric => new FlyoutItem(MetricName(metric), () =>
+            {
+                _trendMetric = metric;
+                _trendChoice.Content = MetricName(metric) + " · 最近 60 秒";
+                RefreshTrend();
+            })).ToArray(), "显示趋势", _trendChoice));
+        }
+
+        private static double MetricValue(PerfSample sample, PerfMetric metric) => metric switch
+        {
+            PerfMetric.Cpu => sample.CpuPercent,
+            PerfMetric.Gpu => PickGpu(sample.Gpus)?.UtilPercent ?? -1,
+            PerfMetric.Memory => sample.MemTotalBytes == 0 ? -1 : 100.0 * sample.MemUsedBytes / sample.MemTotalBytes,
+            PerfMetric.Network => sample.NetDownBps >= 0 ? sample.NetDownBps : -1,
+            _ => -1
+        };
+
+        private void RefreshTrend()
+        {
+            double peak = _trend.SetSamples(sample => MetricValue(sample, _trendMetric), _trendMetric != PerfMetric.Network);
+            string text = "峰值 · " + (_trendMetric == PerfMetric.Network ? FormatNetworkRate(peak, false) : FmtPercent(peak));
+            if (_trendPeak.Text != text) _trendPeak.Text = text;
         }
 
         private TextBlock AddRow(StackPanel body, string label)
@@ -1079,20 +1455,32 @@ namespace DesktopBar.UI
         private void SetActive(bool active)
         {
             if (_disposed) return;
-            active = active && IsVisible && IsLoaded;
-            if (active == _active) return;
-            _active = active;
-            var service = PerfService.Instance;
-            if (active)
+            active = active && IsVisible && IsLoaded && _presentationDemand;
+            if (active != _active)
             {
-                service.AddRef();
-                service.Updated += OnSample;
-                var latest = service.Latest;
-                if (latest != null) Apply(latest);
-                return;
+                _active = active;
+                UpdateSampleSubscription();
+                var service = PerfService.Instance;
+                if (active)
+                {
+                    service.AddRef();
+                    var latest = service.Latest;
+                    if (latest != null) Apply(latest);
+                }
+                else service.ReleaseRef();
             }
-            service.Updated -= OnSample;
-            service.ReleaseRef();
+            else UpdateSampleSubscription();
+            UpdateNetworkWatch();
+            QueuePanelPreload();
+        }
+
+        private bool _presentationDemand = true;
+
+        internal void SetPresentationDemand(bool active)
+        {
+            if (_presentationDemand == active) return;
+            _presentationDemand = active;
+            SetActive(active);
         }
 
         private void OnSample(PerfSample sample)
@@ -1102,29 +1490,37 @@ namespace DesktopBar.UI
             {
                 Dispatcher.BeginInvoke(new Action(() =>
                 {
-                    if (!_disposed && _active) Apply(sample);
+                    if (_disposed) return;
+                    if (_active) Apply(PerfService.Instance.Latest ?? sample);
+                    QueuePanelPreload();
                 }));
             }
             catch (InvalidOperationException) { }
         }
 
-        private void Apply(PerfSample sample)
+        private void Apply(PerfSample sample, bool preload = false)
         {
+            bool refreshPanel = Open || preload;
             switch (_metric)
             {
+                case PerfMetric.Summary:
+                    var first = EnabledMetrics().FirstOrDefault();
+                    SetPillText(MetricName(first) + " " + FormatMetric(first));
+                    foreach (var metric in EnabledMetrics()) UpdateRow(MetricName(metric), FormatMetric(metric));
+                    break;
                 case PerfMetric.Cpu:
                     SetPillText(FmtPercent(sample.CpuPercent));
-                    SetRow("占用", FmtPercent(sample.CpuPercent));
-                    SetRow("温度", FmtTemp(sample.CpuTempC));
-                    SetRow("频率", FmtFreq(sample.CpuFreqMhz));
+                    UpdateRow("占用", FmtPercent(sample.CpuPercent));
+                    UpdateRow("温度", FmtTemp(sample.CpuTempC));
+                    UpdateRow("频率", FmtFreq(sample.CpuFreqMhz));
                     break;
                 case PerfMetric.Gpu:
                     var gpu = PickGpu(sample.Gpus);
                     SetPillText(gpu == null ? "--" : FmtPercent(gpu.UtilPercent));
-                    SetRow("型号", gpu == null ? "--" : gpu.Name);
-                    SetRow("占用", gpu == null ? "--" : FmtPercent(gpu.UtilPercent));
-                    SetRow("温度", FmtTemp(gpu == null ? -1 : gpu.TempC));
-                    SetRow("频率", FmtFreq(gpu == null ? -1 : gpu.ClockMhz));
+                    UpdateRow("型号", gpu == null ? "--" : gpu.Name);
+                    UpdateRow("占用", gpu == null ? "--" : FmtPercent(gpu.UtilPercent));
+                    UpdateRow("温度", FmtTemp(gpu == null ? -1 : gpu.TempC));
+                    UpdateRow("频率", FmtFreq(gpu == null ? -1 : gpu.ClockMhz));
                     break;
                 case PerfMetric.Memory:
                     if (sample.MemTotalBytes <= 0)
@@ -1136,12 +1532,12 @@ namespace DesktopBar.UI
                         double percent = 100.0 * sample.MemUsedBytes / sample.MemTotalBytes;
                         SetPillText(FmtPercent(percent));
                     }
-                    SetRow("占用", sample.MemTotalBytes <= 0
+                    UpdateRow("占用", sample.MemTotalBytes <= 0
                         ? "--"
                         : FmtPercent(100.0 * sample.MemUsedBytes / sample.MemTotalBytes));
-                    SetRow("已用", sample.MemTotalBytes <= 0 ? "--" : FmtGb(sample.MemUsedBytes) + " GB");
-                    SetRow("容量", sample.MemTotalBytes <= 0 ? "--" : FmtGb(sample.MemTotalBytes) + " GB");
-                    SetRow("频率", sample.MemSpeedMts > 0 ? Math.Round(sample.MemSpeedMts) + " MT/s" : "--");
+                    UpdateRow("已用", sample.MemTotalBytes <= 0 ? "--" : FmtGb(sample.MemUsedBytes) + " GB");
+                    UpdateRow("容量", sample.MemTotalBytes <= 0 ? "--" : FmtGb(sample.MemTotalBytes) + " GB");
+                    UpdateRow("频率", sample.MemSpeedMts > 0 ? Math.Round(sample.MemSpeedMts) + " MT/s" : "--");
                     break;
                 default:
                     if (!IsValidRate(sample.NetUpBps) && !IsValidRate(sample.NetDownBps))
@@ -1153,21 +1549,26 @@ namespace DesktopBar.UI
                         SetPillText("↓" + FormatNetworkRate(sample.NetDownBps, compact: true)
                             + " ↑" + FormatNetworkRate(sample.NetUpBps, compact: true));
                     }
-                    SetRow("下行", FormatNetworkRate(sample.NetDownBps, compact: false));
-                    SetRow("上行", FormatNetworkRate(sample.NetUpBps, compact: false));
+                    UpdateRow("下行", FormatNetworkRate(sample.NetDownBps, compact: false));
+                    UpdateRow("上行", FormatNetworkRate(sample.NetUpBps, compact: false));
                     break;
             }
+            if (refreshPanel && !ReferenceEquals(_panelSample, sample))
+            {
+                _panelSample = sample;
+                RefreshTrend();
+            }
+            void UpdateRow(string label, string text) { if (refreshPanel) SetRow(label, text); }
+            string FormatMetric(PerfMetric metric) => metric == PerfMetric.Network
+                ? FormatNetworkRate(sample.NetDownBps, compact: true) : FmtPercent(MetricValue(sample, metric));
         }
 
         private void SetRow(string label, string text)
         {
-            // 面板没打开时那棵树不参与合成,逐秒写它只是白花 DP 与文本排版开销;
-            // 打开时 OnPanelShown 会整体刷一遍,不会显示旧值。
-            if (Panel == null || !Panel.IsVisible) return;
             if (_rows.TryGetValue(label, out var tb) && tb.Text != text)
             {
                 tb.Text = text;
-                if (label == "型号") tb.ToolTip = text == "--" ? null : text;
+                if (label is "型号" or "连接") tb.ToolTip = text == "--" ? null : text;
             }
         }
 
@@ -1226,14 +1627,15 @@ namespace DesktopBar.UI
             if (_disposed) return;
             // 不经由 SetActive(false) 退订:SetActive 的 _disposed 守卫会把它短路,
             // 导致采样线程永不停止、委托持模块。这里直接退订并释放引用。
-            var service = PerfService.Instance;
+            _disposed = true;
             if (_active)
             {
                 _active = false;
-                service.Updated -= OnSample;
-                service.ReleaseRef();
+                PerfService.Instance.ReleaseRef();
             }
-            _disposed = true;
+            UpdateSampleSubscription();
+            UpdateNetworkWatch();
+            _panelPreload?.Abort();
             base.Dispose();
         }
     }

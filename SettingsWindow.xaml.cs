@@ -66,11 +66,11 @@ namespace DesktopBar
         // ---------- 导航 ----------
         private static readonly Dictionary<string, string> PageKeywords = new(StringComparer.Ordinal)
         {
-            ["Appearance"] = "外观 材质 胶囊 液态玻璃 雾面 壁纸换图过渡 壁纸过渡 幻灯片过渡 更新节奏 透明度 主题 配色 颜色 边框 缩放",
+            ["Appearance"] = "外观 材质 胶囊 液态玻璃 雾面 壁纸换图过渡 壁纸过渡 幻灯片过渡 更新节奏 透明度 主题 配色 颜色 边框 缩放 定格 定格玻璃 展开页",
             ["Time"] = "时间 时钟 日期 星期 秒数 农历 居中",
-            ["Folders"] = "小文件夹 文件 目录 位置 存储 创建 排序 重命名 资源管理器 定位",
-            ["Modules"] = "模块显示 性能 监测 GPU CPU 内存 网络速率 CPU温度 GPU温度 音乐 音量 频谱 回收站",
-            ["General"] = "通用 开机自启 启动 登录 动画时长 悬停关闭 桌面空间 预留 数据 配置 日志 顶栏唤出 鼠标触顶 触顶停留 置顶 全局快捷键 快捷键停留 停留时长 玻璃取景 逐窗口采样 截图 录屏 屏幕共享 远程控制",
+            ["Folders"] = "小文件夹 文件 目录 位置 存储 创建 排序 重命名 资源管理器 定位 直连 收件箱 置顶",
+            ["Modules"] = "模块显示 顶栏布局 常用项 固定 排列 预设 性能 监测 GPU CPU 内存 网络速率 CPU温度 GPU温度 音乐 音量 频谱 回收站",
+            ["General"] = "通用 开机自启 启动 登录 动画时长 悬停关闭 桌面空间 预留 数据 配置 日志 顶栏唤出 鼠标触顶 触顶停留 置顶 全局快捷键 快捷键停留 停留时长 玻璃取景 逐窗口采样 截图 录屏 屏幕共享 远程控制 触顶例外 备份",
             ["About"] = "关于 版本 软件更新 检查更新 下载 GitHub 开发者 协助者 头像 Akiyuki1130 OneCat2015"
         };
 
@@ -116,6 +116,8 @@ namespace DesktopBar
                 {
                     match.IsChecked = true;
                     match.Focus();
+                    string query = SettingsSearchBox.Text.Trim();
+                    Dispatcher.BeginInvoke(DispatcherPriority.Loaded, new Action(() => JumpToSetting(query)));
                 }
                 e.Handled = true;
             }
@@ -134,6 +136,34 @@ namespace DesktopBar
             ShowPage((string)((RadioButton)sender).Tag);
         }
 
+        private void JumpToSetting(string query)
+        {
+            if (query.Length == 0) return;
+            var page = PagesGrid.Children.OfType<FrameworkElement>().FirstOrDefault(item => Equals(item.Tag, _currentPage));
+            if (page == null) return;
+            string[] terms = query.Split((char[])null, StringSplitOptions.RemoveEmptyEntries);
+            var target = Labels(page).Where(label => label.IsVisible && label.Text.Length <= 38 && terms.All(
+                    term => label.Text.Contains(term, StringComparison.OrdinalIgnoreCase)))
+                .OrderBy(label => label.Text.Length).FirstOrDefault();
+            if (target == null) return;
+            target.BringIntoView();
+            if (SystemParameters.ClientAreaAnimation)
+                target.BeginAnimation(OpacityProperty, new DoubleAnimation(.48, 1, TimeSpan.FromMilliseconds(270))
+                {
+                    AutoReverse = true, RepeatBehavior = new RepeatBehavior(2), FillBehavior = FillBehavior.Stop
+                });
+
+            static IEnumerable<TextBlock> Labels(DependencyObject element)
+            {
+                for (int index = 0; index < VisualTreeHelper.GetChildrenCount(element); index++)
+                {
+                    var child = VisualTreeHelper.GetChild(element, index);
+                    if (child is TextBlock label) yield return label;
+                    foreach (var inner in Labels(child)) yield return inner;
+                }
+            }
+        }
+
         private void ShowPage(string tag)
         {
             if (PagesGrid == null || string.IsNullOrEmpty(tag) || _currentPage == tag) return;
@@ -148,7 +178,7 @@ namespace DesktopBar
                 "Appearance" => "外观",
                 "Time" => "时间",
                 "Folders" => "小文件夹",
-                "Modules" => "模块显示",
+                "Modules" => "顶栏布局",
                 "General" => "通用",
                 "About" => "关于",
                 _ => tag
@@ -165,6 +195,14 @@ namespace DesktopBar
             if (animate)
                 next.BeginAnimation(OpacityProperty, new DoubleAnimation(0.64, 1,
                     TimeSpan.FromMilliseconds(130)) { FillBehavior = FillBehavior.Stop });
+        }
+
+        internal void NavigateTo(string page)
+        {
+            SettingsSearchBox.Clear();
+            var entry = NavigationItems.Children.OfType<RadioButton>()
+                .FirstOrDefault(button => (string)button.Tag == page);
+            if (entry != null) entry.IsChecked = true;
         }
 
         private void Close_Click(object sender, RoutedEventArgs e) => Close();
@@ -591,6 +629,12 @@ namespace DesktopBar
                 var pacePicker = BuildGlassPacePicker();
                 body.Children.Add(Row("更新节奏", pacePicker));
                 body.Children.Add(MakeHint("自动模式会在画面静止时降低刷新频率。", 3));
+                body.Children.Add(ToggleRow("展开页定格玻璃", S.FreezePanelGlass, enabled =>
+                {
+                    S.FreezePanelGlass = enabled;
+                    ApplyGlassSetting();
+                }));
+                body.Children.Add(MakeHint("打开面板时取景一次，停留期间保留折射和雾面。", 3));
                 var advanced = new StackPanel();
                 void AddSlider(string label, int min, int max, double value, string suffix, Action<double> set)
                 {
@@ -741,6 +785,17 @@ namespace DesktopBar
             body.Children.Add(ToggleRow("显示秒数", S.ShowSeconds, v => { S.ShowSeconds = v; Save(); }));
             body.Children.Add(ToggleRow("显示日期", S.ShowDate, v => { S.ShowDate = v; Save(); }));
             body.Children.Add(ToggleRow("显示星期", S.ShowWeekday, v => { S.ShowWeekday = v; Save(); }));
+            var zoneLabels = new[] { ("", "关闭") }.Concat(TimeZoneInfo.GetSystemTimeZones().Select(zone => (zone.Id, zone.DisplayName))).ToArray();
+            var zonePicker = new ComboBox { Width = 245, MinHeight = 32, ItemsSource = zoneLabels.Select(item => item.Item2).ToArray(),
+                Style = (Style)FindResource("DarkCombo") };
+            zonePicker.SelectedIndex = Math.Max(0, Array.FindIndex(zoneLabels, item => item.Item1 == S.SecondTimeZoneId));
+            zonePicker.SelectionChanged += (_, _) =>
+            {
+                if (zonePicker.SelectedIndex < 0) return;
+                S.SecondTimeZoneId = zoneLabels[zonePicker.SelectedIndex].Item1;
+                Save();
+            };
+            body.Children.Add(Row("展开页第二时区", zonePicker));
             body.Children.Add(MakeHint("鼠标悬停在时间选项卡上时,会展开显示星期、日期和农历日期。", 14));
             TimeHost.Children.Add(card);
         }
@@ -835,6 +890,8 @@ namespace DesktopBar
             actions.Children.Add(delete);
             listBody.Children.Add(actions);
             FoldersHost.Children.Add(listCard);
+            FoldersHost.Children.Add(BuildLinkedFoldersCard());
+            FoldersHost.Children.Add(BuildFolderShortcutsCard());
         }
 
         /// <summary>列表行模板:名称居左;"打开"与拖动手柄靠右,拖动手柄在最右。</summary>
@@ -1050,6 +1107,10 @@ namespace DesktopBar
         private void BuildModulesPage()
         {
             ModulesHost.Children.Clear();
+            ModulesHost.Children.Add(BuildPresetsCard());
+            ModulesHost.Children.Add(BuildAppSceneCard());
+            ModulesHost.Children.Add(BuildLayoutCard());
+            ModulesHost.Children.Add(BuildFavoritesCard());
 
             // 切换只更新对应模块的显隐(ApplyModuleVisibility),不重建顶栏,避免其他胶囊闪烁。
             var card = Card("模块显示",
@@ -1068,6 +1129,13 @@ namespace DesktopBar
                 v => { S.ShowSpectrum = v; Save(); App.Bar?.ApplyModuleVisibility(); }));
             body.Children.Add(ToggleRow("音量按钮", S.ShowVolume,
                 v => { S.ShowVolume = v; Save(); App.Bar?.ApplyModuleVisibility(); }));
+            if (BatteryModule.Available)
+                body.Children.Add(ToggleRow("电池与供电", S.ShowBattery, enabled =>
+                {
+                    S.ShowBattery = enabled;
+                    App.Save();
+                    App.Bar?.ApplyModuleVisibility();
+                }));
 
             body.Children.Add(ToggleRow("CPU 占用率", S.ShowMonitorCpu,
                 v => { S.ShowMonitorCpu = v; Save(); App.Bar?.ApplyModuleVisibility(); }));
@@ -1099,6 +1167,7 @@ namespace DesktopBar
                 v => { S.ShowMonitorMemory = v; Save(); App.Bar?.ApplyModuleVisibility(); }));
             body.Children.Add(ToggleRow("网络上下行", S.ShowMonitorNetwork,
                 v => { S.ShowMonitorNetwork = v; Save(); App.Bar?.ApplyModuleVisibility(); }));
+            body.Children.Add(ToggleRow("合并性能胶囊", S.CombinePerfModules, v => { S.CombinePerfModules = v; Save(); }));
 
             // 原生 CPU 温度(AMD 平台):经 PawnIO 读取真 Tctl;未装时回落 SoC/热区传感器。
             if (DesktopBar.Services.PerfService.CpuIsAmd)
@@ -1446,6 +1515,7 @@ namespace DesktopBar
             GeneralHost.Children.Add(card1);
 
             GeneralHost.Children.Add(BuildRevealCard());
+            GeneralHost.Children.Add(BuildEdgeExclusionsCard());
 
             var captureCard = Card("玻璃取景", null, out var captureBody);
             captureBody.Children.Add(ToggleRow("逐窗口采样", S.ShowInScreenCapture, enabled =>
@@ -1455,6 +1525,13 @@ namespace DesktopBar
                 App.Save();
             }));
             captureBody.Children.Add(MakeHint("开启后，玻璃实时合成背后的窗口，桌面空白处映出壁纸，录屏和远程画面也能显示顶栏与展开页。关闭后改用整屏采样，屏幕捕获会隐藏顶栏与展开页。"));
+            captureBody.Children.Add(ToggleRow("轻量录制 · 只取壁纸", S.WallpaperOnlyCapture, enabled =>
+            {
+                S.WallpaperOnlyCapture = enabled;
+                App.Save();
+                GlassService.ApplyCaptureVisibility();
+            }));
+            captureBody.Children.Add(MakeHint("用桌面壁纸作为玻璃底图，顶栏和展开页可出现在录屏及远程画面。启用时优先使用这个取景方式。", 4));
             GeneralHost.Children.Add(captureCard);
 
             var cardSpace = Card("桌面空间", null, out var bs);
@@ -1469,6 +1546,7 @@ namespace DesktopBar
             b2.Children.Add(MakeHint("配置文件:" + Path.Combine(App.AppDataDir, "settings.json") +
                                      "\n日志文件:" + Path.Combine(App.AppDataDir, "log.txt")));
             GeneralHost.Children.Add(card2);
+            GeneralHost.Children.Add(BuildBackupCard());
         }
 
         private Button _revealShortcutButton;
@@ -1489,7 +1567,28 @@ namespace DesktopBar
                 S.RevealEdgeDwellMs = (int)value;
                 App.Save();
             }, step: 10)));
-            body.Children.Add(MakeHint("鼠标在主屏顶边停满设定时长后唤出。离开顶栏和展开页后收起。", 4));
+            body.Children.Add(MakeHint("鼠标在屏幕顶边停满设定时长后唤出。离开顶栏和展开页后收起。", 4));
+            var displays = new List<(string Name, string Device, bool Pointer)> { ("主屏", "", false), ("跟随指针", "", true) };
+            foreach (var screen in System.Windows.Forms.Screen.AllScreens)
+                if (!screen.Primary)
+                    displays.Add(($"副屏 · {screen.Bounds.Width} × {screen.Bounds.Height} ({screen.DeviceName})", screen.DeviceName, false));
+            var displayPicker = new ComboBox
+            {
+                Style = (Style)FindResource("DarkCombo"),
+                Width = 230,
+                ItemsSource = displays.Select(item => item.Name).ToArray(),
+                SelectedIndex = Math.Max(0, displays.FindIndex(item => item.Device == S.RevealDisplayName && item.Pointer == S.RevealOnPointerScreen))
+            };
+            displayPicker.SelectionChanged += (_, _) =>
+            {
+                if (displayPicker.SelectedIndex < 0) return;
+                var display = displays[displayPicker.SelectedIndex];
+                S.RevealDisplayName = display.Device;
+                S.RevealOnPointerScreen = display.Pointer;
+                App.Save();
+            };
+            body.Children.Add(Row("唤出屏幕", displayPicker));
+            body.Children.Add(MakeHint("副屏唤出使用纯色材质。收起后顶栏回到主屏。", 4));
 
             ToggleButton hotkeyToggle = null;
             body.Children.Add(ToggleRow("全局快捷键唤出", S.RevealWithHotkey, enabled =>
@@ -1628,6 +1727,7 @@ namespace DesktopBar
             ub.Children.Add(MakeHint("「自动下载更新」需要开启「自动检查更新」;下载完成后会先询问,确认后才安装。" +
                                      "安装新版本时会退出 YukiDesk 并启动安装程序,设置与小文件夹不会丢失。", 14));
             AboutHost.Children.Add(upd);
+            AboutHost.Children.Add(BuildDiagnosticsCard());
         }
 
         private Button GitHubProfileButton(string role, string login)

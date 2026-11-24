@@ -20,25 +20,40 @@ namespace DesktopBar.Interop
         [DllImport("user32.dll", SetLastError = true)]
         private static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
 
-        [DllImport("user32.dll")]
-        private static extern IntPtr GetForegroundWindow();
+        internal static void PositionBar(IntPtr hwnd, int x, int y, int width, int height)
+            => SetWindowPos(hwnd, IntPtr.Zero, x, y, width, height, SWP_NOACTIVATE | SWP_NOZORDER);
 
-        [DllImport("gdi32.dll")]
-        private static extern IntPtr CreateRoundRectRgn(int x1, int y1, int x2, int y2, int cw, int ch);
+        [DllImport("user32.dll")]
+        internal static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        internal static extern bool SetForegroundWindow(IntPtr hwnd);
+
+        internal static void AllowActivation(IntPtr hwnd)
+            => SetWindowLong(hwnd, GWL_EXSTYLE, GetWindowLong(hwnd, GWL_EXSTYLE) & ~WS_EX_NOACTIVATE);
+
+        internal static bool ForegroundMatches(System.Collections.Generic.List<string> names)
+        {
+            if (names.Count == 0) return false;
+            string program = ForegroundProgramName();
+            return names.Exists(name => string.Equals(System.IO.Path.GetFileNameWithoutExtension(name),
+                program, StringComparison.OrdinalIgnoreCase));
+        }
+
+        internal static string ForegroundProgramName()
+        {
+            if (GetWindowThreadProcessId(GetForegroundWindow(), out uint processId) == 0) return null;
+            try
+            {
+                using var process = System.Diagnostics.Process.GetProcessById((int)processId);
+                return process.ProcessName;
+            }
+            catch (ArgumentException) { return null; }
+            catch (InvalidOperationException) { return null; }
+        }
 
         [DllImport("gdi32.dll")]
         private static extern bool DeleteObject(IntPtr hObject);
-
-        [DllImport("user32.dll")]
-        private static extern bool SetWindowRgn(IntPtr hwnd, IntPtr rgn, bool redraw);
-
-        /// <summary>给无边框窗口设置圆角(不依赖分层透明)。</summary>
-        public static void SetRoundRegion(IntPtr hwnd, int w, int h, int radius)
-        {
-            IntPtr rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, radius, radius);
-            if (rgn != IntPtr.Zero && !SetWindowRgn(hwnd, rgn, true))
-                DeleteObject(rgn);
-        }
 
         [DllImport("user32.dll")]
         private static extern int GetWindowLong(IntPtr hWnd, int index);
@@ -339,7 +354,7 @@ namespace DesktopBar.Interop
          InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
         private interface IShellItemImageFactory
         {
-            int GetImage(SIZE size, uint flags, out IntPtr bitmap);
+            [PreserveSig] int GetImage(SIZE size, uint flags, out IntPtr bitmap);
         }
 
         [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
@@ -379,7 +394,17 @@ namespace DesktopBar.Interop
             finally { DeleteObject(hBitmap); }
         }
 
+        internal static BitmapSource GetShellThumbnail(string path, int pixelSize, bool cacheOnly = false)
+        {
+            const uint thumbnailOnly = 0x08;
+            const uint inCacheOnly = 0x10;
+            return ReadShellImage(path, pixelSize, thumbnailOnly | (cacheOnly ? inCacheOnly : 0));
+        }
+
         private static BitmapSource TryShellDesktopIcon(string path, int pixelSize)
+            => ReadShellImage(path, pixelSize, SIIGBF_ICONONLY | SIIGBF_SCALEUP);
+
+        private static BitmapSource ReadShellImage(string path, int pixelSize, uint flags)
         {
             if (string.IsNullOrWhiteSpace(path) || !File.Exists(path) && !Directory.Exists(path)) return null;
             IShellItemImageFactory factory = null;
@@ -388,8 +413,9 @@ namespace DesktopBar.Interop
                 var iid = ShellItemImageFactoryIid;
                 if (SHCreateItemFromParsingName(path, IntPtr.Zero, ref iid, out factory) != 0 || factory == null)
                     return null;
-                var size = new SIZE { cx = Math.Max(48, Math.Min(256, pixelSize)), cy = Math.Max(48, Math.Min(256, pixelSize)) };
-                int hr = factory.GetImage(size, SIIGBF_BIGGERSIZEOK | SIIGBF_ICONONLY | SIIGBF_SCALEUP, out IntPtr bitmap);
+                int pixels = Math.Clamp(pixelSize, 48, 512);
+                var size = new SIZE { cx = pixels, cy = pixels };
+                int hr = factory.GetImage(size, SIIGBF_BIGGERSIZEOK | flags, out IntPtr bitmap);
                 return hr == 0 ? BitmapToSource(bitmap) : null;
             }
             catch { return null; }

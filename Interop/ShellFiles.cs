@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.ComTypes;
 using System.Threading;
@@ -20,13 +21,26 @@ namespace DesktopBar.Interop
         internal static void Invoke(IntPtr owner, RecycledItem item, string verb)
             => WithId(item.Id, id => InvokeItem(owner, id, verb));
 
-        private static void InvokeItem(IntPtr owner, IntPtr id, string verb)
-            => WithParent(id, (folder, child) =>
+        internal static void Invoke(IntPtr owner, IReadOnlyList<string> paths, string verb)
+            => WithPathSelection(paths, (folder, children) => InvokeItems(owner, folder, children, verb));
+
+        internal static void Invoke(IntPtr owner, IReadOnlyList<RecycledItem> items, string verb)
+            => WithSelection(items, item =>
             {
-                var iid = typeof(IContextMenu).GUID;
-                Check(folder.GetUIObjectOf(owner, 1, new[] { child }, ref iid, IntPtr.Zero, out var pointer));
-                WithMenu(pointer, owner, verb);
-            });
+                var pointer = Marshal.AllocCoTaskMem(item.Id.Length);
+                Marshal.Copy(item.Id, 0, pointer, item.Id.Length);
+                return pointer;
+            }, (folder, children) => InvokeItems(owner, folder, children, verb));
+
+        private static void InvokeItem(IntPtr owner, IntPtr id, string verb)
+            => WithParent(id, (folder, child) => InvokeItems(owner, folder, new[] { child }, verb));
+
+        private static void InvokeItems(IntPtr owner, IShellFolder folder, IntPtr[] children, string verb)
+        {
+            var iid = typeof(IContextMenu).GUID;
+            Check(folder.GetUIObjectOf(owner, (uint)children.Length, children, ref iid, IntPtr.Zero, out var pointer));
+            WithMenu(pointer, owner, verb);
+        }
 
         internal static void Paste(IntPtr owner, string directory)
             => WithPath(directory, id =>
@@ -85,18 +99,61 @@ namespace DesktopBar.Interop
         internal static void Drag(IntPtr owner, RecycledItem item)
             => WithId(item.Id, id => Drag(owner, id, 2));
 
+        internal static void Drag(IntPtr owner, IReadOnlyList<string> paths)
+            => WithPathSelection(paths, (folder, children) => Drag(owner, folder, children, 7));
+
         private static void Drag(IntPtr owner, IntPtr id, uint effects)
-            => WithParent(id, (folder, child) =>
+            => WithParent(id, (folder, child) => Drag(owner, folder, new[] { child }, effects));
+
+        private static void Drag(IntPtr owner, IShellFolder folder, IntPtr[] children, uint effects)
+        {
+            var iid = typeof(IDataObject).GUID;
+            Check(folder.GetUIObjectOf(owner, (uint)children.Length, children, ref iid, IntPtr.Zero, out var data));
+            try
             {
-                var iid = typeof(IDataObject).GUID;
-                Check(folder.GetUIObjectOf(owner, 1, new[] { child }, ref iid, IntPtr.Zero, out var data));
-                try
+                EnableAsyncTransfer(data);
+                Check(SHDoDragDrop(owner, data, IntPtr.Zero, effects, out _));
+            }
+            finally { Marshal.Release(data); }
+        }
+
+        private static void WithPathSelection(IReadOnlyList<string> paths, Action<IShellFolder, IntPtr[]> action)
+        {
+            if (paths.Count == 0) return;
+            string parent = Path.GetDirectoryName(paths[0]);
+            foreach (string path in paths)
+                if (!string.Equals(parent, Path.GetDirectoryName(path), StringComparison.OrdinalIgnoreCase))
+                    throw new ArgumentException("请在同一目录中选择项目。");
+            WithSelection(paths, path =>
+            {
+                Check(NativeMethods.SHParseDisplayName(path, IntPtr.Zero, out var id, 0, out _));
+                return id;
+            }, action);
+        }
+
+        private static void WithSelection<T>(IReadOnlyList<T> items, Func<T, IntPtr> getId, Action<IShellFolder, IntPtr[]> action)
+        {
+            if (items.Count == 0) return;
+            var ids = new IntPtr[items.Count];
+            try
+            {
+                for (int i = 0; i < items.Count; i++) ids[i] = getId(items[i]);
+                WithParent(ids[0], (folder, first) =>
                 {
-                    EnableAsyncTransfer(data);
-                    Check(SHDoDragDrop(owner, data, IntPtr.Zero, effects, out _));
-                }
-                finally { Marshal.Release(data); }
-            });
+                    var children = new IntPtr[ids.Length];
+                    children[0] = first;
+                    for (int i = 1; i < ids.Length; i++) children[i] = ILFindLastID(ids[i]);
+                    action(folder, children);
+                });
+            }
+            finally
+            {
+                foreach (var id in ids) Marshal.FreeCoTaskMem(id);
+            }
+        }
+
+        [DllImport("shell32.dll")]
+        private static extern IntPtr ILFindLastID(IntPtr id);
 
         private static void EnableAsyncTransfer(IntPtr data)
         {

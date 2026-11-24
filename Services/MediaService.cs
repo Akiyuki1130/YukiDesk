@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Linq;
 using System.Security.Cryptography;
 using System.Threading.Tasks;
 using System.Windows.Media.Imaging;
@@ -54,7 +55,6 @@ namespace DesktopBar.Services
         private GlobalSystemMediaTransportControlsSessionManager _manager;
         private GlobalSystemMediaTransportControlsSession _session;
         private DispatcherTimer _timer;
-        private DateTime _posTime = DateTime.MinValue;
         private long _sessionGeneration;
         private long _refreshGeneration;
         private long _publishedGeneration;
@@ -112,15 +112,67 @@ namespace DesktopBar.Services
                 return;
             }
 
-            _currentSessionChanged = (manager, args) => Post(() => Hook(manager.GetCurrentSession()));
-            _sessionsChanged = (manager, args) => Post(() => Hook(manager.GetCurrentSession()));
+            _currentSessionChanged = (manager, args) => Post(SelectSession);
+            _sessionsChanged = (manager, args) => Post(SelectSession);
             _manager.CurrentSessionChanged += _currentSessionChanged;
             _manager.SessionsChanged += _sessionsChanged;
 
             _timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(500) };
             _timer.Tick += OnTimerTick;
             _timer.Start();
-            Hook(_manager.GetCurrentSession());
+            SelectSession();
+        }
+
+        internal (string Id, string Title)[] Sources()
+        {
+            try
+            {
+                return (_manager?.GetSessions() ?? Array.Empty<GlobalSystemMediaTransportControlsSession>())
+                    .Select(session => session.SourceAppUserModelId)
+                    .Where(id => !string.IsNullOrWhiteSpace(id)).Distinct(StringComparer.OrdinalIgnoreCase)
+                    .Select(id => (id, SourceTitle(id))).ToArray();
+            }
+            catch (Exception ex) { App.Log("读取媒体来源失败: " + ex.Message); return Array.Empty<(string, string)>(); }
+        }
+
+        internal static string SourceTitle(string id)
+        {
+            if (string.IsNullOrWhiteSpace(id)) return "无播放来源";
+            string name = System.IO.Path.GetFileName(id.Split('!')[0]);
+            return name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ? name[..^4] : name;
+        }
+
+        internal void ChooseSource(string id)
+        {
+            App.Settings.PreferredMediaSource = id ?? "";
+            App.Save();
+            SelectSession();
+        }
+
+        private void SelectSession()
+        {
+            if (_manager == null || _disposed) return;
+            var preferred = App.Settings.PreferredMediaSource;
+            try
+            {
+                var selected = string.IsNullOrEmpty(preferred) ? null : _manager.GetSessions()
+                    .FirstOrDefault(session => string.Equals(session.SourceAppUserModelId, preferred, StringComparison.OrdinalIgnoreCase));
+                Hook(string.IsNullOrEmpty(preferred) ? _manager.GetCurrentSession() : selected);
+            }
+            catch (Exception ex) { App.Log("选择媒体来源失败: " + ex.Message); }
+        }
+
+        internal async Task<bool> ControlAsync(int direction)
+        {
+            var session = _session;
+            if (session == null || _disposed) return false;
+            try
+            {
+                return direction < 0 ? await session.TrySkipPreviousAsync()
+                    : direction > 0 ? await session.TrySkipNextAsync()
+                    : await session.TryTogglePlayPauseAsync();
+            }
+            catch (Exception ex) { App.Log("媒体会话控制失败: " + ex.Message); return false; }
         }
 
         private void OnTimerTick(object sender, EventArgs args)
@@ -147,7 +199,6 @@ namespace DesktopBar.Services
             _sessionGeneration++;
             _refreshGeneration++;
             _sessionKey = session?.SourceAppUserModelId ?? "";
-            _posTime = DateTime.MinValue;
             PublishEmpty(session != null);
 
             if (session == null)
@@ -240,19 +291,25 @@ namespace DesktopBar.Services
                 props?.TrackNumber.ToString() ?? "");
         }
 
-        private void GetPlayback(GlobalSystemMediaTransportControlsSession session,
+        private static void GetPlayback(GlobalSystemMediaTransportControlsSession session,
             GlobalSystemMediaTransportControlsSessionTimelineProperties timeline, out bool playing,
             out TimeSpan position)
         {
             var playback = session.GetPlaybackInfo();
             playing = playback != null && playback.PlaybackStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing;
-            position = timeline.Position;
-            if (playing && _posTime != DateTime.MinValue)
-            {
-                var elapsed = DateTime.Now - _posTime;
-                if (elapsed < TimeSpan.FromSeconds(3)) position += elapsed;
-            }
-            if (timeline.EndTime > TimeSpan.Zero && position > timeline.EndTime) position = timeline.EndTime;
+            position = ProjectPosition(timeline.Position, timeline.EndTime, timeline.LastUpdatedTime,
+                DateTimeOffset.UtcNow, playing, playback?.PlaybackRate ?? 1);
+        }
+
+        internal static TimeSpan ProjectPosition(TimeSpan position, TimeSpan end, DateTimeOffset updated,
+            DateTimeOffset now, bool playing, double rate)
+        {
+            double ticks = position.Ticks;
+            if (playing && updated > DateTimeOffset.UnixEpoch && now > updated)
+                ticks += (now - updated).Ticks * (double.IsFinite(rate) ? rate : 1);
+            if (ticks <= 0) return TimeSpan.Zero;
+            if (end > TimeSpan.Zero && ticks >= end.Ticks) return end;
+            return ticks >= long.MaxValue ? TimeSpan.MaxValue : TimeSpan.FromTicks((long)ticks);
         }
 
         private static long _lastPushFailLogTick = -60000;
@@ -264,7 +321,6 @@ namespace DesktopBar.Services
             {
                 var timeline = session.GetTimelineProperties();
                 GetPlayback(session, timeline, out bool playing, out TimeSpan position);
-                _posTime = DateTime.Now;
                 Publish(new MediaInfo(NextPublishedGeneration(), true, _current.SessionKey, _current.TrackKey,
                     _current.ThumbnailKey, _current.Title, _current.Artist, _current.Cover, playing, position,
                     timeline.EndTime, timeline.MaxSeekTime > timeline.MinSeekTime));

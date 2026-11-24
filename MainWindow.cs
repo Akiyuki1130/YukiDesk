@@ -19,7 +19,7 @@ namespace DesktopBar
     /// 桌面层顶栏窗口:透明全屏窗口钉在 Z 序底部(桌面之上、所有软件之下),
     /// WS_EX_NOACTIVATE 保证点击不抢焦点、不会被提到前台。
     /// </summary>
-    public class MainWindow : Window
+    public partial class MainWindow : Window
     {
         public static MainWindow Bar;
 
@@ -30,12 +30,13 @@ namespace DesktopBar
         private readonly List<ModuleBase> _modules = new List<ModuleBase>();
         private readonly List<ModuleBase> _folderModules = new List<ModuleBase>();
         private readonly DispatcherTimer _pinTimer;
+        private readonly DispatcherTimer _moduleDemandTimer;
+        private readonly Dictionary<ModuleBase, int> _coveredDemand = new();
         private readonly BarRevealController _reveal;
         private readonly DispatcherTimer _folderRefresh;
         private FileSystemWatcher _folderRootWatcher;
         private string _folderRoot;
         private int _folderScanVersion;
-        private StackPanel _folderStrip;
         internal event Action FolderCatalogChanged;
         private MediaService _media;
         private Action<MediaInfo> _mediaHandler;
@@ -43,7 +44,8 @@ namespace DesktopBar
         private MusicModule _music;
         private SpectrumModule _spectrum;
         private ModuleBase _power, _thisPc, _recycle, _volume;
-        private PerfModule _perfCpu, _perfGpu, _perfMemory, _perfNetwork;
+        private BatteryModule _battery;
+        private PerfModule _perfCpu, _perfGpu, _perfMemory, _perfNetwork, _perfSummary;
         private bool _closing;
         private bool _mediaAvailable = true;
         private int _layoutVersion;
@@ -51,6 +53,11 @@ namespace DesktopBar
         public MainWindow()
         {
             _reveal = new BarRevealController(this);
+            _moduleDemandTimer = new DispatcherTimer(DispatcherPriority.Background, Dispatcher)
+            {
+                Interval = TimeSpan.FromMilliseconds(650)
+            };
+            _moduleDemandTimer.Tick += (_, _) => RefreshModuleDemandNow();
             _folderRefresh = new DispatcherTimer(DispatcherPriority.Background, Dispatcher);
             _folderRefresh.Tick += (_, _) =>
             {
@@ -97,17 +104,21 @@ namespace DesktopBar
             {
                 App.Log("YukiDesk 主窗口 Loaded");
                 BuildLayout();
+                RefreshAppSceneRules();
                 Dispatcher.BeginInvoke(DispatcherPriority.ApplicationIdle, new Action(() =>
                 {
                     if (_closing || Visibility != Visibility.Visible) return;
                     PinToDesktopLayer();
                     // 诊断开关:YUKI_NO_REPIN=1 关掉 3 秒保底重钉,用来量化重钉本身的开销。
                     if (Environment.GetEnvironmentVariable("YUKI_NO_REPIN") != "1") _pinTimer.Start();
+                    _moduleDemandTimer.Start();
                 }));
             };
             IsVisibleChanged += (s, e) =>
             {
                 if (!IsVisible) ClosePanels();
+                _moduleDemandTimer.IsEnabled = IsVisible;
+                if (!IsVisible) RefreshModuleDemandNow();
             };
             // 分辨率/缩放/显示器变化:顶栏宽度只在构造时定过一次,不跟事件就会停留旧值。
             Microsoft.Win32.SystemEvents.DisplaySettingsChanged += OnDisplaySettingsChanged;
@@ -116,6 +127,9 @@ namespace DesktopBar
                 _closing = true;
                 _layoutVersion++;
                 _pinTimer.Stop();
+                _moduleDemandTimer.Stop();
+                _appSceneTimer?.Stop();
+                App.SceneSettings = null;
                 _folderRefresh.Stop();
                 _folderRootWatcher?.Dispose();
                 _reveal.Dispose();
@@ -133,11 +147,12 @@ namespace DesktopBar
                 if (_closing) return;
                 try
                 {
+                    _reveal.ResetForDisplayChange();
                     Width = SystemParameters.PrimaryScreenWidth;
                     PinToDesktopLayer();
                     var hwnd = new WindowInteropHelper(this).Handle;
-                    if (S.ReserveDesktopSpace) DesktopSpaceService.Apply(S, hwnd);
-                    else DesktopSpaceService.Apply(S);
+                    if (App.ActiveSettings.ReserveDesktopSpace) DesktopSpaceService.Apply(App.ActiveSettings, hwnd);
+                    else DesktopSpaceService.Apply(App.ActiveSettings);
                     App.Log("显示设置已变化,顶栏已重新适配");
                 }
                 catch (Exception ex) { App.Log("适配显示设置变化失败: " + ex.Message); }
@@ -151,7 +166,8 @@ namespace DesktopBar
             if (hwnd != IntPtr.Zero) NativeMethods.PinAboveDesktop(hwnd);
         }
 
-        internal bool HasRevealInteraction => IsMouseOver || IsMouseCaptureWithin || ModuleBase.ActivePanelKeepsBarRevealed;
+        internal bool HasRevealInteraction => IsMouseOver || IsMouseCaptureWithin || ModuleBase.ActivePanelKeepsBarRevealed
+            || _modules.Any(module => module.MenuIsOpen);
 
         internal bool IsAnyCapsuleCovered(IntPtr hwnd)
         {
@@ -159,7 +175,7 @@ namespace DesktopBar
             foreach (var module in _modules)
             {
                 var pill = module.Pill;
-                if (!pill.IsVisible || pill.ActualWidth < 1 || pill.ActualHeight < 1) continue;
+                if (!pill.IsVisible || pill.ActualWidth < 1 || pill.ActualHeight < 1 || _barLayout?.IsDrawn(module) == false) continue;
                 var center = pill.PointToScreen(new Point(pill.ActualWidth / 2, pill.ActualHeight / 2));
                 if (center.X >= 0 && center.X < screenWidth
                     && NativeMethods.IsCoveredByApplication(hwnd, (int)center.X, (int)center.Y)) return true;
@@ -168,6 +184,32 @@ namespace DesktopBar
         }
 
         internal bool RevealHotkeyRegistered => _reveal.IsHotkeyRegistered;
+
+        internal void RefreshModuleDemandNow()
+        {
+            if (_closing || _barLayout == null) return;
+            var hwnd = new WindowInteropHelper(this).Handle;
+            foreach (var module in _modules)
+            {
+                if (module is not (PerfModule or SpectrumModule)) continue;
+                bool active = false;
+                var pill = module.Pill;
+                if (IsVisible && module.IsVisible)
+                {
+                    active = module.HasVisiblePanel;
+                    if (!active && _barLayout.IsDrawn(module) && pill.ActualWidth > 0 && pill.ActualHeight > 0)
+                    {
+                        var center = pill.PointToScreen(new Point(pill.ActualWidth / 2, pill.ActualHeight / 2));
+                        bool covered = !_reveal.IsRaised && NativeMethods.IsCoveredByApplication(hwnd, (int)center.X, (int)center.Y);
+                        int frames = covered ? Math.Min(2, _coveredDemand.GetValueOrDefault(module) + 1) : 0;
+                        _coveredDemand[module] = frames;
+                        active = frames < 2;
+                    }
+                }
+                if (module is PerfModule perf) perf.SetPresentationDemand(active);
+                else ((SpectrumModule)module).SetPresentationDemand(active);
+            }
+        }
         internal void SetEdgeReveal(bool enabled) => _reveal.SetEdgeEnabled(enabled);
         internal bool TrySetRevealHotkey(bool enabled, BarHotkey shortcut) => _reveal.TrySetHotkey(enabled, shortcut);
         internal void CaptureRevealHotkey(Action<BarHotkey> capture) => _reveal.CaptureHotkey = capture;
@@ -175,7 +217,7 @@ namespace DesktopBar
         internal void ShowForReveal()
         {
             base.Show();
-            GlassService.SetActive(true);
+            GlassService.SetActive(!IsOnSecondaryScreen);
         }
 
         public void ApplySettings()
@@ -201,7 +243,12 @@ namespace DesktopBar
             // Clip=胶囊并集保证胶囊外 alpha=0、点击照常穿透桌面。元素由服务缓存,
             // 全量重建时复用同一块 WriteableBitmap,避免重建瞬间玻璃空一帧。
             var glassHost = GlassService.EnsureHost();
-            if (glassHost != null) root.Children.Add(glassHost);
+            _barGlassHost = glassHost;
+            if (glassHost != null)
+            {
+                glassHost.Visibility = IsOnSecondaryScreen ? Visibility.Hidden : Visibility.Visible;
+                root.Children.Add(glassHost);
+            }
 
             // 顶栏背景条:默认完全透明(null → 不拦截点击)。玻璃/液态玻璃档强制透明——
             // 玻璃染色层已承担压暗职责,再叠背景条会双重压暗。
@@ -209,97 +256,14 @@ namespace DesktopBar
             {
                 Height = 46 * Ui.Scale,
                 VerticalAlignment = VerticalAlignment.Top,
-                Background = ((S.PillMaterial == 3 || S.PillMaterial == 4) || S.BarBgOpacity <= 0.005)
+                Background = ((App.ActiveSettings.PillMaterial == 3 || App.ActiveSettings.PillMaterial == 4) || App.ActiveSettings.BarBgOpacity <= 0.005)
                     ? null
-                    : Ui.Brush(S.BarBgColor, S.BarBgOpacity)
+                    : Ui.Brush(App.ActiveSettings.BarBgColor, App.ActiveSettings.BarBgOpacity)
             };
             root.Children.Add(barBg);
 
-            var cols = new Grid();
-            cols.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            cols.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-            cols.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-
-            var left = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(10 * Ui.Scale, 0, 0, 0) };
-            // 右组不再加面板边距:每个模块自带 10px 右间距,最右胶囊到屏幕边缘正好也是 10px,与左侧一致。
-            var right = new StackPanel { Orientation = Orientation.Horizontal };
-            Grid.SetColumn(left, 0);
-            Grid.SetColumn(right, 2);
-            cols.Children.Add(left);
-            cols.Children.Add(right);
-
-            // 最左:雪花设置按钮 + 电源按钮。模块始终创建,显隐由 ApplyModuleVisibility 控制,
-            // 这样切换"模块显示"开关时不需要重建整条顶栏(重建会让所有胶囊闪一下)。
-            var settingsMod = new SettingsModule(S.SettingsBtn);
-            _modules.Add(settingsMod);
-            left.Children.Add(settingsMod);
-            _power = new PowerModule(S.SettingsBtn);
-            _modules.Add(_power);
-            left.Children.Add(_power);
-
-            // 此电脑：放在电源和回收站之间。显隐走 ShowThisPc(其余模块同款开关)。
-            _thisPc = new ThisPcModule(S.SettingsBtn);
-            _modules.Add(_thisPc);
-            left.Children.Add(_thisPc);
-
-            // 回收站：放在此电脑和小文件夹之间
-            _recycle = new RecycleBinModule(S.SettingsBtn);
-            _modules.Add(_recycle);
-            left.Children.Add(_recycle);
-
-            _folderStrip = new StackPanel { Orientation = Orientation.Horizontal };
-            left.Children.Add(_folderStrip);
-            ApplyFolderOrder();
-            WatchFolderRoot();
-
-            // 时间:靠右时跟随右侧内容,居中时覆盖完整顶栏宽度。
-            var clock = new ClockModule(S.Clock);
-            _modules.Add(clock);
-            Grid centeredClock = null;
-            if (S.TimeOnRight)
-            {
-                right.Children.Add(clock);
-            }
-            else
-            {
-                // 居中时间使用覆盖全窗口的独立网格，不能依赖左右内容的剩余列宽。
-                clock.HorizontalAlignment = HorizontalAlignment.Center;
-                clock.VerticalAlignment = VerticalAlignment.Top;
-                centeredClock = new Grid
-                {
-                    HorizontalAlignment = HorizontalAlignment.Stretch,
-                    VerticalAlignment = VerticalAlignment.Top
-                };
-                centeredClock.Children.Add(clock);
-            }
-
-            // 音乐
-            _music = new MusicModule(S.Music);
-            _modules.Add(_music);
-            if (S.TimeOnRight) right.Children.Insert(0, _music);
-            else right.Children.Add(_music);
-
-            var volume = new VolumeModule(S.SettingsBtn);
-            _modules.Add(volume);
-            _volume = volume;
-            right.Children.Add(volume);
-
-            // 实时音频频谱:插到右组最前,正好落在音乐播放器左边。
-            _spectrum = new SpectrumModule(S.Music);
-            _modules.Add(_spectrum);
-            right.Children.Insert(0, _spectrum);
-
-            // 性能监测:逐个插到右组最前,最终从左到右为 网络、内存、GPU、CPU,紧邻频谱左侧。
-            _perfNetwork = AddPerfModule(right, PerfMetric.Network);
-            _perfMemory = AddPerfModule(right, PerfMetric.Memory);
-            _perfGpu = AddPerfModule(right, PerfMetric.Gpu);
-            _perfCpu = AddPerfModule(right, PerfMetric.Cpu);
-
+            BuildBarModules(root);
             ApplyModuleVisibility();
-
-            root.Children.Add(cols);
-            if (centeredClock != null)
-                root.Children.Add(centeredClock);
             Content = root;
             App.Log("YukiDesk 主栏布局已构建");
             WireMedia();
@@ -313,11 +277,12 @@ namespace DesktopBar
             {
                 if (_closing || layoutVersion != _layoutVersion) return;
                 UpdateGlassClip();
+                if (IsOnSecondaryScreen) return;
                 var hwnd = new WindowInteropHelper(this).Handle;
-                if (S.ReserveDesktopSpace)
-                    DesktopSpaceService.Apply(S, hwnd);
+                if (App.ActiveSettings.ReserveDesktopSpace)
+                    DesktopSpaceService.Apply(App.ActiveSettings, hwnd);
                 else
-                    DesktopSpaceService.Apply(S);
+                    DesktopSpaceService.Apply(App.ActiveSettings);
             }));
         }
 
@@ -329,15 +294,27 @@ namespace DesktopBar
                 _modules.Remove(module);
             }
             _folderModules.Clear();
-            if (_folderStrip == null) return;
-            _folderStrip.Children.Clear();
+            if (_barLayout == null) return;
+            _folderEntries.Clear();
             foreach (var name in S.Folders)
             {
-                var folder = new FolderModule(name, S.Folder);
+                AddFolder(new FolderModule(name, S.Folder));
+            }
+            foreach (var path in S.LinkedFolders)
+            {
+                var trimmed = System.IO.Path.TrimEndingDirectorySeparator(path);
+                var name = System.IO.Path.GetFileName(trimmed);
+                AddFolder(new FolderModule(string.IsNullOrEmpty(name) ? trimmed : name, S.Folder, path));
+            }
+
+            UpdateLayoutEntries();
+
+            void AddFolder(FolderModule folder)
+            {
                 _folderModules.Add(folder);
                 _modules.Add(folder);
-                _folderStrip.Children.Add(folder);
-                SetModuleVisibility(folder, S.ShowFolders);
+                _folderEntries.Add(new BarLayoutPanel.Entry(folder, "folders", folder.FolderName));
+                SetModuleVisibility(folder, App.ActiveSettings.ShowFolders);
             }
         }
 
@@ -447,7 +424,8 @@ namespace DesktopBar
             {
                 var area = new Rect(bounds.X / ActualWidth, bounds.Y / imageHeight,
                     bounds.Width / ActualWidth, bounds.Height / imageHeight);
-                module.ApplyPillInk(GlassService.SurfaceLightness(pixels, width, height, area, look, opacity));
+                double lightness = GlassService.SurfaceLightness(pixels, width, height, area, look, opacity, out double spread);
+                module.ApplyPillInk(lightness, spread);
             }
         }
 
@@ -467,7 +445,7 @@ namespace DesktopBar
         private void UpdateGlassClip()
         {
             if (_closing) return;
-            if (S.PillMaterial != 3 && S.PillMaterial != 4) return;
+            if (App.ActiveSettings.PillMaterial != 3 && App.ActiveSettings.PillMaterial != 4) return;
             var root = Content as Grid;
             if (root == null) return;
             _pendingGlassPills.Clear();
@@ -529,14 +507,6 @@ namespace DesktopBar
             return true;
         }
 
-        private PerfModule AddPerfModule(StackPanel right, PerfMetric metric)
-        {
-            var module = new PerfModule(metric, S.SettingsBtn);
-            _modules.Add(module);
-            right.Children.Insert(0, module);
-            return module;
-        }
-
         /// <summary>
         /// 按"模块显示"设置显隐各模块。只改可见性、不重建顶栏,
         /// 供设置页的模块开关直接调用,避免整条胶囊重建带来的闪烁。
@@ -544,22 +514,24 @@ namespace DesktopBar
         public void ApplyModuleVisibility()
         {
             if (!CheckAccess()) { Dispatcher.BeginInvoke(new Action(ApplyModuleVisibility)); return; }
-            SetModuleVisibility(_power, S.ShowPower);
-            SetModuleVisibility(_thisPc, S.ShowThisPc);
-            SetModuleVisibility(_recycle, S.ShowRecycleBin);
+            SetModuleVisibility(_power, App.ActiveSettings.ShowPower);
+            SetModuleVisibility(_thisPc, App.ActiveSettings.ShowThisPc);
+            SetModuleVisibility(_recycle, App.ActiveSettings.ShowRecycleBin);
             foreach (var fm in _folderModules)
-                SetModuleVisibility(fm, S.ShowFolders);
-            SetModuleVisibility(_music, S.ShowMusic && _mediaAvailable);
+                SetModuleVisibility(fm, App.ActiveSettings.ShowFolders);
+            SetModuleVisibility(_music, App.ActiveSettings.ShowMusic && _mediaAvailable);
             if (_spectrum != null)
             {
-                _spectrum.Visibility = S.ShowSpectrum ? Visibility.Visible : Visibility.Collapsed;
-                _spectrum.SetSpectrumActive(S.ShowSpectrum);
+                _spectrum.Visibility = App.ActiveSettings.ShowSpectrum ? Visibility.Visible : Visibility.Collapsed;
+                _spectrum.SetSpectrumActive(App.ActiveSettings.ShowSpectrum);
             }
-            SetModuleVisibility(_volume, S.ShowVolume);
-            SetModuleVisibility(_perfCpu, S.ShowMonitorCpu);
-            SetModuleVisibility(_perfGpu, S.ShowMonitorGpu);
-            SetModuleVisibility(_perfMemory, S.ShowMonitorMemory);
-            SetModuleVisibility(_perfNetwork, S.ShowMonitorNetwork);
+            SetModuleVisibility(_volume, App.ActiveSettings.ShowVolume);
+            SetModuleVisibility(_battery, App.ActiveSettings.ShowBattery);
+            SetModuleVisibility(_perfCpu, App.ActiveSettings.ShowMonitorCpu && !App.ActiveSettings.CombinePerfModules);
+            SetModuleVisibility(_perfGpu, App.ActiveSettings.ShowMonitorGpu && !App.ActiveSettings.CombinePerfModules);
+            SetModuleVisibility(_perfMemory, App.ActiveSettings.ShowMonitorMemory && !App.ActiveSettings.CombinePerfModules);
+            SetModuleVisibility(_perfNetwork, App.ActiveSettings.ShowMonitorNetwork && !App.ActiveSettings.CombinePerfModules);
+            SetModuleVisibility(_perfSummary, App.ActiveSettings.CombinePerfModules && PerfModule.EnabledMetrics().Any());
         }
 
         /// <summary>立即关闭所有独立展开页，防止顶栏隐藏后留下可交互的置顶窗口。</summary>
@@ -605,17 +577,24 @@ namespace DesktopBar
             foreach (var module in _modules)
                 module.Dispose();
             _modules.Clear();
+            _coveredDemand.Clear();
             _folderModules.Clear();
+            _staticEntries.Clear();
+            _folderEntries.Clear();
+            _favoriteEntries.Clear();
+            _barLayout = null;
             _power = null;
             _thisPc = null;
             _recycle = null;
             _music = null;
             _spectrum = null;
             _volume = null;
+            _battery = null;
             _perfCpu = null;
             _perfGpu = null;
             _perfMemory = null;
             _perfNetwork = null;
+            _perfSummary = null;
         }
 
         private void WireMedia()
@@ -629,18 +608,19 @@ namespace DesktopBar
             if (_mediaLost != null) _media.SessionLost -= _mediaLost;
 
             var music = _music;
+            music?.UseMediaService(_media);
             _mediaHandler = info =>
             {
                 if (music == null || !ReferenceEquals(_music, music)) return;
                 music.Update(info);
-                _mediaAvailable = info.HasSession;
-                SetModuleVisibility(music, S.ShowMusic && _mediaAvailable);
+                _mediaAvailable = info.HasSession || !string.IsNullOrEmpty(S.PreferredMediaSource);
+                SetModuleVisibility(music, App.ActiveSettings.ShowMusic && _mediaAvailable);
             };
             _mediaLost = () =>
             {
-                _mediaAvailable = false;
+                _mediaAvailable = !string.IsNullOrEmpty(S.PreferredMediaSource);
                 if (music != null && ReferenceEquals(_music, music))
-                    SetModuleVisibility(music, false);
+                    SetModuleVisibility(music, App.ActiveSettings.ShowMusic && _mediaAvailable);
             };
             _media.Updated += _mediaHandler;
             _media.SessionLost += _mediaLost;

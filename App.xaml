@@ -92,13 +92,13 @@
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="TextBox">
-                        <Border x:Name="B" CornerRadius="18"
+                        <ui:CapsuleBorder x:Name="B"
                                 Background="{TemplateBinding Background}"
                                 BorderBrush="{TemplateBinding BorderBrush}"
                                 BorderThickness="{TemplateBinding BorderThickness}">
                             <ScrollViewer x:Name="PART_ContentHost" Margin="{TemplateBinding Padding}"
                                           VerticalAlignment="Center"/>
-                        </Border>
+                        </ui:CapsuleBorder>
                         <ControlTemplate.Triggers>
                             <Trigger Property="IsKeyboardFocused" Value="True">
                                 <Setter TargetName="B" Property="BorderBrush" Value="{DynamicResource SettingsAccent}"/>
@@ -202,28 +202,32 @@
             </Setter>
         </Style>
 
-        <!-- 半透明按钮（顶栏展开页用：与右键菜单行同款玻璃底，静置16%/悬停30%/按下38%） -->
+        <!-- 电源面板及其他胶囊按钮共用的半透明样式。 -->
         <Style x:Key="BtnGlass" TargetType="Button">
             <Setter Property="Foreground" Value="{DynamicResource ThemePanelText}"/>
             <Setter Property="Cursor" Value="Hand"/>
             <Setter Property="FontSize" Value="13.5"/>
             <Setter Property="FontWeight" Value="SemiBold"/>
             <Setter Property="MinHeight" Value="36"/>
+            <Setter Property="Padding" Value="14,6"/>
             <Setter Property="HorizontalContentAlignment" Value="Center"/>
             <Setter Property="VerticalContentAlignment" Value="Center"/>
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="Button">
-                        <Border x:Name="B" CornerRadius="18" Background="{DynamicResource ThemePanelHover}" Padding="14,6">
+                        <ui:CapsuleBorder x:Name="B" Background="{DynamicResource ThemePanelHover}" Padding="{TemplateBinding Padding}">
                             <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
                                               VerticalAlignment="{TemplateBinding VerticalContentAlignment}"/>
-                        </Border>
+                        </ui:CapsuleBorder>
                         <ControlTemplate.Triggers>
                             <Trigger Property="IsMouseOver" Value="True">
                                 <Setter TargetName="B" Property="Background" Value="{DynamicResource ThemePanelSelected}"/>
                             </Trigger>
                             <Trigger Property="IsPressed" Value="True">
                                 <Setter TargetName="B" Property="Background" Value="{DynamicResource ThemePanelSelected}"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter TargetName="B" Property="Opacity" Value="0.45"/>
                             </Trigger>
                         </ControlTemplate.Triggers>
                     </ControlTemplate>
@@ -260,26 +264,8 @@
             </Setter>
         </Style>
 
-        <!-- 危险操作仍保留红色语义，但使用半透明玻璃底。 -->
         <Style x:Key="BtnThemeDanger" TargetType="Button" BasedOn="{StaticResource BtnTheme}">
-            <Setter Property="Template">
-                <Setter.Value>
-                    <ControlTemplate TargetType="Button">
-                        <Border x:Name="B" CornerRadius="18" Background="#C9E5484D" Padding="14,6">
-                            <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
-                                              VerticalAlignment="{TemplateBinding VerticalContentAlignment}"/>
-                        </Border>
-                        <ControlTemplate.Triggers>
-                            <Trigger Property="IsMouseOver" Value="True">
-                                <Setter TargetName="B" Property="Background" Value="#E5F0595E"/>
-                            </Trigger>
-                            <Trigger Property="IsPressed" Value="True">
-                                <Setter TargetName="B" Property="Background" Value="#A8C93A40"/>
-                            </Trigger>
-                        </ControlTemplate.Triggers>
-                    </ControlTemplate>
-                </Setter.Value>
-            </Setter>
+            <Setter Property="FontWeight" Value="Bold"/>
         </Style>
 
         <!-- 关闭按钮 -->

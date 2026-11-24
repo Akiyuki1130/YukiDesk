@@ -1,77 +1,113 @@
 using System;
 using System.Windows;
+using System.Windows.Automation;
 using System.Windows.Controls;
-using System.Windows.Input;
 using System.Windows.Media;
-using DesktopBar.Services;
 
 namespace DesktopBar.UI
 {
-    /// <summary>暗色风格的小输入对话框,返回输入内容(取消返回 null)。</summary>
     public static class Prompt
     {
         public static string Show(string title, string label, string initial)
         {
-            string result = null;
-            bool ok = false;
+            var box = Field(label, initial, out var field);
+            return ShowInput(title, field, box, () => null) && !string.IsNullOrWhiteSpace(box.Text)
+                ? box.Text.Trim()
+                : null;
+        }
 
+        internal static TimeSpan? ShowCountdown()
+        {
+            var minutes = Field("分钟", "5", out var minuteField);
+            var seconds = Field("秒", "0", out var secondField);
+            var fields = new Grid();
+            fields.ColumnDefinitions.Add(new ColumnDefinition());
+            fields.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(12) });
+            fields.ColumnDefinitions.Add(new ColumnDefinition());
+            Grid.SetColumn(secondField, 2);
+            fields.Children.Add(minuteField);
+            fields.Children.Add(secondField);
+
+            TimeSpan duration = default;
+            bool accepted = ShowInput("倒计时", fields, minutes, () =>
+                TryCountdownDuration(minutes.Text, seconds.Text, out duration)
+                    ? null : "请输入 1 秒到 720 分钟，秒数为 0–59。");
+            return accepted ? duration : null;
+        }
+
+        internal static bool TryCountdownDuration(string minuteText, string secondText, out TimeSpan duration)
+        {
+            duration = default;
+            if (!int.TryParse(minuteText, out int minutes) || minutes is < 0 or > 720
+                || !int.TryParse(secondText, out int seconds) || seconds is < 0 or > 59)
+                return false;
+            int totalSeconds = minutes * 60 + seconds;
+            if (totalSeconds is < 1 or > 720 * 60) return false;
+            duration = TimeSpan.FromSeconds(totalSeconds);
+            return true;
+        }
+
+        private static TextBox Field(string label, string initial, out StackPanel field)
+        {
+            var text = new TextBlock { Text = label, FontSize = 14 };
+            text.SetResourceReference(TextBlock.ForegroundProperty, "ThemePanelText");
             var box = new TextBox
             {
                 Style = (Style)Application.Current.FindResource("DarkBox"),
                 Text = initial ?? "",
-                Margin = new Thickness(0, 12, 0, 0),
+                Margin = new Thickness(0, 6, 0, 0),
                 FontSize = 14
             };
+            AutomationProperties.SetName(box, label);
             box.SetResourceReference(TextBox.ForegroundProperty, "ThemePanelText");
             box.SetResourceReference(TextBox.CaretBrushProperty, "ThemePanelText");
             box.SetResourceReference(TextBox.BackgroundProperty, "ThemePanelHover");
             box.SetResourceReference(TextBox.BorderBrushProperty, "ThemePanelBorder");
+            field = new StackPanel();
+            field.Children.Add(text);
+            field.Children.Add(box);
+            return box;
+        }
 
-            var btnCancel = new Button
+        private static bool ShowInput(string title, FrameworkElement fields, TextBox first, Func<string> validate)
+        {
+            var titleText = new TextBlock
             {
-                Content = "取消",
-                Style = (Style)Application.Current.FindResource("BtnTheme"),
-                IsCancel = true,
-                Margin = new Thickness(0, 18, 8, 0)
+                Text = title,
+                FontSize = 17,
+                FontWeight = FontWeights.Bold,
+                Margin = new Thickness(0, 0, 0, 15)
             };
-            var btnOk = new Button
-            {
-                Content = "确定",
-                Style = (Style)Application.Current.FindResource("BtnTheme"),
-                IsDefault = true,
-                Margin = new Thickness(0, 18, 0, 0)
-            };
-            btnCancel.Click += (s, e) => ((Window)btnCancel.Tag).Close();
-            btnOk.Click += (s, e) => { ok = true; ((Window)btnOk.Tag).Close(); };
-
-            var btnRow = new StackPanel
+            titleText.SetResourceReference(TextBlock.ForegroundProperty, "ThemePanelText");
+            var error = new TextBlock { Margin = new Thickness(0, 10, 0, 0), Visibility = Visibility.Collapsed,
+                FontWeight = FontWeights.Bold };
+            error.SetResourceReference(TextBlock.ForegroundProperty, "ThemePanelText");
+            var buttonStyle = (Style)Application.Current.FindResource("BtnTheme");
+            var cancel = new Button { Content = "取消", Style = buttonStyle, IsCancel = true, Margin = new Thickness(0, 0, 8, 0) };
+            var ok = new Button { Content = "确定", Style = buttonStyle, IsDefault = true };
+            var buttons = new StackPanel
             {
                 Orientation = Orientation.Horizontal,
-                HorizontalAlignment = HorizontalAlignment.Right
+                HorizontalAlignment = HorizontalAlignment.Right,
+                Margin = new Thickness(0, 18, 0, 0)
             };
-            btnRow.Children.Add(btnCancel);
-            btnRow.Children.Add(btnOk);
+            buttons.Children.Add(cancel);
+            buttons.Children.Add(ok);
 
-            var body = new StackPanel { Margin = new Thickness(22) };
-            var labelText = new TextBlock
-            {
-                Text = label,
-                FontSize = 14
-            };
-            labelText.SetResourceReference(TextBlock.ForegroundProperty, "ThemePanelText");
-            body.Children.Add(labelText);
-            body.Children.Add(box);
-            body.Children.Add(btnRow);
-
+            var body = new StackPanel();
+            body.Children.Add(titleText);
+            body.Children.Add(fields);
+            body.Children.Add(error);
+            body.Children.Add(buttons);
             var card = new Border
             {
-                CornerRadius = new CornerRadius(12),
+                CornerRadius = new CornerRadius(26),
                 BorderThickness = new Thickness(1),
+                Padding = new Thickness(22),
                 Child = body
             };
-            card.SetResourceReference(Border.BackgroundProperty, "ThemePanelBackground");
-            card.SetResourceReference(Border.BorderBrushProperty, "ThemePanelBorder");
-            var w = new Window
+            PopupPalette.Apply(card, dialog: true);
+            var window = new Window
             {
                 FontFamily = Ui.TextFont,
                 FontWeight = FontWeights.SemiBold,
@@ -87,16 +123,18 @@ namespace DesktopBar.UI
                 ShowInTaskbar = false,
                 Content = card
             };
-            btnCancel.Tag = w;
-            btnOk.Tag = w;
-            w.Loaded += (s, e) => { box.Focus(); box.SelectAll(); };
-            w.ShowDialog();
-
-            if (ok) result = box.Text?.Trim();
-            // 确定+空输入与取消同样返回 null:所有调用方都是"名称"类输入,
-            // 空值按取消静默处理,避免"名称无效"之类误报。
-            if (string.IsNullOrWhiteSpace(result)) return null;
-            return result;
+            ok.Click += (_, _) =>
+            {
+                string message = validate();
+                if (message == null) window.DialogResult = true;
+                else
+                {
+                    error.Text = message;
+                    error.Visibility = Visibility.Visible;
+                }
+            };
+            window.Loaded += (_, _) => { first.Focus(); first.SelectAll(); };
+            return window.ShowDialog() == true;
         }
     }
 }

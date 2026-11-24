@@ -58,8 +58,7 @@ namespace DesktopBar.UI
             UpdateShaderValue(TexHProperty);
             UpdateShaderValue(SharpUvProperty);
             UpdateShaderValue(EdgeWidthProperty);
-            if (panel) UpdateShaderValue(PanelAspectProperty);
-            else _pillGeometry = new PillGlassGeometry();
+            if (!panel) _pillGeometry = new PillGlassGeometry();
         }
 
         private static readonly DependencyProperty SharpUvProperty = DependencyProperty.Register(
@@ -72,16 +71,11 @@ namespace DesktopBar.UI
             "EdgeWidth", typeof(double), typeof(LiquidGlassEffect),
             new UIPropertyMetadata(6.0, PixelShaderConstantCallback(9)));
 
-        private static readonly DependencyProperty PanelAspectProperty = DependencyProperty.Register(
-            "PanelAspect", typeof(Point), typeof(LiquidGlassEffect),
-            new UIPropertyMetadata(new Point(1, 1), PixelShaderConstantCallback(10)));
-
         private static readonly DependencyProperty LiftProperty = DependencyProperty.Register(
             "Lift", typeof(double), typeof(LiquidGlassEffect),
             new UIPropertyMetadata(0.0, PixelShaderConstantCallback(11)));
 
         internal double Lift { set { SetValue(LiftProperty, value); } }
-        internal Point PanelAspect { set { SetValue(PanelAspectProperty, value); } }
         internal Point4D SharpUv { set { SetValue(SharpUvProperty, value); } }
         internal Point4D Tint { set { SetValue(TintProperty, value); } }
         internal double EdgeWidth { set { SetValue(EdgeWidthProperty, value); } }
@@ -213,12 +207,11 @@ float pEdgeWidth : register(c9);
             if (panel)
             {
                 sb.AppendLine(@"
-float2 pPanelAspect : register(c10);
 float field(float2 p)
 {
-    float2 halfSize = float2(pTexW, pTexH) * 0.5 / pPanelAspect;
+    float2 halfSize = float2(pTexW, pTexH) * 0.5;
     float radius = min(pRadius, min(halfSize.x, halfSize.y));
-    float2 q = abs(p / pPanelAspect - halfSize) - halfSize + radius;
+    float2 q = abs(p - halfSize) - halfSize + radius;
     return length(max(q, 0)) + min(max(q.x, q.y), 0) - radius;
 }");
             }

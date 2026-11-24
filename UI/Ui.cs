@@ -1,12 +1,8 @@
 using System;
-using System.IO;
-using System.Drawing.Text;
-using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
 using System.Windows.Shapes;
-using Path = System.IO.Path;
 
 namespace DesktopBar.UI
 {
@@ -52,30 +48,6 @@ namespace DesktopBar.UI
                 canvas.Children.Add(tip);
             }
             return new Viewbox { Width = size, Height = size, Child = canvas, Stretch = Stretch.Uniform };
-        }
-
-        internal static void ApplyTrayFont(System.Windows.Forms.ContextMenuStrip menu)
-        {
-            var fonts = new PrivateFontCollection();
-            try
-            {
-                // WinForms 不能沿用 WPF 的字体资源路径，单独加载进程内字体。
-                fonts.AddFontFile(Path.Combine(AppContext.BaseDirectory, FontDirectory, "ResourceHanRoundedSC-Regular.ttf"));
-                var families = fonts.Families;
-                var font = new System.Drawing.Font(families[0], menu.Font.SizeInPoints);
-                menu.Font = font;
-                menu.Disposed += (s, e) =>
-                {
-                    font.Dispose();
-                    foreach (var family in families) family.Dispose();
-                    fonts.Dispose();
-                };
-            }
-            catch (Exception ex) when (ex is ArgumentException or IOException or ExternalException)
-            {
-                fonts.Dispose();
-                App.Log("托盘字体加载失败: " + ex.Message);
-            }
         }
 
         internal static Grid SliderWithValue(Slider slider, TextBlock value, double valueWidth, bool panel = false)

@@ -62,6 +62,7 @@ dotnet build -c Release
 
 ## 第三方组件
 
+- 小文件夹的拼音首字母索引采用 [Unicode 17.0.0 Unihan](https://www.unicode.org/Public/17.0.0/ucd/) 的普通话读音数据，随安装包提供 [Unicode 许可](Assets/Search/Unihan-LICENSE.txt)。
 - [资源圆体（Resource Han Rounded SC）](https://github.com/CyanoHao/Resource-Han-Rounded) 随应用分发，详见 [SIL Open Font License 1.1](Assets/Fonts/ResourceHanRounded-OFL.txt)。
 - [PawnIO](https://github.com/namazso/PawnIO) 是可选运行时，用于部分 AMD 平台的原生 CPU 温度。应用按需从官方发行版下载并校验签名。
 - 内置 AMDFamily17 模块来自 [PawnIO.Modules](https://github.com/namazso/PawnIO.Modules)，二进制取自 [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) 的资源，适用 LGPL-2.1。

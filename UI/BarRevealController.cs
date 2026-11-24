@@ -27,6 +27,10 @@ namespace DesktopBar.UI
         private long _pointerUntil, _hotkeyUntil;
         private long _prepareUntil;
         private TimeSpan? _firstPreparationFrame;
+        private System.Windows.Forms.Screen _revealScreen;
+        private string _lastEdgeScreen;
+        private readonly bool[] _folderRegistrations = new bool[3];
+        private string _pendingFolder;
 
         internal bool IsRaised { get; private set; }
         internal bool IsHotkeyRegistered => _hotkeyId != 0;
@@ -50,6 +54,20 @@ namespace DesktopBar.UI
             SetEdgeEnabled(settings.RevealOnTopEdge);
             if (settings.RevealWithHotkey && !TrySetHotkey(true, BarHotkey.FromSettings(settings)))
                 App.Log("顶栏唤出快捷键注册失败");
+            for (int slot = 0; slot < _folderRegistrations.Length; slot++)
+                if (!string.IsNullOrEmpty(settings.FolderShortcuts[slot])) SetFolderShortcut(slot, true);
+        }
+
+        internal bool SetFolderShortcut(int slot, bool enabled)
+        {
+            if (_source == null || (uint)slot >= _folderRegistrations.Length) return false;
+            if (_folderRegistrations[slot] == enabled) return true;
+            int id = 10 + slot;
+            if (enabled && !NativeMethods.RegisterHotKey(_source.Handle, id,
+                    (uint)(ModifierKeys.Control | ModifierKeys.Alt) | NativeMethods.MOD_NOREPEAT, 0x31u + (uint)slot)) return false;
+            if (!enabled) NativeMethods.UnregisterHotKey(_source.Handle, id);
+            _folderRegistrations[slot] = enabled;
+            return true;
         }
 
         internal void SetEdgeEnabled(bool enabled)
@@ -96,14 +114,36 @@ namespace DesktopBar.UI
 
         private IntPtr OnMessage(IntPtr hwnd, int message, IntPtr wParam, IntPtr lParam, ref bool handled)
         {
-            if (message != NativeMethods.WM_HOTKEY || _hotkeyId == 0 || wParam.ToInt32() != _hotkeyId) return IntPtr.Zero;
+            if (message != NativeMethods.WM_HOTKEY) return IntPtr.Zero;
+            int slot = wParam.ToInt32() - 10;
+            if ((uint)slot < _folderRegistrations.Length && _folderRegistrations[slot])
+            {
+                string path = App.Settings.FolderShortcuts[slot];
+                if (!string.IsNullOrEmpty(path) && App.ActiveSettings.ShowFolders)
+                {
+                    var screen = PointerScreen();
+                    if (!IsRaised && _bar.IsVisible && (screen == null || screen.Primary) && !_bar.IsAnyCapsuleCovered(hwnd))
+                        _bar.OpenFolderShortcut(path);
+                    else
+                    {
+                        _pendingFolder = path;
+                        _hotkeyAfterShowMs = App.ActiveSettings.RevealDurationSeconds * 1000;
+                        Raise(screen);
+                        if (!_preparing && !_showing && !_dismissing) UsePendingFolder();
+                    }
+                }
+                handled = true;
+                return IntPtr.Zero;
+            }
+            if (_hotkeyId == 0 || wParam.ToInt32() != _hotkeyId) return IntPtr.Zero;
             handled = true;
             if (CaptureHotkey != null) CaptureHotkey(_hotkey);
             else
             {
-                if (!IsRaised && _bar.IsVisible && !_bar.IsAnyCapsuleCovered(hwnd)) return IntPtr.Zero;
-                _hotkeyAfterShowMs = App.Settings.RevealDurationSeconds * 1000;
-                Raise();
+                var screen = PointerScreen();
+                if (!IsRaised && _bar.IsVisible && (screen == null || screen.Primary) && !_bar.IsAnyCapsuleCovered(hwnd)) return IntPtr.Zero;
+                _hotkeyAfterShowMs = App.ActiveSettings.RevealDurationSeconds * 1000;
+                Raise(screen);
                 if (IsRaised && !_preparing && !_showing) StartHotkeyCountdown();
             }
             return IntPtr.Zero;
@@ -112,9 +152,18 @@ namespace DesktopBar.UI
         private void Tick(object sender, EventArgs args)
         {
             long now = Environment.TickCount64;
-            bool onPrimary = NativeMethods.TryGetCursorPosition(out int x, out int y)
-                && x >= 0 && x < NativeMethods.ScreenWidth() && y >= 0;
-            if (!_edgeEnabled || !onPrimary || y != 0)
+            bool pointerValid = NativeMethods.TryGetCursorPosition(out int x, out int y);
+            var cursor = new System.Drawing.Point(x, y);
+            var screen = ResolveRevealScreen(cursor, pointerValid);
+            var bounds = screen.Bounds;
+            bool atEdge = pointerValid && bounds.Contains(cursor) && y == bounds.Top;
+            if (_lastEdgeScreen != screen.DeviceName)
+            {
+                _lastEdgeScreen = screen.DeviceName;
+                _edgeEnteredAt = null;
+                _edgeChecked = false;
+            }
+            if (!_edgeEnabled || !atEdge)
             {
                 _edgeEnteredAt = null;
                 _edgeChecked = false;
@@ -122,20 +171,22 @@ namespace DesktopBar.UI
             else if (!_edgeReveal && !_edgeChecked)
             {
                 _edgeEnteredAt ??= now;
-                if (now - _edgeEnteredAt.Value >= App.Settings.RevealEdgeDwellMs)
+                if (now - _edgeEnteredAt.Value >= App.ActiveSettings.RevealEdgeDwellMs)
                 {
                     _edgeChecked = true;
-                    if (IsRaised || !_bar.IsVisible || _bar.IsAnyCapsuleCovered(_source.Handle))
+                    if ((IsRaised || !screen.Primary || !_bar.IsVisible || _bar.IsAnyCapsuleCovered(_source.Handle))
+                        && !NativeMethods.ForegroundMatches(App.Settings.EdgeExcludedApps))
                     {
                         _edgeReveal = true;
                         _pointerUntil = now + PointerGraceMs;
-                        Raise();
+                        Raise(screen);
                     }
                 }
             }
 
             if (!IsRaised || _preparing) return;
-            bool insideEdgeBand = _edgeReveal && onPrimary && y < NativeMethods.WindowBottom(_source.Handle);
+            bool insideEdgeBand = _edgeReveal && pointerValid && (_revealScreen?.Bounds ?? bounds).Contains(cursor)
+                && y < NativeMethods.WindowBottom(_source.Handle);
             if (insideEdgeBand || _bar.HasRevealInteraction)
                 _pointerUntil = now + PointerGraceMs;
 
@@ -147,7 +198,20 @@ namespace DesktopBar.UI
                 Animate(show: false);
         }
 
-        private void Raise()
+        private static System.Windows.Forms.Screen PointerScreen()
+            => ResolveRevealScreen(System.Windows.Forms.Cursor.Position, true);
+
+        private static System.Windows.Forms.Screen ResolveRevealScreen(System.Drawing.Point cursor, bool valid)
+        {
+            var name = App.ActiveSettings.RevealDisplayName;
+            if (!string.IsNullOrEmpty(name))
+                foreach (var screen in System.Windows.Forms.Screen.AllScreens)
+                    if (screen.DeviceName == name) return screen;
+            if (App.ActiveSettings.RevealOnPointerScreen && valid) return System.Windows.Forms.Screen.FromPoint(cursor);
+            return System.Windows.Forms.Screen.PrimaryScreen;
+        }
+
+        private void Raise(System.Windows.Forms.Screen screen)
         {
             if (!IsRaised)
             {
@@ -155,6 +219,8 @@ namespace DesktopBar.UI
                 IsRaised = true;
                 _preparing = true;
                 _bar.Opacity = 0;
+                _revealScreen = screen;
+                _bar.PlaceRevealOn(screen);
                 if (_wasHidden) _bar.ShowForReveal();
                 _firstPreparationFrame = null;
                 CompositionTarget.Rendering += OnPreparationRendering;
@@ -181,12 +247,13 @@ namespace DesktopBar.UI
             await Task.Run(NativeMethods.WaitComposition);
             if (!_preparing || version != _animationVersion) return;
 
-            bool covered = _bar.IsAnyCapsuleCovered(_source.Handle);
+            bool covered = !_bar.IsOnSecondaryScreen && _bar.IsAnyCapsuleCovered(_source.Handle);
             if (!NativeMethods.SetWindowTopmost(_source.Handle, true))
             {
                 FinishDismiss();
                 return;
             }
+            if (_bar.IsOnSecondaryScreen) { FinishPreparation(); return; }
             // 置顶后才开始等待新帧。逐窗口采样只会读取顶栏下方的窗口。
             GlassService.PrepareRevealBackdrop(covered);
             _prepareUntil = Environment.TickCount64 + GlassPreparationMs;
@@ -204,10 +271,11 @@ namespace DesktopBar.UI
         {
             StopPreparationRendering();
             _preparing = false;
-            GlassService.UseTintIfRevealFrameMissing();
+            if (!_bar.IsOnSecondaryScreen) GlassService.UseTintIfRevealFrameMissing();
+            _bar.RefreshModuleDemandNow();
             if (_edgeReveal) _pointerUntil = Environment.TickCount64 + PointerGraceMs;
             Animate(show: true);
-            if (!_showing) StartHotkeyCountdown();
+            if (!_showing) { StartHotkeyCountdown(); UsePendingFolder(); }
         }
 
         private void StopPreparationRendering()
@@ -249,6 +317,7 @@ namespace DesktopBar.UI
                 {
                     _showing = false;
                     StartHotkeyCountdown();
+                    UsePendingFolder();
                 }
                 else FinishDismiss();
             };
@@ -260,6 +329,15 @@ namespace DesktopBar.UI
             if (_hotkeyAfterShowMs == 0) return;
             _hotkeyUntil = Environment.TickCount64 + _hotkeyAfterShowMs;
             _hotkeyAfterShowMs = 0;
+        }
+
+        private void UsePendingFolder()
+        {
+            if (_pendingFolder == null) return;
+            string path = _pendingFolder;
+            _pendingFolder = null;
+            StartHotkeyCountdown();
+            _bar.OpenFolderShortcut(path);
         }
 
         private void FinishDismiss()
@@ -282,12 +360,20 @@ namespace DesktopBar.UI
             StopPreparationRendering();
             IsRaised = _preparing = _showing = _dismissing = _edgeReveal = false;
             _edgeEnteredAt = null;
+            _pendingFolder = null;
             _hotkeyAfterShowMs = 0;
             _pointerUntil = _hotkeyUntil = 0;
             NativeMethods.SetWindowTopmost(_source.Handle, false);
             GlassService.SetBarRevealed(false);
             _bar.BeginAnimation(UIElement.OpacityProperty, null);
+            _bar.PlaceRevealOn(null);
+            _revealScreen = null;
             UpdateTimer();
+        }
+
+        internal void ResetForDisplayChange()
+        {
+            if (IsRaised) FinishDismiss();
         }
 
         private void UpdateTimer() => _timer.IsEnabled = _edgeEnabled || IsRaised;
@@ -301,6 +387,7 @@ namespace DesktopBar.UI
             if (_source != null)
             {
                 UnregisterHotkey();
+                for (int slot = 0; slot < _folderRegistrations.Length; slot++) SetFolderShortcut(slot, false);
                 _source.RemoveHook(OnMessage);
                 _source = null;
             }

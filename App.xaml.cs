@@ -1,7 +1,9 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Threading;
 using System.Windows;
+using System.Windows.Controls.Primitives;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
 using System.Windows.Threading;
@@ -16,6 +18,9 @@ namespace DesktopBar
     {
         private static Mutex _mutex;
         public static AppSettings Settings;
+        internal static volatile AppSettings SceneSettings;
+        internal static AppSettings ActiveSettings => SceneSettings ?? Settings;
+        internal static bool IsSettingsOpen => _settingsWin?.IsVisible == true;
         public static MainWindow Bar;
         private static SettingsWindow _settingsWin;
         private static readonly object LogGate = new object();
@@ -23,6 +28,7 @@ namespace DesktopBar
         private static Mutex _logMutex;
         private Forms.NotifyIcon _tray;
         private Icon _trayIcon;
+        private Popup _trayFlyout;
 
         public static string AppDataDir => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "YukiDesk");
         public static void Log(string msg)
@@ -239,9 +245,17 @@ namespace DesktopBar
             catch { }
         }
 
+        private bool _filePreviewWorker;
+
         protected override void OnStartup(StartupEventArgs e)
         {
             base.OnStartup(e);
+            if (e.Args.Length == 2 && e.Args[0] == Services.FilePreview.WorkerArgument)
+            {
+                _filePreviewWorker = true;
+                Shutdown(Services.FilePreview.RunWorker(e.Args[1]));
+                return;
+            }
             // 全局异常兜底必须在 --tempslave 分支之前注册:从属进程没有任何 UI,漏注册就完全失声。
             DispatcherUnhandledException += (s, args) =>
             {
@@ -427,23 +441,55 @@ namespace DesktopBar
                 Icon = _trayIcon ?? System.Drawing.SystemIcons.Application,
                 Visible = true
             };
-            var menu = new Forms.ContextMenuStrip();
-            UI.Ui.ApplyTrayFont(menu);
-            menu.Items.Add("打开设置", null, (s, e) => Dispatcher.BeginInvoke(new Action(ShowSettings)));
-            menu.Items.Add("显示/隐藏顶栏", null, (s, e) => Dispatcher.BeginInvoke(new Action(() =>
+            _tray.MouseClick += (_, e) =>
             {
-                if (Bar.Visibility == Visibility.Visible) Bar.HideWithPanels();
-                else Bar.Show();
-            })));
-            menu.Items.Add("打开数据目录", null, (s, e) => Dispatcher.BeginInvoke(new Action(() => UI.ShellOpen.OpenPath(Settings.StorageRoot))));
-            menu.Items.Add(new Forms.ToolStripSeparator());
-            menu.Items.Add("退出", null, (s, e) => Dispatcher.BeginInvoke(new Action(Shutdown)));
-            _tray.ContextMenuStrip = menu;
-            _tray.MouseClick += (s, e) => { if (e.Button == Forms.MouseButtons.Left) Dispatcher.BeginInvoke(new Action(ShowSettings)); };
+                if (e.Button == Forms.MouseButtons.Left) Dispatcher.BeginInvoke(new Action(ShowSettings));
+                if (e.Button == Forms.MouseButtons.Right) Dispatcher.BeginInvoke(new Action(ShowTrayMenu));
+            };
+        }
+
+        private void ShowTrayMenu()
+        {
+            ShowTrayFlyout(new[]
+            {
+                new UI.FlyoutItem("打开设置", ShowSettings),
+                new UI.FlyoutItem("常用项 ›", () => ShowTrayFlyout(UI.DesktopActions.FavoriteItems(), "常用项")),
+                new UI.FlyoutItem("顶栏预设 ›", ShowTrayPresets),
+                new UI.FlyoutItem(Bar.IsVisible ? "隐藏顶栏" : "显示顶栏", () =>
+                {
+                    if (Bar.IsVisible) Bar.HideWithPanels();
+                    else Bar.Show();
+                }),
+                new UI.FlyoutItem("打开数据目录", () => UI.ShellOpen.OpenPath(Settings.StorageRoot)),
+                new UI.FlyoutItem("退出", Shutdown)
+            }, "YukiDesk");
+        }
+
+        private void ShowTrayPresets()
+        {
+            var items = new List<UI.FlyoutItem>();
+            if (Bar.ActiveSceneName is string scene)
+                items.Add(new UI.FlyoutItem("当前临时预设 · " + scene, enabled: false));
+            foreach (var preset in Settings.DesktopPresets)
+                items.Add(new UI.FlyoutItem(preset.Name, () => DesktopPresets.Apply(preset)));
+            items.Add(new UI.FlyoutItem("管理预设…", () => ShowSettingsPage("Modules")));
+            ShowTrayFlyout(items, "顶栏预设");
+        }
+
+        private void ShowTrayFlyout(IReadOnlyList<UI.FlyoutItem> items, string title)
+        {
+            if (_trayFlyout != null) _trayFlyout.IsOpen = false;
+            _trayFlyout = UI.FlyoutMenu.Show(items, title);
         }
 
         protected override void OnExit(ExitEventArgs e)
         {
+            if (_filePreviewWorker)
+            {
+                base.OnExit(e);
+                return;
+            }
+            AwakeSession.Stop();
             // 退出过程留痕:自检(--glassperf/--glassshot)结束时会对比这两行的落盘顺序,
             // 判断"进程是正常走完拆解"还是"在拆解途中被原生层带走"。
             try { Log("YukiDesk 退出开始,代码=" + e.ApplicationExitCode); } catch { }
@@ -461,7 +507,8 @@ namespace DesktopBar
             // 玻璃捕获线程引用主窗几何与位图,必须在主窗 Close 之前停(下一位就是 Restore/Close)。
             step("玻璃服务", () => Services.GlassService.Stop());
             step("AppBar还原", () => DesktopSpaceService.Restore());
-            try { if (_tray != null) { _tray.Visible = false; _tray.ContextMenuStrip?.Dispose(); _tray.Dispose(); } } catch { }
+            try { if (_trayFlyout != null) _trayFlyout.IsOpen = false; } catch { }
+            try { if (_tray != null) { _tray.Visible = false; _tray.Dispose(); } } catch { }
             try { _trayIcon?.Dispose(); } catch { }
             try { Bar?.ClosePanels(); } catch { }
             try { Bar?.Close(); } catch { }
@@ -575,6 +622,7 @@ namespace DesktopBar
         }
         public static void ShowSettings()
         {
+            Bar?.EndAppSceneForSettings();
             Bar?.ClosePanels();
             if (_settingsWin != null)
             {
@@ -595,6 +643,15 @@ namespace DesktopBar
             w.Topmost = false;
             PlayOpenAnimation(w);
         }
+
+        internal static void ShowSettingsPage(string page)
+        {
+            ShowSettings();
+            _settingsWin?.NavigateTo(page);
+        }
+
+        internal static void NotifyTimerDone() => (Current as App)?._tray?.ShowBalloonTip(
+            4500, "YukiDesk 倒计时", "设定时间已到。", Forms.ToolTipIcon.Info);
 
         /// <summary>设置窗口打开动画:整窗淡入 + 上浮归位 + 内容轻微缩放。</summary>
         private static void PlayOpenAnimation(SettingsWindow w)

@@ -61,7 +61,21 @@ namespace DesktopBar.Services
         private int _users;
         private Thread _thread;
         private CancellationTokenSource _cancellation;
-        private PerfSample _latest;
+        private bool _initialSampleRequested;
+        private int _consecutiveFailures;
+        private long _retryNotBefore;
+        private volatile PerfSample _latest;
+        private readonly Queue<(long Time, PerfSample Sample)> _history = new();
+
+        internal (long Time, PerfSample Sample)[] RecentSamples()
+        {
+            long cutoff = Environment.TickCount64 - 60000;
+            lock (_gate)
+            {
+                while (_history.Count > 0 && _history.Peek().Time < cutoff) _history.Dequeue();
+                return _history.ToArray();
+            }
+        }
 
         /// <summary>最近一次采样快照(采样线程写入,读取方只读)。</summary>
         public PerfSample Latest => _latest;
@@ -70,6 +84,16 @@ namespace DesktopBar.Services
         public event Action<PerfSample> Updated;
 
         private PerfService() { }
+
+        internal void RequestInitialSample()
+        {
+            lock (_gate)
+            {
+                if (_latest != null || _initialSampleRequested) return;
+                _initialSampleRequested = true;
+                StartWorkerLocked();
+            }
+        }
 
         public void AddRef()
         {
@@ -86,7 +110,7 @@ namespace DesktopBar.Services
             lock (_gate)
             {
                 _users = Math.Max(0, _users - 1);
-                if (_users == 0) cancellation = _cancellation;
+                if (_users == 0 && !_initialSampleRequested) cancellation = _cancellation;
             }
             try { cancellation?.Cancel(); }
             catch (ObjectDisposedException) { }
@@ -94,7 +118,7 @@ namespace DesktopBar.Services
 
         private void StartWorkerLocked()
         {
-            if (_users <= 0 || _thread != null) return;
+            if ((_users <= 0 && !_initialSampleRequested) || _thread != null) return;
             _cancellation?.Dispose();
             _cancellation = new CancellationTokenSource();
             var cancellation = _cancellation;
@@ -112,9 +136,13 @@ namespace DesktopBar.Services
             var token = runCancellation.Token;
             try
             {
+                long wait = _retryNotBefore - Environment.TickCount64;
+                if (wait > 0 && token.WaitHandle.WaitOne((int)wait)) return;
                 using var cpu = new CpuSampler();
+                cpu.Next();
                 using var mem = new MemorySampler();
                 using var pdh = new PdhHost();
+                pdh.Collect();
                 double cpuBaseMhz = ReadCpuBaseMhz();
                 var cpuTemp = new CpuTempSampler();
                 AdlHost adl = null;
@@ -178,9 +206,22 @@ namespace DesktopBar.Services
                         else if (wmiTemp >= 0) sample.CpuTempC = wmiTemp;
                         else if (amdSocTemp >= 0) sample.CpuTempC = amdSocTemp;
 
-                        _latest = sample;
+                        bool keepSampling;
+                        lock (_gate)
+                        {
+                            _history.Enqueue((Environment.TickCount64, sample));
+                            if (_history.Count > 60) _history.Dequeue();
+                            _latest = sample;
+                            _initialSampleRequested = false;
+                            keepSampling = _users > 0;
+                        }
                         Updated?.Invoke(sample);
-                        if (token.WaitHandle.WaitOne(1000)) break;
+                        lock (_gate)
+                        {
+                            _consecutiveFailures = 0;
+                            _retryNotBefore = 0;
+                        }
+                        if (!keepSampling || token.WaitHandle.WaitOne(1000)) break;
                     }
                 }
                 finally
@@ -192,7 +233,17 @@ namespace DesktopBar.Services
             }
             catch (Exception ex)
             {
-                App.Log("性能监测线程异常: " + ex.Message);
+                if (!token.IsCancellationRequested)
+                {
+                    int delay;
+                    lock (_gate)
+                    {
+                        _consecutiveFailures = Math.Min(6, _consecutiveFailures + 1);
+                        delay = RetryDelayMs(_consecutiveFailures);
+                        _retryNotBefore = Environment.TickCount64 + delay;
+                    }
+                    App.Log($"性能监测线程异常，{delay / 1000} 秒后重试: {ex.Message}");
+                }
             }
             finally
             {
@@ -202,12 +253,16 @@ namespace DesktopBar.Services
                     {
                         _thread = null;
                         _cancellation = null;
-                        if (_users > 0) StartWorkerLocked();
+                        if (_users > 0 || (_initialSampleRequested && (token.IsCancellationRequested || _consecutiveFailures < 3)))
+                            StartWorkerLocked();
+                        else _initialSampleRequested = false;
                     }
                 }
                 runCancellation.Dispose();
             }
         }
+
+        internal static int RetryDelayMs(int failures) => Math.Min(30000, 1000 << (Math.Clamp(failures, 1, 6) - 1));
 
         // 显卡名单每 30 秒重枚举一次;初值取负数,保证启动后第一次比较就能触发刷新。
         private List<GpuAdapterInfo> _adapters = new List<GpuAdapterInfo>();
@@ -224,7 +279,11 @@ namespace DesktopBar.Services
                     _adapters = EnumerateAdapters();
                     _adaptersTick = now;
                 }
-                return new List<GpuAdapterInfo>(_adapters);
+                return _adapters.ConvertAll(adapter => new GpuAdapterInfo
+                {
+                    Name = adapter.Name, Luid = adapter.Luid,
+                    VendorId = adapter.VendorId, DeviceId = adapter.DeviceId
+                });
             }
         }
 

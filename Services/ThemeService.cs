@@ -25,7 +25,7 @@ namespace DesktopBar.Services
 
         public static string Background => _appearance?.Background ?? "#14141C";
         public static string Text => _appearance?.Text ?? "#FFFFFF";
-        public static string Border => App.Settings?.BorderColor ?? "#FFFFFF";
+        public static string Border => App.ActiveSettings?.BorderColor ?? "#FFFFFF";
 
         internal static bool FollowsBackground(AppSettings settings) => settings != null
             && (settings.FollowCapsuleBackground
@@ -75,7 +75,7 @@ namespace DesktopBar.Services
 
         private static async void CheckWallpaper()
         {
-            if (_stopped || _checkingWallpaper || !NeedsWallpaper(App.Settings)) return;
+            if (_stopped || _checkingWallpaper || !NeedsWallpaper(App.ActiveSettings)) return;
             _checkingWallpaper = true;
             try
             {
@@ -87,7 +87,7 @@ namespace DesktopBar.Services
                     var current = WallpaperMonitor.Read();
                     return (current, resized || current != previous ? WallpaperMonitor.SampleTop(current, barHeight) : null);
                 });
-                if (_stopped || !NeedsWallpaper(App.Settings)) return;
+                if (_stopped || !NeedsWallpaper(App.ActiveSettings)) return;
                 bool wallpaperChanged = state != _wallpaper;
                 _wallpaper = state;
                 _wallpaperBarHeight = barHeight;
@@ -116,7 +116,7 @@ namespace DesktopBar.Services
                 if (!dispatcher.HasShutdownStarted) dispatcher.BeginInvoke(new Action(Refresh));
                 return;
             }
-            var settings = App.Settings;
+            var settings = App.ActiveSettings;
             if (settings == null) return;
 
             bool automatic = FollowsBackground(settings);

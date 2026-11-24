@@ -13,7 +13,7 @@ namespace DesktopBar.UI
     // 注册原生 OLE 目标，让 Windows Shell 收到完整的数据对象及其异步传输接口。
     internal sealed class ShellDropTarget : ShellFiles.IDropTarget
     {
-        private sealed record Zone(string Path, Action<Action> RunDrop, Action<bool> SetActive);
+        private sealed record Zone(string Path, Action<Action> RunDrop, Action<bool> SetActive, DropFeedback Feedback);
 
         private static readonly ConditionalWeakTable<HwndSource, ShellDropTarget> Windows = new();
         private static readonly DependencyProperty ZoneProperty = DependencyProperty.RegisterAttached(
@@ -37,10 +37,13 @@ namespace DesktopBar.UI
             _source.Disposed += (_, _) => Unregister();
         }
 
-        internal static void Wire(FrameworkElement element, string path, Action<Action> runDrop, Action<bool> setActive)
+        internal static void Wire(FrameworkElement element, string path, Action<Action> runDrop, Action<bool> setActive,
+            FrameworkElement feedbackTarget)
         {
-            if (string.IsNullOrEmpty(path)) return;
-            element.SetValue(ZoneProperty, new Zone(path, runDrop, setActive));
+            bool alreadyWired = element.GetValue(ZoneProperty) is Zone;
+            if (string.IsNullOrEmpty(path) && !alreadyWired) return;
+            element.SetValue(ZoneProperty, new Zone(path, runDrop, setActive, new DropFeedback(feedbackTarget ?? element)));
+            if (alreadyWired) return;
             element.Loaded += (_, _) => EnsureRegistered(element);
             PresentationSource.AddSourceChangedHandler(element, (_, _) => EnsureRegistered(element));
             EnsureRegistered(element);
@@ -75,7 +78,7 @@ namespace DesktopBar.UI
             var element = root.InputHitTest(local) as DependencyObject;
             while (element != null)
             {
-                if (element.GetValue(ZoneProperty) is Zone zone) return zone;
+                if (element.GetValue(ZoneProperty) is Zone zone) return string.IsNullOrEmpty(zone.Path) ? null : zone;
                 element = element switch
                 {
                     Visual or Visual3D => VisualTreeHelper.GetParent(element),
@@ -106,6 +109,7 @@ namespace DesktopBar.UI
             var zone = _zone;
             _session = null;
             _zone = null;
+            zone?.Feedback.Clear();
             if (session == null) return;
             try { session.Dispose(); }
             finally { zone.SetActive(false); }
@@ -130,7 +134,11 @@ namespace DesktopBar.UI
                 effects = 0;
                 return 0;
             }
-            try { effects = UpdateTarget(keys, point, effects); }
+            try
+            {
+                effects = UpdateTarget(keys, point, effects);
+                _zone?.Feedback.Highlight(effects);
+            }
             catch (Exception ex)
             {
                 effects = 0;
@@ -138,6 +146,7 @@ namespace DesktopBar.UI
                 try { EndSession(); }
                 catch (Exception cleanup) { App.Log("Windows 无法结束拖动: " + cleanup.Message); }
                 _zone = failed;
+                failed?.Feedback.Highlight(0);
                 App.Log("Windows 无法接收拖动内容: " + ex.Message);
             }
             return 0;
@@ -146,6 +155,7 @@ namespace DesktopBar.UI
         public int DragLeave()
         {
             _data = null;
+            _zone?.Feedback.Clear();
             try { EndSession(); }
             catch (Exception ex) { App.Log("Windows 无法结束拖动: " + ex.Message); }
             return 0;
@@ -156,12 +166,13 @@ namespace DesktopBar.UI
             uint allowed = effects;
             effects = 0;
             if (_dropping) return 0;
+            Zone target = null;
             try
             {
                 _data = data;
                 if (!ReferenceEquals(HitTest(point), _zone))
                     UpdateTarget(keys, point, allowed);
-                var zone = _zone;
+                var zone = target = _zone;
                 using var session = _session;
                 _session = null;
                 _zone = null;
@@ -176,8 +187,13 @@ namespace DesktopBar.UI
                     zone.SetActive(false);
                 }
                 effects = performed;
+                zone.Feedback.Finish(performed, false);
             }
-            catch (Exception ex) { App.Log("Windows 无法完成拖放: " + ex.Message); }
+            catch (Exception ex)
+            {
+                target?.Feedback.Finish(0, true);
+                App.Log("Windows 无法完成拖放: " + ex.Message);
+            }
             finally { DragLeave(); }
             return 0;
         }

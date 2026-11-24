@@ -34,7 +34,7 @@ namespace DesktopBar.Services
         private const string Repo = "Akiyuki1130/YukiDesk";
         private const string ApiUrl = "https://api.github.com/repos/" + Repo + "/releases/latest";
 
-        /// <summary>当前程序版本(取程序集版本,只保留前三段)。必须先于 Http 初始化。</summary>
+        /// <summary>当前程序版本。必须先于 Http 初始化。</summary>
         public static Version CurrentVersion { get; } = Normalize(
             typeof(UpdateService).Assembly.GetName().Version ?? new Version(1, 0, 0));
 
@@ -71,7 +71,9 @@ namespace DesktopBar.Services
         public static bool Busy => Volatile.Read(ref _busy) != 0;
 
         private static Version Normalize(Version v)
-            => new Version(Math.Max(v.Major, 0), Math.Max(v.Minor, 0), Math.Max(v.Build < 0 ? 0 : v.Build, 0));
+            => new Version(v.Major, v.Minor, Math.Max(v.Build, 0), Math.Max(v.Revision, 0));
+
+        private static string CurrentVersionLabel => CurrentVersion.ToString(CurrentVersion.Revision == 0 ? 3 : 4);
 
         private static HttpClient CreateHttp()
         {
@@ -83,7 +85,7 @@ namespace DesktopBar.Services
             }
             catch { }
             var client = new HttpClient(handler) { Timeout = Timeout.InfiniteTimeSpan };
-            client.DefaultRequestHeaders.UserAgent.ParseAdd("YukiDesk/" + CurrentVersion.ToString(3));
+            client.DefaultRequestHeaders.UserAgent.ParseAdd("YukiDesk/" + CurrentVersionLabel);
             client.DefaultRequestHeaders.Accept.ParseAdd("application/vnd.github+json");
             return client;
         }
@@ -93,20 +95,14 @@ namespace DesktopBar.Services
         /// <summary>查询最新 Release;无更新返回 null,网络/解析失败抛异常。</summary>
         public static async Task<UpdateInfo> CheckLatestAsync(CancellationToken ct)
         {
-            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            cts.CancelAfter(TimeSpan.FromSeconds(30));
-            using var resp = await Http.GetAsync(ApiUrl, cts.Token);
-            resp.EnsureSuccessStatusCode();
-            var json = await resp.Content.ReadAsStringAsync(cts.Token);
-
-            using var doc = JsonDocument.Parse(json);
+            using var doc = await ReadReleaseAsync(ct);
             var root = doc.RootElement;
             if (root.GetProperty("prerelease").GetBoolean() || root.GetProperty("draft").GetBoolean())
                 return null;
 
             string tag = root.GetProperty("tag_name").GetString() ?? "";
             if (!Version.TryParse(tag.TrimStart('v', 'V'), out var latest)) return null;
-            if (latest <= CurrentVersion) return null;
+            if (Normalize(latest) <= CurrentVersion) return null;
 
             // 直接用 tag 文本匹配资产名:ToString(3) 会把 4 段版本 v1.0.8.1 截成 1.0.8 而失配。
             string version = tag.TrimStart('v', 'V');
@@ -126,30 +122,59 @@ namespace DesktopBar.Services
                 Notes = root.GetProperty("body").GetString() ?? "",
                 DownloadUrl = asset.Value.Url,
                 FileName = asset.Value.Name,
-                ChecksumUrl = FindChecksumAsset(root, version)
+                ChecksumUrl = FindChecksumAsset(root, version, ArchTag)
             };
         }
 
-        private static string FindChecksumAsset(JsonElement root, string version)
+        internal static async Task<string> ReadReleaseSummaryAsync(CancellationToken cancellationToken)
         {
-            // 兼容两种清单命名:tag 三段版(SHA256SUMS-1.0.8.txt)与程序集四段版
-            // (SHA256SUMS-1.0.8.0.txt,2026-10 之前的 packaging.cmd 用 FileVersion 命名,
-            // 已发布的 Release 带的就是四段名)。没有这个回退时四段清单永远匹配不上,
-            // ChecksumUrl 为 null → VerifyChecksumAsync 静默跳过,宣称的 SHA-256 校验
-            // 实际不生效。与 FindAsset 的双名匹配(expectedShort/expectedAssembly)同构。
-            string nameTag = "SHA256SUMS-" + version + ".txt";
-            string nameAssembly = "SHA256SUMS-" + version + ".0.txt";
+            using var doc = await ReadReleaseAsync(cancellationToken);
+            var root = doc.RootElement;
+            string tag = root.GetProperty("tag_name").GetString() ?? "未知";
+            string version = tag.TrimStart('v', 'V');
+            string manifest = FindChecksumAsset(root, version, ArchTag) != null ? "发行版附带 SHA-256 清单" : "发行版未附带 SHA-256 清单";
+            return $"本机  v{CurrentVersionLabel} · {ArchTag} · {(IsSelfContained ? "完整包" : "精简包")}\n"
+                + $"GitHub 正式版  {tag}\n{manifest}";
+        }
+
+        private static async Task<JsonDocument> ReadReleaseAsync(CancellationToken cancellationToken)
+        {
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            cts.CancelAfter(TimeSpan.FromSeconds(30));
+            using var response = await Http.GetAsync(ApiUrl, cts.Token);
+            response.EnsureSuccessStatusCode();
+            string json = await response.Content.ReadAsStringAsync(cts.Token);
+            return JsonDocument.Parse(json);
+        }
+
+        private static string FindChecksumAsset(JsonElement root, string version, string arch)
+        {
+            if (!Version.TryParse(version, out var parsed)) return null;
+            var normalized = Normalize(parsed);
+            string assembly = normalized.ToString(4);
+            string tag = normalized.ToString(3);
+            // Older packages use the assembly version; single-architecture packs add the architecture.
+            string[] names =
+            {
+                $"SHA256SUMS-{assembly}-{arch}.txt", $"SHA256SUMS-{tag}-{arch}.txt",
+                $"SHA256SUMS-{assembly}.txt", $"SHA256SUMS-{tag}.txt"
+            };
+            string bestUrl = null;
+            int bestMatch = names.Length;
             foreach (var asset in root.GetProperty("assets").EnumerateArray())
             {
                 string name = asset.GetProperty("name").GetString() ?? "";
-                if (!string.Equals(name, nameTag, StringComparison.OrdinalIgnoreCase)
-                    && !string.Equals(name, nameAssembly, StringComparison.OrdinalIgnoreCase)) continue;
+                int match = Array.FindIndex(names, expected => string.Equals(name, expected, StringComparison.OrdinalIgnoreCase));
+                if (match < 0 || match >= bestMatch) continue;
                 string url = asset.GetProperty("browser_download_url").GetString() ?? "";
                 if (Uri.TryCreate(url, UriKind.Absolute, out var uri)
                     && string.Equals(uri.Host, "github.com", StringComparison.OrdinalIgnoreCase))
-                    return url;
+                {
+                    bestMatch = match;
+                    bestUrl = url;
+                }
             }
-            return null;
+            return bestUrl;
         }
 
         private static (string Name, string Url)? FindAsset(JsonElement root,
@@ -224,47 +249,42 @@ namespace DesktopBar.Services
         // ---------- 安装 ----------
 
         /// <summary>启动已下载的安装程序并退出 YukiDesk(每用户安装,无需管理员)。</summary>
-        public static bool InstallAndRestart(string setupPath)
+        public static async Task<bool> InstallAndRestartAsync(string setupPath)
+        {
+            if (!await Task.Run(() => TryStartInstaller(setupPath))) return false;
+            var app = Application.Current;
+            if (app == null || app.Dispatcher.HasShutdownStarted) return true;
+            await app.Dispatcher.InvokeAsync(() =>
+            {
+                var timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(500) };
+                timer.Tick += (_, _) =>
+                {
+                    timer.Stop();
+                    app.Shutdown();
+                };
+                timer.Start();
+            });
+            return true;
+        }
+
+        private static bool TryStartInstaller(string setupPath)
         {
             if (string.IsNullOrEmpty(setupPath) || !File.Exists(setupPath)) return false;
             App.Log("更新: 启动安装程序 " + setupPath);
-            System.Diagnostics.Process proc = null;
             try
             {
-                proc = System.Diagnostics.Process.Start(
+                using var proc = System.Diagnostics.Process.Start(
                     new System.Diagnostics.ProcessStartInfo(setupPath) { UseShellExecute = true });
+                if (proc == null) return false;
+                try { proc.WaitForInputIdle(4000); } catch { }
+                if (!proc.WaitForExit(150)) return true;
+                App.Log("更新: 安装程序启动后立即退出 code=" + proc.ExitCode + ",YukiDesk 继续运行");
             }
             catch (Exception ex)
             {
                 App.Log("更新: 安装程序启动失败: " + ex.Message);
-                return false;
             }
-            if (proc != null)
-            {
-                // 等安装器完成初始化;若它秒退(包损坏/被拦截/用户在首屏取消)就不退出 YukiDesk,
-                // 否则会出现"应用自己关了、安装却没发生"的半途消失。
-                try { proc.WaitForInputIdle(4000); } catch { }
-                bool exited;
-                try { exited = proc.HasExited; } catch { exited = false; }
-                if (exited)
-                {
-                    int code = 0;
-                    try { code = proc.ExitCode; } catch { }
-                    App.Log("更新: 安装程序启动后立即退出 code=" + code + ",YukiDesk 继续运行");
-                    try { proc.Dispose(); } catch { }
-                    return false;
-                }
-                try { proc.Dispose(); } catch { }
-            }
-            // 安装器已在运行:给一点启动缓冲再退出。
-            var t = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(500) };
-            t.Tick += (s, e) =>
-            {
-                t.Stop();
-                Application.Current?.Shutdown();
-            };
-            t.Start();
-            return true;
+            return false;
         }
 
         /// <summary>Release 提供 SHA256SUMS-<版本>.txt 时比对下载包哈希;缺失时仅记录并放行(旧 Release 兼容)。</summary>
@@ -347,13 +367,13 @@ namespace DesktopBar.Services
                     catch (Exception ex) { status?.Invoke("检查更新失败: " + ex.Message); return; }
                 }
 
-                if (info == null) { status?.Invoke("当前已是最新版本 (v" + CurrentVersion.ToString(3) + ")"); return; }
+                if (info == null) { status?.Invoke("当前已是最新版本 (v" + CurrentVersionLabel + ")"); return; }
                 status?.Invoke("发现新版本 v" + info.Version);
 
                 if (!autoDownload)
                 {
                     if (!ConfirmDialog.Show("YukiDesk 更新",
-                        "发现新版本 v" + info.Version + "(当前 v" + CurrentVersion.ToString(3) + ")。\n\n是否立即下载并安装?", "下载并安装"))
+                        "发现新版本 v" + info.Version + "(当前 v" + CurrentVersionLabel + ")。\n\n是否立即下载并安装?", "下载并安装"))
                     {
                         status?.Invoke("已取消。");
                         return;
@@ -393,7 +413,8 @@ namespace DesktopBar.Services
                     status?.Invoke("已取消安装。");
                     return;
                 }
-                if (!InstallAndRestart(path))
+                status?.Invoke("正在启动安装程序…");
+                if (!await InstallAndRestartAsync(path))
                 {
                     DeleteDownloadedInstaller(path);
                     status?.Invoke("安装未启动。");

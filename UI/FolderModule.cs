@@ -16,12 +16,13 @@ using DesktopBar.Services;
 
 namespace DesktopBar.UI
 {
-    public class FolderModule : ModuleBase
+    public partial class FolderModule : ModuleBase
     {
         private const int PrefetchLimit = 64;
         private sealed record FolderTile(FileSystemInfo File, Border View);
         private readonly string _directory;
         private readonly string _name;
+        private readonly bool _linked;
         private readonly WrapPanel _wrap = new WrapPanel();
         private readonly DispatcherTimer _debounce;
         private const int ReloadDelayMs = 300;
@@ -30,13 +31,18 @@ namespace DesktopBar.UI
         private FileSystemWatcher _watcher;
         private FileSystemInfo[] _files, _displayedFiles, _preparingFiles;
         private FolderTile[] _tiles = Array.Empty<FolderTile>();
+        private FileSystemInfo[] _matchedFiles = Array.Empty<FileSystemInfo>();
+        private CancellationTokenSource _filterRequest;
         private int _loadVersion;
         private volatile bool _disposed;
+        internal string FolderName => _name;
+        internal string FolderPath => _directory;
 
-        public FolderModule(string name, TabStyle style) : base(style)
+        public FolderModule(string name, TabStyle style, string linkedPath = null) : base(style)
         {
             _name = name;
-            _directory = MiniFolderCatalog.GetFolderPath(App.Settings.StorageRoot, name);
+            _linked = linkedPath != null;
+            _directory = linkedPath ?? MiniFolderCatalog.GetFolderPath(App.Settings.StorageRoot, name);
             var badge = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
             badge.Children.Add(MakeFolderGlyph(18));
             var title = MakePillText(name);
@@ -47,7 +53,8 @@ namespace DesktopBar.UI
             {
                 if (e.ClickCount != 2) return;
                 e.Handled = true;
-                ShellOpen.OpenFolder(_directory);
+                if (_available) DesktopActions.Open(_directory);
+                else ShowPanel();
             };
             Pill.MouseRightButtonUp += (_, e) =>
             {
@@ -55,18 +62,12 @@ namespace DesktopBar.UI
                 ShowFolderMenu();
             };
 
-            Panel.Width = 190 * Ui.Scale;
-            Panel.Child = new ScrollViewer
-            {
-                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
-                HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
-                MaxHeight = SystemParameters.PrimaryScreenHeight * 0.5,
-                Content = _wrap
-            };
+            Panel.Width = (Preferences.ListView ? 336 : 290) * Ui.Scale;
+            Panel.Child = BuildFolderContent();
             Panel.MouseRightButtonUp += (_, e) =>
             {
                 e.Handled = true;
-                ShowFolderMenu();
+                ShowFolderMenu(fromPanel: true);
             };
             foreach (var target in new FrameworkElement[] { Pill, PanelWindow })
                 WireFileDrop(target, _directory, RunFileOperation);
@@ -91,6 +92,19 @@ namespace DesktopBar.UI
             _ = ShowFilesAsync();
         }
 
+        protected override bool KeepPanelOpenOnPointerExit => _panelPinned;
+        protected override bool CaptureFullPanelEnvelope => false;
+        protected override Size GetPanelEnvelope(Size content) => new(Math.Max(content.Width, 336 * Ui.Scale),
+            Math.Max(content.Height, SystemParameters.PrimaryScreenHeight * .42 + 176 * Ui.Scale + 265));
+
+        protected override void OnPanelHidden()
+        {
+            _filterRequest?.Cancel();
+            ClearSelection();
+            CancelPreview();
+            if (_panelPinned) SetPanelPinned(false);
+        }
+
         protected override void OnFileDropSettled() => _ = ShowFilesAsync();
 
         private async Task LoadFilesAsync()
@@ -98,27 +112,28 @@ namespace DesktopBar.UI
             if (_directory == null || _disposed) return;
             int version = ++_loadVersion;
             bool watch = _watcher == null;
-            var snapshot = await Task.Run(() => ReadFolder(watch));
+            string path = CurrentDirectory;
+            var snapshot = await Task.Run(() => ReadFolder(path, watch));
             if (_disposed || version != _loadVersion)
             {
                 snapshot.Watcher?.Dispose();
                 return;
             }
             _watcher ??= snapshot.Watcher;
-            _files = snapshot.Files ?? _files ?? Array.Empty<FileSystemInfo>();
+            UpdateFolderSnapshot(snapshot.Files);
             for (int i = 0; i < Math.Min(PrefetchLimit, _files.Length); i++)
                 IconCache.LoadAsync(_files[i]);
             if (Open) await ShowFilesAsync();
         }
 
-        private (FileSystemInfo[] Files, FileSystemWatcher Watcher) ReadFolder(bool watch)
+        private (FileSystemInfo[] Files, FileSystemWatcher Watcher) ReadFolder(string path, bool watch)
         {
             FileSystemWatcher watcher = null;
             if (watch)
             {
                 try
                 {
-                    watcher = new FileSystemWatcher(_directory)
+                    watcher = new FileSystemWatcher(path)
                     {
                         NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.LastWrite
                     };
@@ -137,7 +152,7 @@ namespace DesktopBar.UI
             }
             try
             {
-                var files = new DirectoryInfo(_directory).GetFileSystemInfos()
+                var files = new DirectoryInfo(path).GetFileSystemInfos()
                     .OrderBy(item => item is DirectoryInfo ? 0 : 1)
                     .ThenBy(item => item.Name, StringComparer.OrdinalIgnoreCase)
                     .ToArray();
@@ -146,7 +161,7 @@ namespace DesktopBar.UI
             catch (DirectoryNotFoundException)
             {
                 watcher?.Dispose();
-                return (Array.Empty<FileSystemInfo>(), null);
+                return (null, null);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or InvalidOperationException)
             {
@@ -188,19 +203,42 @@ namespace DesktopBar.UI
         private async Task ShowFilesAsync()
         {
             var files = _files;
-            bool CanApply() => !_disposed && Open && !FileDropInteractionActive && ReferenceEquals(_files, files);
-            if (files == null || !CanApply() || ReferenceEquals(_displayedFiles, files)
-                || ReferenceEquals(_preparingFiles, files)) return;
+            int revision = _viewRevision;
+            bool CanApply() => !_disposed && Open && !FileDropInteractionActive
+                && ReferenceEquals(_files, files) && revision == _viewRevision;
+            if (files == null || !CanApply() || (ReferenceEquals(_displayedFiles, files) && _displayedRevision == revision)
+                || (ReferenceEquals(_preparingFiles, files) && _preparingRevision == revision
+                    && _filterRequest is { IsCancellationRequested: false })) return;
 
             _preparingFiles = files;
+            _preparingRevision = revision;
+            _filterRequest?.Cancel();
+            using var request = new CancellationTokenSource();
+            _filterRequest = request;
             try
             {
-                var existing = _tiles.ToDictionary(tile => tile.File.FullName, StringComparer.Ordinal);
-                var next = new FolderTile[files.Length];
-                int prepared = 0;
-                for (int i = 0; i < files.Length; i++)
+                var query = BuildFolderQuery();
+                var matches = await Task.Run(() => query(files, request.Token), request.Token);
+                if (request.IsCancellationRequested || !CanApply()) return;
+                if (Preferences.ListView)
                 {
-                    var file = files[i];
+                    CommitFolderView(matches);
+                    SetPanelWidth(336 * Ui.Scale, animate: _displayedFiles != null);
+                    ShowVirtualRows(matches);
+                    _displayedRevision = revision;
+                    _displayedFiles = files;
+                    ShowFolderStatus(matches.Length);
+                    return;
+                }
+                var items = matches.Take(_visibleLimit).ToArray();
+                var existing = _displayedRevision == revision
+                    ? _tiles.ToDictionary(tile => tile.File.FullName, StringComparer.Ordinal)
+                    : new Dictionary<string, FolderTile>();
+                var next = new FolderTile[items.Length];
+                int prepared = 0;
+                for (int i = 0; i < items.Length; i++)
+                {
+                    var file = items[i];
                     if (existing.TryGetValue(file.FullName, out var tile) && file.GetType() == tile.File.GetType()
                         && file.LastWriteTimeUtc == tile.File.LastWriteTimeUtc)
                     {
@@ -208,14 +246,15 @@ namespace DesktopBar.UI
                         continue;
                     }
                     next[i] = new FolderTile(file, MakeItem(file));
-                    if (++prepared % 8 == 0 && i + 1 < files.Length)
+                    if (++prepared % 8 == 0 && i + 1 < items.Length)
                     {
                         await Dispatcher.Yield(DispatcherPriority.Background);
-                        if (!CanApply()) return;
+                        if (request.IsCancellationRequested || !CanApply()) return;
                     }
                 }
 
                 // Keep the current tree on screen while preparing icons and commit the layout in one pass.
+                CommitFolderView(matches);
                 var views = next.Select(tile => tile.View).ToHashSet();
                 for (int i = _wrap.Children.Count - 1; i >= 0; i--)
                     if (_wrap.Children[i] is Border view && !views.Contains(view)) _wrap.Children.RemoveAt(i);
@@ -227,13 +266,35 @@ namespace DesktopBar.UI
                     _wrap.Children.Insert(i, view);
                 }
 
-                int cols = Math.Min(4, Math.Max(1, files.Length));
+                int cols = Math.Min(4, Math.Max(3, items.Length));
                 _wrap.Width = cols * 76 * Ui.Scale;
-                Panel.Width = Math.Max(190, cols * 76 + 26) * Ui.Scale;
+                SetPanelWidth(Math.Max(290, _wrap.Width / Ui.Scale + 26) * Ui.Scale, animate: _displayedFiles != null);
+                if (_displayedRevision != revision) EaseInResults(_wrap);
                 _tiles = next;
+                _displayedRevision = revision;
                 _displayedFiles = files;
+                ShowFolderStatus(matches.Length);
             }
-            finally { if (ReferenceEquals(_preparingFiles, files)) _preparingFiles = null; }
+            catch (OperationCanceledException) { }
+            finally
+            {
+                if (ReferenceEquals(_filterRequest, request))
+                {
+                    _filterRequest = null;
+                    _preparingFiles = null;
+                }
+            }
+        }
+
+        private void CommitFolderView(FileSystemInfo[] matches)
+        {
+            bool navigated = !_listView.IsHitTestVisible;
+            _matchedFiles = matches;
+            _listView.IsHitTestVisible = _gridScroll.IsHitTestVisible = true;
+            ReconcileSelection(matches);
+            SetFolderViewMode();
+            UpdateFolderLocation();
+            if (navigated) WireFileDrop(PanelWindow, _available ? CurrentDirectory : null, RunFileOperation);
         }
 
         private Border MakeItem(FileSystemInfo item)
@@ -254,41 +315,60 @@ namespace DesktopBar.UI
                 Margin = new Thickness(0, 4 * scale, 0, 0)
             };
             label.SetResourceReference(TextBlock.ForegroundProperty, "ThemePanelText");
-            var body = new StackPanel { Width = 68 * scale, Margin = new Thickness(3 * scale, 8 * scale, 3 * scale, 8 * scale) };
-            body.Children.Add(image);
-            body.Children.Add(label);
+            var body = BuildFileTile(item, image, label, displayName, scale);
             var motion = new ScaleTransform(1, 1);
             var tile = new Border
             {
                 CornerRadius = new CornerRadius(8 * scale), Background = Brushes.Transparent, Child = body,
-                Cursor = Cursors.Hand, ToolTip = item.Name, RenderTransformOrigin = new Point(0.5, 0.5), RenderTransform = motion
+                Cursor = Cursors.Hand, ToolTip = item.Name, Focusable = true,
+                RenderTransformOrigin = new Point(0.5, 0.5), RenderTransform = motion
             };
-            tile.MouseEnter += (_, _) => tile.SetResourceReference(Border.BackgroundProperty, "ThemePanelControl");
-            tile.MouseLeave += (_, _) => { tile.Background = Brushes.Transparent; AnimateScale(motion, 1); };
+            System.Windows.Automation.AutomationProperties.SetName(tile, displayName);
+            tile.Tag = item.FullName;
+            tile.GotKeyboardFocus += (_, _) => PaintTile(tile);
+            tile.LostKeyboardFocus += (_, _) => PaintTile(tile);
+            tile.PreviewKeyDown += (_, e) =>
+            {
+                if (!tile.IsHitTestVisible) return;
+                if (e.Key == Key.Space && !isDir) { PreviewFile(item); e.Handled = true; }
+                if (e.Key == Key.Enter) { OpenInside(item); e.Handled = true; }
+            };
+            tile.MouseEnter += (_, _) => PaintTile(tile);
+            tile.MouseLeave += (_, _) => { PaintTile(tile); AnimateScale(motion, 1); };
+            PaintTile(tile);
             tile.MouseLeftButtonDown += (_, _) => AnimateScale(motion, 0.93);
             ShellFileActions.WireDrag(tile, () =>
             {
                 AnimateScale(motion, 1);
-                RunFileOperation(() => ShellFiles.Drag(FileOperationOwner, item.FullName));
-            }, _ =>
+                var selection = SelectedPaths(item.FullName);
+                RunFileOperation(() => ShellFiles.Drag(FileOperationOwner, selection));
+            }, clicks =>
             {
                 AnimateScale(motion, 1);
-                if (isDir) ShellOpen.OpenFolder(item.FullName);
-                else ShellOpen.OpenPath(item.FullName);
+                if (SelectItem(item, clicks)) EnterPanelKeyboardMode(tile);
+                else OpenInside(item);
             });
             tile.MouseRightButtonUp += (_, e) =>
             {
                 e.Handled = true;
+                if (_selection.Contains(item.FullName) && _selection.Count > 1)
+                {
+                    TrackFlyout(FlyoutMenu.Show(SelectionActions(), $"已选 {_selection.Count} 项"));
+                    return;
+                }
                 var items = new System.Collections.Generic.List<FlyoutItem>
                 {
-                    new FlyoutItem("打开", () => ShellOpen.OpenPath(item.FullName)),
+                    new FlyoutItem("打开", () => DesktopActions.Open(item.FullName)),
+                    new FlyoutItem(IsPinned(item.Name) ? "取消置顶" : "置顶", () => TogglePin(item.Name)),
+                    new FlyoutItem("固定到常用项", () => DesktopActions.Add(item.FullName)),
                     ItemVerb("复制", item.FullName, "copy"),
                     ItemVerb("剪切", item.FullName, "cut"),
-                    PasteItem(isDir ? item.FullName : _directory),
+                    PasteItem(isDir ? item.FullName : CurrentDirectory),
                     RenameItem(item.FullName),
                     ItemVerb("删除", item.FullName, "delete", danger: true),
                     new FlyoutItem("在资源管理器中定位", () => ShellOpen.RevealItem(item.FullName))
                 };
+                if (!isDir) items.Insert(1, new FlyoutItem("快速预览", () => PreviewFile(item)));
                 TrackFlyout(FlyoutMenu.Show(items, displayName));
             };
             if (isDir)
@@ -296,16 +376,26 @@ namespace DesktopBar.UI
             return tile;
         }
 
-        private void ShowFolderMenu()
+        private void ShowFolderMenu(bool fromPanel = false)
         {
-            if (_directory == null) return;
-            TrackFlyout(FlyoutMenu.Show(new[]
+            if (fromPanel && !_listView.IsHitTestVisible) return;
+            string path = fromPanel ? CurrentDirectory : _directory;
+            if (path == null) return;
+            var actions = new List<FlyoutItem>
             {
-                PasteItem(_directory),
-                RenameItem(_directory),
-                ItemVerb("删除小文件夹", _directory, "delete", danger: true),
-                new FlyoutItem("在资源管理器中打开", () => ShellOpen.OpenFolder(_directory))
-            }, _name));
+                new FlyoutItem("重新读取", () => _ = LoadFilesAsync()),
+                new FlyoutItem("固定到常用项", () => DesktopActions.Add(path)),
+                new FlyoutItem("在资源管理器中打开", () => ShellOpen.OpenFolder(path))
+            };
+            if (_available) actions.Insert(0, PasteItem(path));
+            if (_linked && path == _directory)
+                actions.Add(new FlyoutItem("移除顶栏入口", () => DesktopActions.UnlinkFolder(_directory)));
+            else
+            {
+                actions.Add(RenameItem(path));
+                actions.Add(ItemVerb("删除文件夹", path, "delete", danger: true));
+            }
+            TrackFlyout(FlyoutMenu.Show(actions, _name));
         }
 
         private FlyoutItem ItemVerb(string label, string path, string verb, bool danger = false)
@@ -319,7 +409,12 @@ namespace DesktopBar.UI
 
         private static void AnimateScale(ScaleTransform transform, double value)
         {
-            var animation = new DoubleAnimation(value, TimeSpan.FromMilliseconds(SystemParameters.ClientAreaAnimation ? 125 : 0));
+            var duration = TimeSpan.FromMilliseconds(SystemParameters.ClientAreaAnimation ? 110 : 0);
+            var animation = new DoubleAnimation(transform.ScaleX, value, duration)
+            {
+                EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }, FillBehavior = FillBehavior.Stop
+            };
+            transform.ScaleX = transform.ScaleY = value;
             transform.BeginAnimation(ScaleTransform.ScaleXProperty, animation);
             transform.BeginAnimation(ScaleTransform.ScaleYProperty, animation);
         }
@@ -327,6 +422,7 @@ namespace DesktopBar.UI
         public override void Dispose()
         {
             _disposed = true;
+            _filterRequest?.Cancel();
             _debounce.Stop();
             _watcher?.Dispose();
             base.Dispose();

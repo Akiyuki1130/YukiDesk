@@ -15,6 +15,7 @@ namespace DesktopBar.Services
     {
         private const int MaxLayers = 4;
         private const long MaxSessionPixels = 18_000_000;
+        private const int FirstFrameGraceMs = 240;
         private static readonly object Gate = new();
         private static readonly HashSet<WindowBackdrop> Readers = new();
         private static readonly Dictionary<IntPtr, Feed> Feeds = new();
@@ -44,16 +45,34 @@ namespace DesktopBar.Services
         private IntPtr _anchor;
         private Int32Rect _area;
         private long _nextScan;
+        private long? _missingBackdropSince;
         private byte[] _composed;
 
+        private bool _waitingForWindowFrame;
         internal bool HasSources => _layers.Count > 0;
-        internal bool WaitingForWindowFrame { get; private set; }
 
-        internal void InvalidateLayers() => _nextScan = 0;
+        internal void InvalidateLayers()
+        {
+            _nextScan = 0;
+            _missingBackdropSince = null;
+        }
+
+        internal bool ShouldWaitForWindowFrame(bool hasWindowPixels, long now, bool expectWindow = false)
+        {
+            if (!_waitingForWindowFrame && (hasWindowPixels || (!expectWindow && !HasSources)))
+            {
+                _missingBackdropSince = null;
+                return false;
+            }
+            // A source may be listed even when it cannot deliver a frame. After the
+            // grace period present the available layers (or wallpaper) and keep retrying.
+            _missingBackdropSince ??= now;
+            return now - _missingBackdropSince.Value < FirstFrameGraceMs;
+        }
 
         internal byte[] Composite(IntPtr anchor, Int32Rect area, byte[] wallpaper)
         {
-            WaitingForWindowFrame = false;
+            _waitingForWindowFrame = false;
             if (anchor == IntPtr.Zero || !Initialize()) return wallpaper;
             lock (Gate)
             {
@@ -90,6 +109,7 @@ namespace DesktopBar.Services
 
         internal void Suspend()
         {
+            _missingBackdropSince = null;
             if (_anchor == IntPtr.Zero) return;
             lock (Gate)
             {
@@ -184,7 +204,7 @@ namespace DesktopBar.Services
                 var source = feed.Source;
                 if (!source.Update())
                 {
-                    WaitingForWindowFrame = true;
+                    _waitingForWindowFrame = true;
                     return false;
                 }
                 var size = source.Size;

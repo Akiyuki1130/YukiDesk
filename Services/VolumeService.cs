@@ -4,7 +4,7 @@ using System.Runtime.InteropServices;
 namespace DesktopBar.Services
 {
     /// <summary>播放端点音量控制。不做设备选择，始终作用于系统当前默认输出设备。</summary>
-    public sealed class VolumeService : IDisposable
+    public sealed partial class VolumeService : IDisposable
     {
         private static readonly Guid EndpointVolumeIid = new Guid("5CDF2C82-841E-4546-9722-0CF74078229A");
         private static readonly Guid EnumeratorClass = new Guid("BCDE0395-E52F-467C-8E3D-C4579291692E");
@@ -14,6 +14,13 @@ namespace DesktopBar.Services
         private IAudioEndpointVolume _endpoint;
         private string _selectedId = "";
         private bool _disposed;
+        private EndpointNotifications _notifications;
+        private IntPtr _notificationsPointer;
+        internal event Action OutputChanged;
+        internal string OutputId => _endpoint == null ? null : _selectedId;
+
+        internal bool IsBoundToDefaultOutput()
+            => OutputId is string id && id.Length != 0 && DeviceIdsEqual(id, GetDefaultDeviceId());
 
         private static long _lastReadFailLogTick = -60000;
 
@@ -60,11 +67,18 @@ namespace DesktopBar.Services
             }
         }
 
-        public bool SetVolume(float value)
+        public bool SetVolume(float value) => SetVolume(value, null);
+
+        internal bool SetVolumeForOutput(float value, string outputId)
+            => !string.IsNullOrEmpty(outputId) && SetVolume(value, outputId);
+
+        private bool SetVolume(float value, string outputId)
         {
             try
             {
                 Ensure();
+                if (outputId != null && (!DeviceIdsEqual(_selectedId, outputId)
+                    || !DeviceIdsEqual(GetDefaultDeviceId(), outputId))) return false;
                 Check(_endpoint.SetMasterVolumeLevelScalar(Math.Max(0, Math.Min(1, value)), Guid.Empty), "设置系统音量");
                 return true;
             }
@@ -120,6 +134,44 @@ namespace DesktopBar.Services
                 _enumerator = (IMMDeviceEnumerator)Activator.CreateInstance(Type.GetTypeFromCLSID(EnumeratorClass));
         }
 
+        internal string DefaultOutputName()
+        {
+            IMMDevice device = null;
+            IAudioPropertyStore store = null;
+            try
+            {
+                EnsureEnumerator();
+                Check(_enumerator.GetDefaultAudioEndpoint(EDataFlow.Render, ERole.Multimedia, out device), "查找播放设备");
+                Check(device.OpenPropertyStore(0, out store), "读取播放设备属性");
+                var key = new AudioPropertyKey { Format = new Guid("A45C254E-DF1C-4EFD-8020-67D146A850E0"), Id = 14 };
+                Check(store.GetValue(ref key, out var value), "读取播放设备名称");
+                try { return value.Type == 31 ? Marshal.PtrToStringUni(value.Text) : null; }
+                finally { PropVariantClear(ref value); }
+            }
+            catch (Exception) { return null; }
+            finally { Release(store); Release(device); }
+        }
+
+        internal void WatchOutput()
+        {
+            if (_notificationsPointer != IntPtr.Zero) return;
+            IntPtr pointer = IntPtr.Zero;
+            try
+            {
+                EnsureEnumerator();
+                _notifications = new EndpointNotifications(() => OutputChanged?.Invoke());
+                pointer = Marshal.GetComInterfaceForObject(_notifications, typeof(IAudioEndpointNotifications));
+                Check(_enumerator.RegisterEndpointNotificationCallback(pointer), "监听播放设备");
+                _notificationsPointer = pointer;
+            }
+            catch (Exception ex)
+            {
+                if (pointer != IntPtr.Zero) Marshal.Release(pointer);
+                _notifications = null;
+                App.Log("播放设备通知注册失败: " + ex.Message);
+            }
+        }
+
         private void ActivateEndpoint(IMMDevice device)
         {
             ActivateEndpoint(device, out _endpoint);
@@ -129,7 +181,9 @@ namespace DesktopBar.Services
         {
             if (device == null) throw new InvalidOperationException("播放设备不可用");
             var iid = EndpointVolumeIid;
-            Check(device.Activate(ref iid, CLSCTX.ALL, IntPtr.Zero, out endpoint), "连接播放设备");
+            Check(device.Activate(ref iid, CLSCTX.ALL, IntPtr.Zero, out var activated), "连接播放设备");
+            endpoint = activated as IAudioEndpointVolume;
+            if (endpoint == null) Release(activated);
             if (endpoint == null) throw new InvalidOperationException("播放设备音量接口不可用");
         }
 
@@ -224,6 +278,13 @@ namespace DesktopBar.Services
         {
             if (_disposed) return;
             _disposed = true;
+            if (_notificationsPointer != IntPtr.Zero)
+            {
+                try { _enumerator?.UnregisterEndpointNotificationCallback(_notificationsPointer); }
+                finally { Marshal.Release(_notificationsPointer); _notificationsPointer = IntPtr.Zero; }
+            }
+            _notifications = null;
+            OutputChanged = null;
             ReleaseEndpointOnly();
             Release(_device);
             Release(_enumerator);
@@ -247,18 +308,67 @@ namespace DesktopBar.Services
             int EnumAudioEndpoints(EDataFlow dataFlow, uint stateMask, out IntPtr devices);
             int GetDefaultAudioEndpoint(EDataFlow dataFlow, ERole role, out IMMDevice endpoint);
             int GetDevice([MarshalAs(UnmanagedType.LPWStr)] string id, out IMMDevice device);
-            int RegisterEndpointNotificationCallback(IntPtr client);
-            int UnregisterEndpointNotificationCallback(IntPtr client);
+            [PreserveSig] int RegisterEndpointNotificationCallback(IntPtr client);
+            [PreserveSig] int UnregisterEndpointNotificationCallback(IntPtr client);
         }
 
         [ComImport, Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
         private interface IMMDevice
         {
-            int Activate(ref Guid iid, uint clsctx, IntPtr activationParams, out IAudioEndpointVolume endpoint);
+            [PreserveSig] int Activate(ref Guid iid, uint clsctx, IntPtr activationParams,
+                [MarshalAs(UnmanagedType.IUnknown)] out object endpoint);
             // 保留槽位；属性存储暂未使用。
-            int OpenPropertyStore(uint access, out IntPtr store);
+            [PreserveSig] int OpenPropertyStore(uint access, out IAudioPropertyStore store);
             int GetId(out IntPtr id);
             int GetState(out uint state);
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct AudioPropertyKey
+        {
+            internal Guid Format;
+            internal uint Id;
+        }
+
+        [StructLayout(LayoutKind.Explicit, Size = 24)]
+        private struct AudioPropertyValue
+        {
+            [FieldOffset(0)] internal ushort Type;
+            [FieldOffset(8)] internal IntPtr Text;
+        }
+
+        [DllImport("ole32.dll")]
+        private static extern int PropVariantClear(ref AudioPropertyValue value);
+
+        [ComImport, Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        private interface IAudioPropertyStore
+        {
+            [PreserveSig] int GetCount(out uint count);
+            [PreserveSig] int GetAt(uint index, out AudioPropertyKey key);
+            [PreserveSig] int GetValue(ref AudioPropertyKey key, out AudioPropertyValue value);
+        }
+
+        [ComVisible(true), Guid("7991EEC9-7E89-4D85-8390-6C703CEC60C0"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        public interface IAudioEndpointNotifications
+        {
+            [PreserveSig] int OnDeviceStateChanged([MarshalAs(UnmanagedType.LPWStr)] string id, uint state);
+            [PreserveSig] int OnDeviceAdded([MarshalAs(UnmanagedType.LPWStr)] string id);
+            [PreserveSig] int OnDeviceRemoved([MarshalAs(UnmanagedType.LPWStr)] string id);
+            [PreserveSig] int OnDefaultDeviceChanged(int flow, int role, [MarshalAs(UnmanagedType.LPWStr)] string id);
+            [PreserveSig] int OnPropertyValueChanged([MarshalAs(UnmanagedType.LPWStr)] string id, AudioPropertyKey key);
+        }
+
+        [ComVisible(true), ClassInterface(ClassInterfaceType.None)]
+        private sealed class EndpointNotifications : IAudioEndpointNotifications
+        {
+            private readonly Action _notify;
+            internal EndpointNotifications(Action notify) => _notify = notify;
+            private int Notify() { _notify(); return 0; }
+            public int OnDeviceStateChanged(string id, uint state) => Notify();
+            public int OnDeviceAdded(string id) => Notify();
+            public int OnDeviceRemoved(string id) => Notify();
+            public int OnDefaultDeviceChanged(int flow, int role, string id) => flow == 0 && role == 1 ? Notify() : 0;
+            public int OnPropertyValueChanged(string id, AudioPropertyKey key) => 0;
         }
 
         [ComImport, Guid("5CDF2C82-841E-4546-9722-0CF74078229A"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]

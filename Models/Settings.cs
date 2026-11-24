@@ -14,7 +14,7 @@ namespace DesktopBar.Models
         public string FontColor { get; set; } = "#FFFFFF";
     }
 
-    public class AppSettings
+    public partial class AppSettings
     {
         internal const int MaxRevealEdgeDwellMs = 1500;
         internal const int MinRevealDurationSeconds = 1;

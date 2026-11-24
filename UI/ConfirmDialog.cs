@@ -4,12 +4,11 @@ using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Effects;
-using DesktopBar.Services;
 
 namespace DesktopBar.UI
 {
     /// <summary>
-    /// 圆角半透明确认弹窗：始终置顶（呼出即在最上层）、深色毛玻璃质感、支持拖动与回车/Esc。
+    /// 圆角确认弹窗：始终置顶，支持拖动与回车/Esc。
     /// 用于顶栏模块的确认场景，替代会被其他窗口压住的系统消息框。
     /// </summary>
     public static class ConfirmDialog
@@ -29,6 +28,7 @@ namespace DesktopBar.UI
             bool showCancel, bool danger, bool okIsDefault = true)
         {
             bool result = false;
+            var workArea = SystemParameters.WorkArea;
             var win = new Window
             {
                 FontFamily = Ui.TextFont,
@@ -42,13 +42,15 @@ namespace DesktopBar.UI
                 WindowStartupLocation = WindowStartupLocation.CenterScreen,
                 SizeToContent = SizeToContent.WidthAndHeight,
                 ResizeMode = ResizeMode.NoResize,
-                MinWidth = 380
+                MinWidth = Math.Min(380, workArea.Width),
+                MaxWidth = Math.Min(620, workArea.Width)
             };
 
             var titleTb = new TextBlock
             {
                 Text = title,
                 FontSize = 16,
+                TextWrapping = TextWrapping.Wrap,
                 FontWeight = FontWeights.Bold
             };
             titleTb.SetResourceReference(TextBlock.ForegroundProperty, "ThemePanelText");
@@ -58,7 +60,7 @@ namespace DesktopBar.UI
                 FontSize = 14,
                 LineHeight = 21,
                 TextWrapping = TextWrapping.Wrap,
-                Opacity = 0.78,
+                Opacity = 0.90,
                 Margin = new Thickness(0, 10, 0, 0)
             };
             msg.SetResourceReference(TextBlock.ForegroundProperty, "ThemePanelText");
@@ -94,14 +96,21 @@ namespace DesktopBar.UI
 
             var content = new StackPanel();
             content.Children.Add(titleTb);
-            content.Children.Add(msg);
+            content.Children.Add(new ScrollViewer
+            {
+                Content = msg,
+                MaxHeight = workArea.Height * .55,
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+                Focusable = false
+            });
             content.Children.Add(buttons);
 
             var border = new Border
             {
                 // 留出阴影空间
                 Margin = new Thickness(18),
-                CornerRadius = new CornerRadius(14),
+                CornerRadius = new CornerRadius(26),
                 BorderThickness = new Thickness(1),
                 Padding = new Thickness(24, 20, 24, 20),
                 Effect = new DropShadowEffect
@@ -113,8 +122,7 @@ namespace DesktopBar.UI
                 },
                 Child = content
             };
-            border.SetResourceReference(Border.BackgroundProperty, "ThemePanelBackground");
-            border.SetResourceReference(Border.BorderBrushProperty, "ThemePanelBorder");
+            PopupPalette.Apply(border, dialog: true);
             border.MouseLeftButtonDown += (s, e) =>
             {
                 if (e.ButtonState == MouseButtonState.Pressed)
@@ -138,7 +146,5 @@ namespace DesktopBar.UI
             return result;
         }
 
-        private static Brush Brush(string hex, double opacity = 1)
-            => Ui.Brush(hex, opacity);
     }
 }

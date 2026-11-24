@@ -6,9 +6,9 @@ using System.Windows.Controls.Primitives;
 using System.Windows.Documents;
 using System.Windows.Interop;
 using System.Windows.Media;
+using System.Windows.Media.Animation;
 using System.Windows.Threading;
 using DesktopBar.Interop;
-using DesktopBar.Services;
 
 namespace DesktopBar.UI
 {
@@ -18,95 +18,106 @@ namespace DesktopBar.UI
         public Action OnClick { get; }
         public bool Danger { get; }
         public bool Enabled { get; }
+        public string Group { get; }
 
-        public FlyoutItem(string text, Action onClick = null, bool danger = false, bool enabled = true)
+        public FlyoutItem(string text, Action onClick = null, bool danger = false, bool enabled = true, string group = null)
         {
             Text = text;
             OnClick = onClick;
             Danger = danger;
             Enabled = enabled;
+            Group = group;
         }
     }
 
     /// <summary>
-    /// 与展开页同主题的右键菜单：置顶 Popup + 免激活样式，在鼠标位置弹出。
+    /// 与展开页同主题的免激活菜单，在指针或触发按钮旁弹出。
     /// 自带场景（桌面层窗口不抢焦点）下比 WPF ContextMenu 更可靠。
     /// 返回 Popup，调用方用 ModuleBase.TrackFlyout 登记，避免面板被自动收起。
     /// </summary>
     public static class FlyoutMenu
     {
-        public static Popup Show(IReadOnlyList<FlyoutItem> items, string caption = null)
+        public static Popup Show(IReadOnlyList<FlyoutItem> items, string caption = null, FrameworkElement anchor = null)
         {
             if (items == null || items.Count == 0) return null;
             double s = Ui.Scale;
+            bool animate = SystemParameters.ClientAreaAnimation && SystemParameters.MenuAnimation;
 
             var sp = new StackPanel();
             TextElement.SetFontFamily(sp, Ui.TextFont);
-            if (!string.IsNullOrEmpty(caption))
+            void AddCaption(string value)
             {
                 var captionText = new TextBlock
                 {
-                    Text = caption,
+                    Text = value,
                     FontSize = 12 * s,
                     FontWeight = FontWeights.SemiBold,
-                    Opacity = 0.65,
-                    Margin = new Thickness(6 * s, 2 * s, 6 * s, 6 * s)
+                    Opacity = 0.78,
+                    Margin = new Thickness(8 * s, (sp.Children.Count == 0 ? 2 : 10) * s, 8 * s, 2 * s)
                 };
                 captionText.SetResourceReference(TextBlock.ForegroundProperty, "ThemePanelText");
                 sp.Children.Add(captionText);
             }
+            if (!string.IsNullOrEmpty(caption)) AddCaption(caption);
 
             Popup popup = null;
+            string group = null;
             foreach (var item in items)
             {
+                if (item.Group != null && item.Group != group) AddCaption(item.Group);
+                group = item.Group;
+                var button = PanelControls.GlassButton(item.Text, () =>
+                {
+                    popup.IsOpen = false;
+                    item.OnClick?.Invoke();
+                }, compact: item.Group != null);
+                if (item.Group != null)
+                {
+                    button.HorizontalContentAlignment = HorizontalAlignment.Left;
+                    button.Margin = new Thickness(0, 3 * s, 0, 0);
+                }
+                button.MinWidth = 140 * s;
+                button.IsEnabled = item.Enabled;
                 var text = new TextBlock
                 {
-                    Text = item.Text,
-                    FontSize = 13.5 * s,
-                    FontWeight = FontWeights.SemiBold,
-                    VerticalAlignment = VerticalAlignment.Center,
-                    Opacity = item.Enabled ? 1 : 0.4
+                    Text = item.Text, TextTrimming = TextTrimming.CharacterEllipsis, MaxWidth = 250 * s
                 };
-                if (item.Danger) text.Foreground = Ui.Brush("#F2777C");
-                else text.SetResourceReference(TextBlock.ForegroundProperty, "ThemePanelText");
-                // 静态半透明深色行（比菜单背景深一点），悬停加深。
-                var row = new Border
-                {
-                    CornerRadius = new CornerRadius(8 * s),
-                    Padding = new Thickness(10 * s, 7 * s, 10 * s, 7 * s),
-                    MinWidth = 138 * s,
-                    Child = text
-                };
-                row.SetResourceReference(Border.BackgroundProperty, "ThemePanelHover");
-                var captured = item;
-                if (item.Enabled)
-                {
-                    row.Cursor = System.Windows.Input.Cursors.Hand;
-                    row.MouseEnter += (s2, e2) => row.SetResourceReference(Border.BackgroundProperty, "ThemePanelSelected");
-                    row.MouseLeave += (s2, e2) => row.SetResourceReference(Border.BackgroundProperty, "ThemePanelHover");
-                    row.MouseLeftButtonUp += (s2, e2) =>
-                    {
-                        if (popup != null) popup.IsOpen = false;
-                        captured.OnClick?.Invoke();
-                    };
-                }
-                sp.Children.Add(row);
+                if (item.Danger) text.FontWeight = FontWeights.Bold;
+                text.SetResourceReference(TextBlock.ForegroundProperty, "ThemePanelText");
+                button.Content = text;
+                button.ToolTip = item.Text;
+                System.Windows.Automation.AutomationProperties.SetName(button, item.Text);
+                sp.Children.Add(button);
             }
 
             var border = new Border
             {
-                CornerRadius = new CornerRadius(10 * s),
+                CornerRadius = new CornerRadius(22 * s),
                 BorderThickness = new Thickness(1 * s),
                 Padding = new Thickness(6 * s),
-                Child = sp
+                Child = new ScrollViewer
+                {
+                    Content = sp,
+                    HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+                    VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                    MaxHeight = SystemParameters.WorkArea.Height * 0.65
+                }
             };
-            border.SetResourceReference(Border.BackgroundProperty, "ThemePanelBackground");
-            border.SetResourceReference(Border.BorderBrushProperty, "ThemePanelBorder");
+            PopupPalette.Apply(border);
+            var entranceScale = new ScaleTransform();
+            if (animate)
+            {
+                border.RenderTransformOrigin = new Point(0.20, 0.12);
+                border.RenderTransform = entranceScale;
+            }
             popup = new Popup
             {
                 Child = border,
                 AllowsTransparency = true,
-                Placement = PlacementMode.MousePoint,
+                PopupAnimation = animate ? PopupAnimation.Fade : PopupAnimation.None,
+                Placement = anchor == null ? PlacementMode.MousePoint : PlacementMode.Bottom,
+                PlacementTarget = anchor,
+                VerticalOffset = anchor == null ? 0 : 4 * s,
                 StaysOpen = false,
                 Focusable = false
             };
@@ -117,14 +128,25 @@ namespace DesktopBar.UI
             };
             closeTimer.Tick += (s2, e2) =>
             {
+                if (!border.IsMouseOver && PointerOver(anchor)) return;
                 closeTimer.Stop();
-                if (popup != null) popup.IsOpen = false;
+                if (!border.IsMouseOver) popup.IsOpen = false;
             };
             border.MouseEnter += (s2, e2) => closeTimer.Stop();
             border.MouseLeave += (s2, e2) => closeTimer.Start();
             popup.Opened += (s2, e2) =>
             {
-                closeTimer.Start();
+                if (!border.IsMouseOver) closeTimer.Start();
+                if (animate)
+                {
+                    var grow = new DoubleAnimation(0.965, 1, TimeSpan.FromMilliseconds(125))
+                    {
+                        EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut },
+                        FillBehavior = FillBehavior.Stop
+                    };
+                    entranceScale.BeginAnimation(ScaleTransform.ScaleXProperty, grow);
+                    entranceScale.BeginAnimation(ScaleTransform.ScaleYProperty, grow);
+                }
                 try
                 {
                     var src = (HwndSource)PresentationSource.FromVisual(border);
@@ -135,6 +157,13 @@ namespace DesktopBar.UI
             popup.Closed += (s2, e2) => closeTimer.Stop();
             popup.IsOpen = true;
             return popup;
+        }
+
+        private static bool PointerOver(FrameworkElement element)
+        {
+            if (element == null || !element.IsVisible || PresentationSource.FromVisual(element) == null
+                || !NativeMethods.TryGetCursorPosition(out int x, out int y)) return false;
+            return new Rect(element.RenderSize).Contains(element.PointFromScreen(new Point(x, y)));
         }
     }
 }
