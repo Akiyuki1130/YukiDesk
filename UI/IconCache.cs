@@ -39,6 +39,8 @@ namespace DesktopBar.UI
         private static readonly Dictionary<string, LinkedListNode<IconRequest>> Pending = new();
         private static readonly RequestQueue PrefetchQueue = new();
         private static readonly RequestQueue VisibleQueue = new();
+        private static readonly DependencyProperty RequestKeyProperty = DependencyProperty.RegisterAttached(
+            "IconRequestKey", typeof(string), typeof(IconCache));
 
         public static BitmapSource GetFallback(bool isDir, string ext)
             => GetFallback(isDir, ext, IconPixelSize());
@@ -95,10 +97,16 @@ namespace DesktopBar.UI
                     }
                     if (target != null)
                     {
+                        if (target.GetValue(RequestKeyProperty) is string previous && previous != key) DetachTarget(target, null);
                         var targets = node.Value.Targets ??= new List<WeakReference<Image>>();
                         targets.RemoveAll(reference => !reference.TryGetTarget(out _));
                         if (!targets.Exists(reference => reference.TryGetTarget(out var image) && ReferenceEquals(image, target)))
+                        {
                             targets.Add(new WeakReference<Image>(target));
+                            target.SetValue(RequestKeyProperty, key);
+                            target.Unloaded -= DetachTarget;
+                            target.Unloaded += DetachTarget;
+                        }
                         if (node.List == PrefetchQueue.Items)
                         {
                             PrefetchQueue.Items.Remove(node);
@@ -117,6 +125,22 @@ namespace DesktopBar.UI
                 }
             }
             if (target != null) target.Source = icon;
+        }
+
+        private static void DetachTarget(object sender, RoutedEventArgs args)
+        {
+            var image = (Image)sender;
+            image.Unloaded -= DetachTarget;
+            if (image.GetValue(RequestKeyProperty) is not string key) return;
+            image.ClearValue(RequestKeyProperty);
+            lock (Gate)
+            {
+                if (!Pending.TryGetValue(key, out var node) || node.Value.Targets is not { } targets) return;
+                targets.RemoveAll(reference => !reference.TryGetTarget(out var target) || ReferenceEquals(target, image));
+                if (targets.Count != 0 || node.List != VisibleQueue.Items) return;
+                VisibleQueue.Items.Remove(node);
+                Pending.Remove(key);
+            }
         }
 
         private static void ProcessQueue(RequestQueue queue)
