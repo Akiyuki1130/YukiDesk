@@ -29,6 +29,7 @@ namespace DesktopBar.UI
         private string _insideDirectory;
         private DockPanel _locationBar;
         private TextBlock _location;
+        private Button _locationButton;
         private Button _pinPanelButton, _fileFilterButton;
         private bool _panelPinned;
         private int _fileKind, _modifiedPeriod;
@@ -51,14 +52,40 @@ namespace DesktopBar.UI
         private FrameworkElement BuildFolderLocation()
         {
             _locationBar = new DockPanel { Visibility = Visibility.Collapsed };
-            var up = PanelControls.GlassButton("上一级", () => NavigateTo(Path.GetDirectoryName(CurrentDirectory)), compact: true);
+            var up = PanelControls.GlassButton("上一级", () => NavigateUp(), compact: true);
+            up.ToolTip = "上一级（Alt+↑）";
             DockPanel.SetDock(up, Dock.Left);
             _locationBar.Children.Add(up);
             _location = PanelControls.Text("");
             _location.TextTrimming = TextTrimming.CharacterEllipsis;
-            _location.Margin = new Thickness(7, 4, 0, 0);
-            _locationBar.Children.Add(_location);
+            _locationButton = PanelControls.GlassButton("", ShowAncestorMenu, compact: true);
+            _locationButton.HorizontalContentAlignment = HorizontalAlignment.Left;
+            _locationButton.Content = _location;
+            _locationBar.Children.Add(_locationButton);
             return _locationBar;
+        }
+
+        private bool NavigateUp()
+        {
+            if (_insideDirectory == null || !_listView.IsHitTestVisible) return false;
+            NavigateTo(Path.GetDirectoryName(_insideDirectory));
+            return true;
+        }
+
+        private void ShowAncestorMenu()
+        {
+            if (_insideDirectory == null || !_listView.IsHitTestVisible) return;
+            var ancestors = new System.Collections.Generic.List<FlyoutItem>();
+            var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(_directory));
+            for (string path = Path.GetDirectoryName(_insideDirectory); path != null; path = Path.GetDirectoryName(path))
+            {
+                bool atRoot = string.Equals(path, root, StringComparison.OrdinalIgnoreCase);
+                string destination = path;
+                ancestors.Add(new FlyoutItem(atRoot ? _name : Path.GetFileName(path), () => NavigateTo(destination)));
+                if (atRoot) break;
+            }
+            ancestors.Reverse();
+            TrackFlyout(FlyoutMenu.Show(ancestors, "返回目录", _locationButton));
         }
 
         private void OpenInside(FileSystemInfo item)
@@ -69,7 +96,8 @@ namespace DesktopBar.UI
 
         private void NavigateTo(string path)
         {
-            if (string.IsNullOrEmpty(path) || _directory == null) return;
+            if (string.IsNullOrEmpty(path) || _directory == null
+                || string.Equals(path, CurrentDirectory, StringComparison.OrdinalIgnoreCase)) return;
             string relative = Path.GetRelativePath(_directory, path);
             if (Path.IsPathRooted(relative) || relative == ".." || relative.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal)) return;
             _insideDirectory = relative == "." ? null : path;
@@ -99,7 +127,7 @@ namespace DesktopBar.UI
             if (_insideDirectory == null) return;
             string relative = Path.GetRelativePath(_directory, _insideDirectory);
             _location.Text = _name + " › " + relative.Replace(Path.DirectorySeparatorChar.ToString(), " › ");
-            _location.ToolTip = _insideDirectory;
+            _locationButton.ToolTip = "返回上级目录\n" + _insideDirectory;
         }
 
         private Button BuildPinButton()

@@ -8,6 +8,7 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Media.Animation;
 using System.Windows.Media.Imaging;
 using DesktopBar.Interop;
 using DesktopBar.Models;
@@ -23,6 +24,7 @@ namespace DesktopBar.UI
         private Border _preview;
         private Image _previewImage;
         private TextBlock _previewLabel;
+        private Button _previewPrevious, _previewNext;
         private int _viewRevision, _preparingRevision, _displayedRevision = -1, _previewRevision;
         private int _previewIndex;
         private CancellationTokenSource _previewRead;
@@ -123,8 +125,10 @@ namespace DesktopBar.UI
             previewContent.Children.Add(_previewLabel);
             previewContent.Children.Add(_previewImage);
             var previewActions = new StackPanel { Orientation = Orientation.Horizontal };
-            previewActions.Children.Add(PanelControls.Button("上一张", () => MovePreview(-1)));
-            previewActions.Children.Add(PanelControls.Button("下一张", () => MovePreview(1)));
+            _previewPrevious = PanelControls.Button("上一项", () => MovePreview(-1));
+            _previewNext = PanelControls.Button("下一项", () => MovePreview(1));
+            previewActions.Children.Add(_previewPrevious);
+            previewActions.Children.Add(_previewNext);
             previewActions.Children.Add(PanelControls.Button("关闭预览", CancelPreview));
             previewContent.Children.Add(previewActions);
             _preview = new Border { Child = previewContent, Margin = new Thickness(8), Visibility = Visibility.Collapsed };
@@ -132,6 +136,7 @@ namespace DesktopBar.UI
             PanelWindow.PreviewKeyDown += (_, e) =>
             {
                 if (HandleSelectionKey(e)) return;
+                var key = e.Key == Key.System ? e.SystemKey : e.Key;
                 if (e.Key == Key.Escape)
                 {
                     if (_preview.Visibility == Visibility.Visible) CancelPreview();
@@ -143,6 +148,11 @@ namespace DesktopBar.UI
                 {
                     MovePreview(e.Key == Key.Left ? -1 : 1);
                     e.Handled = true;
+                }
+                else if (_preview.Visibility != Visibility.Visible && (key == Key.Up && Keyboard.Modifiers == ModifierKeys.Alt
+                    || key == Key.Back && Keyboard.Modifiers == ModifierKeys.None && !_filter.IsKeyboardFocusWithin))
+                {
+                    e.Handled = NavigateUp();
                 }
                 else if ((e.Key == Key.OemQuestion || e.Key == Key.Divide) && !_filter.IsKeyboardFocusWithin)
                 {
@@ -162,7 +172,8 @@ namespace DesktopBar.UI
         private void ShowSortMenu()
         {
             var sort = Preferences.Sort;
-            var choices = new List<(string Key, string Name)> { ("name", "名称"), ("modified", "最近修改"), ("type", "类型") };
+            var choices = new List<(string Key, string Name)>
+                { ("name", "名称"), ("modified", "最近修改"), ("size", "大小（大到小）"), ("type", "类型") };
             if (IsInbox) choices.Insert(0, ("arrived", "最近拖入或新增"));
             TrackFlyout(FlyoutMenu.Show(choices.Select(item => new FlyoutItem(
                 (sort == item.Key ? "✓  " : "") + item.Name, () =>
@@ -227,11 +238,12 @@ namespace DesktopBar.UI
                 var sorted = sort switch
                 {
                     "modified" => groups.ThenByDescending(item => item.LastWriteTimeUtc),
+                    "size" => groups.ThenByDescending(ReadFileSize),
                     "type" => groups.ThenBy(item => item is DirectoryInfo ? "" : item.Extension, StringComparer.OrdinalIgnoreCase),
                     "arrived" when arrivals != null => groups.ThenByDescending(item => arrivals.GetValueOrDefault(item.Name)),
                     _ => groups.ThenBy(item => item is DirectoryInfo ? 0 : 1)
                 };
-                return sorted.ThenBy(item => item.Name, StringComparer.CurrentCultureIgnoreCase).ToArray();
+                return sorted.ThenBy(item => item.Name, Ui.FileNameOrder).ToArray();
             };
         }
 
@@ -288,11 +300,33 @@ namespace DesktopBar.UI
             label.TextAlignment = TextAlignment.Left;
             label.Margin = new Thickness(0);
             details.Children.Add(label);
-            var caption = PanelControls.Text(item.LastWriteTime.ToString("g"));
+            long bytes = ReadFileSize(item);
+            string date = item.LastWriteTime.ToString("g");
+            var caption = PanelControls.Text(bytes >= 0 ? date + " · " + FormatFileSize(bytes) : date);
+            caption.TextTrimming = TextTrimming.CharacterEllipsis;
             caption.Opacity = 0.72;
             details.Children.Add(caption);
             body.Children.Add(details);
             return body;
+        }
+
+        private static long ReadFileSize(FileSystemInfo item)
+        {
+            if (item is not FileInfo file) return -1;
+            try { return file.Length; }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return -1; }
+        }
+
+        private static string FormatFileSize(long bytes)
+        {
+            const double mib = 1024 * 1024;
+            return bytes switch
+            {
+                < 1024 => $"{bytes} B",
+                < 1024 * 1024 => $"{bytes / 1024.0:0.#} KB",
+                < 1024L * 1024 * 1024 => $"{bytes / mib:0.#} MB",
+                _ => $"{bytes / (mib * 1024):0.#} GB"
+            };
         }
 
         private void PreviewFile(FileSystemInfo file)
@@ -301,13 +335,14 @@ namespace DesktopBar.UI
             _previewIndex = Array.FindIndex(_previewItems, item => item.FullName == file.FullName);
             if (_previewIndex < 0) return;
             _preview.Visibility = Visibility.Visible;
+            _previewPrevious.IsEnabled = _previewNext.IsEnabled = _previewItems.Length > 1;
             EnterPanelKeyboardMode(_previewLabel);
             _ = LoadPreviewAsync(file.FullName);
         }
 
         private void MovePreview(int direction)
         {
-            if (_previewItems == null || _previewItems.Length == 0) return;
+            if (_previewItems == null || _previewItems.Length <= 1) return;
             _previewIndex = (_previewIndex + direction + _previewItems.Length) % _previewItems.Length;
             _ = LoadPreviewAsync(_previewItems[_previewIndex].FullName);
         }
@@ -318,7 +353,7 @@ namespace DesktopBar.UI
             _previewRead?.Cancel();
             using var read = new CancellationTokenSource();
             _previewRead = read;
-            _previewImage.Source = null;
+            _previewImage.BeginAnimation(OpacityProperty, null);
             string name = Path.GetFileName(path);
             _previewLabel.Text = name + " · 正在读取…";
             try
@@ -326,6 +361,9 @@ namespace DesktopBar.UI
                 var image = await FilePreview.ReadAsync(path, read.Token);
                 if (request != _previewRevision || _disposed) return;
                 _previewImage.Source = image;
+                if (image != null && SystemParameters.ClientAreaAnimation)
+                    _previewImage.BeginAnimation(OpacityProperty, new DoubleAnimation(.72, 1, TimeSpan.FromMilliseconds(125))
+                    { FillBehavior = FillBehavior.Stop });
                 _previewLabel.Text = image != null ? name : name + " · 无法预览此文件";
             }
             finally { if (ReferenceEquals(_previewRead, read)) _previewRead = null; }
@@ -336,6 +374,7 @@ namespace DesktopBar.UI
             _previewRevision++;
             _previewRead?.Cancel();
             _previewItems = null;
+            _previewImage.BeginAnimation(OpacityProperty, null);
             _previewImage.Source = null;
             _preview.Visibility = Visibility.Collapsed;
         }

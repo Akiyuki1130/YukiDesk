@@ -52,29 +52,7 @@ namespace DesktopBar.UI
 
         private FrameworkElement BuildVirtualList()
         {
-            var panel = new FrameworkElementFactory(typeof(VirtualizingStackPanel));
-            var content = new FrameworkElementFactory(typeof(FolderRowHost));
-            var itemContainer = new Style(typeof(ListBoxItem));
-            itemContainer.Setters.Add(new Setter(FocusableProperty, false));
-            itemContainer.Setters.Add(new Setter(Control.TemplateProperty, new ControlTemplate(typeof(ListBoxItem))
-            {
-                VisualTree = new FrameworkElementFactory(typeof(ContentPresenter))
-            }));
-            _listView = new ListBox
-            {
-                MaxHeight = SystemParameters.PrimaryScreenHeight * .42,
-                Background = Brushes.Transparent,
-                BorderThickness = new Thickness(0),
-                Padding = new Thickness(0),
-                ItemsPanel = new ItemsPanelTemplate(panel),
-                ItemTemplate = new DataTemplate { VisualTree = content },
-                ItemContainerStyle = itemContainer
-            };
-            ScrollViewer.SetCanContentScroll(_listView, true);
-            ScrollViewer.SetHorizontalScrollBarVisibility(_listView, ScrollBarVisibility.Disabled);
-            ScrollViewer.SetVerticalScrollBarVisibility(_listView, ScrollBarVisibility.Auto);
-            VirtualizingPanel.SetIsVirtualizing(_listView, true);
-            VirtualizingPanel.SetVirtualizationMode(_listView, VirtualizationMode.Recycling);
+            _listView = PanelControls.VirtualizedFileList<FolderRowHost>(SystemParameters.PrimaryScreenHeight * .42);
             return _listView;
         }
 
@@ -88,7 +66,7 @@ namespace DesktopBar.UI
 
         private void ShowVirtualRows(FileSystemInfo[] matches)
         {
-            var scroll = FindDescendants<ScrollViewer>(_listView).FirstOrDefault();
+            var scroll = Ui.VisualDescendants<ScrollViewer>(_listView).FirstOrDefault();
             double offset = scroll?.VerticalOffset ?? 0;
             var previous = _listView.ItemsSource as FolderRow[];
             string anchor = previous != null && offset >= 0 && offset < previous.Length
@@ -111,7 +89,7 @@ namespace DesktopBar.UI
                 {
                     if (Open && _listView.IsHitTestVisible
                         && _listView.ItemContainerGenerator.ContainerFromItem(first) is ListBoxItem row)
-                        FindDescendants<Border>(row).FirstOrDefault(tile => tile.Focusable)?.Focus();
+                        Ui.VisualDescendants<Border>(row).FirstOrDefault(tile => tile.Focusable)?.Focus();
                 }));
             }
             else if (_gridScroll.IsHitTestVisible && _tiles.FirstOrDefault() is FolderTile tile) tile.View.Focus();
@@ -198,7 +176,7 @@ namespace DesktopBar.UI
             if (_available) UpdateFolderCount(_matchedFiles.Length);
             _batchActions.Visibility = _selection.Count == 0 ? Visibility.Collapsed : Visibility.Visible;
             foreach (var tile in _tiles) PaintTile(tile.View);
-            foreach (var tile in FindDescendants<FolderRowHost>(_listView).Select(row => row.Content).OfType<Border>()) PaintTile(tile);
+            foreach (var tile in Ui.VisualDescendants<FolderRowHost>(_listView).Select(row => row.Content).OfType<Border>()) PaintTile(tile);
         }
 
         private void PaintTile(Border tile)
@@ -228,16 +206,6 @@ namespace DesktopBar.UI
             });
         }
 
-        private static IEnumerable<T> FindDescendants<T>(DependencyObject parent) where T : DependencyObject
-        {
-            if (parent == null) yield break;
-            for (int index = 0; index < VisualTreeHelper.GetChildrenCount(parent); index++)
-            {
-                var child = VisualTreeHelper.GetChild(parent, index);
-                if (child is T found) yield return found;
-                foreach (var nested in FindDescendants<T>(child)) yield return nested;
-            }
-        }
     }
 
     internal sealed record FolderRow(FileSystemInfo File, Func<Border> Create);

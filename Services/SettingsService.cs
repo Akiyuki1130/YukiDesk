@@ -118,6 +118,7 @@ namespace DesktopBar.Services
                 StringComparer.OrdinalIgnoreCase);
             foreach (var view in s.FolderViews.Values)
             {
+                if (view.Sort is not ("name" or "modified" or "size" or "type" or "arrived")) view.Sort = "name";
                 view.Pinned = (view.Pinned ?? new()).Where(IsValidFolderName).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
                 view.Arrivals = new Dictionary<string, DateTime>(view.Arrivals ?? new(), StringComparer.OrdinalIgnoreCase);
             }

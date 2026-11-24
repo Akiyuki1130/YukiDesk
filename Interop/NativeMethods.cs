@@ -10,6 +10,9 @@ namespace DesktopBar.Interop
 {
     internal static class NativeMethods
     {
+        [DllImport("shlwapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+        internal static extern int StrCmpLogicalW(string left, string right);
+
         // ---------- 桌面层 Z 序控制 ----------
         [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "FindWindowW")]
         private static extern IntPtr FindWindowW(string cls, string win);

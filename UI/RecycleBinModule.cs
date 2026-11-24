@@ -10,15 +10,18 @@ using System.Windows.Media;
 using System.Windows.Threading;
 using DesktopBar.Interop;
 using DesktopBar.Models;
+using DesktopBar.Services;
 
 namespace DesktopBar.UI
 {
     public class RecycleBinModule : ModuleBase
     {
-        private readonly WrapPanel _items = new WrapPanel();
+        private readonly ListBox _items;
         private readonly TextBlock _status;
-        private readonly DispatcherTimer _refreshTimer;
+        private readonly DispatcherTimer _refreshTimer, _filterTimer;
         private List<ShellFiles.RecycledItem> _snapshot = new();
+        private List<ShellFiles.RecycledItem> _readItems;
+        private CancellationTokenSource _viewRequest;
         private readonly HashSet<string> _selection = new(StringComparer.Ordinal);
         private readonly TextBox _filter;
         private readonly Button _restoreSelected, _selectMode, _dateFilter;
@@ -70,7 +73,7 @@ namespace DesktopBar.UI
             {
                 App.Settings.RecycleNewestFirst = !App.Settings.RecycleNewestFirst;
                 App.Save();
-                Refresh();
+                _ = FilterItemsAsync();
             });
             sort.Margin = new Thickness(6 * Ui.Scale, 4 * Ui.Scale, 0, 0);
             sort.Click += (_, _) => sort.Content = App.Settings.RecycleNewestFirst ? "最近删除" : "名称";
@@ -83,18 +86,29 @@ namespace DesktopBar.UI
             {
                 _recentOnly = !_recentOnly;
                 _dateFilter.Content = _recentOnly ? "近七天" : "全部日期";
-                Refresh();
+                _ = FilterItemsAsync();
             }, compact: true);
             DockPanel.SetDock(_dateFilter, Dock.Right);
             filters.Children.Add(_dateFilter);
             _filter = new TextBox { Height = 26 * Ui.Scale, MinHeight = 0, Padding = new Thickness(7, 1, 7, 1),
-                ToolTip = "按名称或原目录筛选" };
+                ToolTip = "按名称、拼音首字母或原目录筛选" };
             _filter.SetResourceReference(StyleProperty, "DarkBox");
             _filter.SetResourceReference(BackgroundProperty, "ThemePanelHover");
             _filter.SetResourceReference(ForegroundProperty, "ThemePanelText");
             _filter.SetResourceReference(TextBox.CaretBrushProperty, "ThemePanelText");
             _filter.PreviewMouseLeftButtonDown += (_, _) => EnterPanelKeyboardMode(_filter);
-            _filter.TextChanged += (_, _) => Refresh();
+            _filterTimer = new DispatcherTimer(DispatcherPriority.Background, Dispatcher) { Interval = TimeSpan.FromMilliseconds(100) };
+            _filterTimer.Tick += (_, _) =>
+            {
+                _filterTimer.Stop();
+                _ = FilterItemsAsync();
+            };
+            _filter.TextChanged += (_, _) =>
+            {
+                _viewRequest?.Cancel();
+                _filterTimer.Stop();
+                _filterTimer.Start();
+            };
             filters.Children.Add(_filter);
             body.Children.Add(filters);
             var selectionActions = new WrapPanel();
@@ -110,13 +124,8 @@ namespace DesktopBar.UI
             selectionActions.Children.Add(_restoreSelected);
             body.Children.Add(selectionActions);
             body.Children.Add(_status);
-            body.Children.Add(new ScrollViewer
-            {
-                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
-                HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
-                MaxHeight = SystemParameters.PrimaryScreenHeight * 0.5,
-                Content = _items
-            });
+            _items = PanelControls.VirtualizedFileList<RecycleRowHost>(SystemParameters.PrimaryScreenHeight * .5);
+            body.Children.Add(_items);
             Panel.Width = 260 * Ui.Scale;
             Panel.Child = body;
             _refreshTimer = new DispatcherTimer(DispatcherPriority.Background, Dispatcher) { Interval = TimeSpan.FromSeconds(2) };
@@ -132,6 +141,7 @@ namespace DesktopBar.UI
 
         protected override void OnPanelShown()
         {
+            _ = FilterItemsAsync();
             _refreshTimer.Start();
             Refresh();
         }
@@ -139,6 +149,8 @@ namespace DesktopBar.UI
         protected override void OnPanelHidden()
         {
             _refreshTimer.Stop();
+            _filterTimer.Stop();
+            _viewRequest?.Cancel();
             _selection.Clear();
             _selecting = false;
             UpdateSelection();
@@ -197,44 +209,8 @@ namespace DesktopBar.UI
                 thread.Start();
                 var entries = await completion.Task;
                 if (!CanApplySnapshot()) return;
-                string search = _filter.Text.Trim();
-                DateTime cutoff = _recentOnly ? DateTime.Now.AddDays(-7) : DateTime.MinValue;
-                entries = entries.Where(item =>
-                    (search.Length == 0 || item.Name.Contains(search, StringComparison.CurrentCultureIgnoreCase)
-                        || item.OriginalFolder?.Contains(search, StringComparison.CurrentCultureIgnoreCase) == true)
-                    && (!_recentOnly || (DateTime.TryParse(item.DeletedAt, out var deleted) && deleted >= cutoff)))
-                    .OrderByDescending(item => App.Settings.RecycleNewestFirst
-                        && DateTime.TryParse(item.DeletedAt, out var date) ? date : DateTime.MinValue)
-                    .ThenBy(item => item.Name, StringComparer.CurrentCultureIgnoreCase).ToList();
-                var status = entries.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
-                if (entries.Count == _snapshot.Count && entries.Zip(_snapshot,
-                        (current, previous) => current.Id.AsSpan().SequenceEqual(previous.Id)).All(same => same))
-                {
-                    _status.Text = search.Length > 0 || _recentOnly ? "没有匹配的项目" : "回收站是空的";
-                    _status.Visibility = status;
-                    return;
-                }
-
-                var views = new FrameworkElement[entries.Count];
-                for (int i = 0; i < entries.Count; i++)
-                {
-                    views[i] = MakeItem(entries[i]);
-                    if (i % 12 == 11 && i + 1 < entries.Count)
-                    {
-                        await Dispatcher.Yield(DispatcherPriority.Background);
-                        if (!CanApplySnapshot()) return;
-                    }
-                }
-                int cols = Math.Min(4, Math.Max(1, entries.Count));
-                _items.Width = cols * 76 * Ui.Scale;
-                SetPanelWidth(Math.Max(260, cols * 76 + 26) * Ui.Scale);
-                _items.Children.Clear();
-                foreach (var view in views) _items.Children.Add(view);
-                _snapshot = entries;
-                _selection.IntersectWith(entries.Select(RecycledKey));
-                UpdateSelection();
-                _status.Text = search.Length > 0 || _recentOnly ? "没有匹配的项目" : "回收站是空的";
-                _status.Visibility = status;
+                _readItems = entries;
+                _ = FilterItemsAsync();
             }
             catch (Exception ex)
             {
@@ -250,6 +226,97 @@ namespace DesktopBar.UI
                 _refreshing = false;
                 if (_refreshRequested) Refresh();
             }
+        }
+
+        private async Task FilterItemsAsync()
+        {
+            if (_readItems == null || !CanApplySnapshot()) return;
+            _viewRequest?.Cancel();
+            using var request = new CancellationTokenSource();
+            _viewRequest = request;
+            var items = _readItems;
+            string search = _filter.Text.Trim();
+            bool recent = _recentOnly;
+            bool newest = App.Settings.RecycleNewestFirst;
+            var snapshot = _snapshot;
+            try
+            {
+                var entries = await Task.Run(() =>
+                {
+                    var matches = FilterItems(items, search, recent, newest, request.Token);
+                    return SameItems(matches, snapshot) ? snapshot : matches;
+                }, request.Token);
+                if (request.IsCancellationRequested || !CanApplySnapshot()) return;
+                if (!ReferenceEquals(entries, snapshot)) PresentRecycleItems(entries);
+                _status.Text = search.Length > 0 || recent ? "没有匹配的项目" : "回收站是空的";
+                _status.Visibility = entries.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception ex)
+            {
+                App.Log("Windows 回收站筛选失败: " + ex.Message);
+                if (!request.IsCancellationRequested && CanApplySnapshot())
+                {
+                    _status.Text = "无法筛选回收站";
+                    _status.Visibility = Visibility.Visible;
+                }
+            }
+            finally { if (ReferenceEquals(_viewRequest, request)) _viewRequest = null; }
+        }
+
+        private static List<ShellFiles.RecycledItem> FilterItems(List<ShellFiles.RecycledItem> items, string search,
+            bool recent, bool newest, CancellationToken cancellation)
+        {
+            DateTime cutoff = recent ? DateTime.Now.AddDays(-7) : DateTime.MinValue;
+            var words = search.Split((char[])null, StringSplitOptions.RemoveEmptyEntries)
+                .Select(word => (Text: word, Initials: PinyinInitials.ParseTerm(word))).ToArray();
+            var matches = new List<(ShellFiles.RecycledItem Item, DateTime Deleted)>();
+            foreach (var item in items)
+            {
+                cancellation.ThrowIfCancellationRequested();
+                if (!words.All(word => item.Name.Contains(word.Text, StringComparison.CurrentCultureIgnoreCase)
+                    || item.OriginalFolder?.Contains(word.Text, StringComparison.CurrentCultureIgnoreCase) == true
+                    || PinyinInitials.Matches(item.Name, word.Initials))) continue;
+                DateTime date = (recent || newest) && DateTime.TryParse(item.DeletedAt, out DateTime deleted) ? deleted : DateTime.MinValue;
+                if (date >= cutoff) matches.Add((item, date));
+            }
+            return matches.OrderByDescending(match => newest ? match.Deleted : DateTime.MinValue)
+                .ThenBy(match => match.Item.Name, Ui.FileNameOrder).Select(match => match.Item).ToList();
+        }
+
+        private static bool SameItems(List<ShellFiles.RecycledItem> current, List<ShellFiles.RecycledItem> previous) =>
+            current.Count == previous.Count && current.Zip(previous).All(pair => pair.First.Name == pair.Second.Name
+                && pair.First.OriginalFolder == pair.Second.OriginalFolder && pair.First.DeletedAt == pair.Second.DeletedAt
+                && pair.First.IsFolder == pair.Second.IsFolder && pair.First.Id.AsSpan().SequenceEqual(pair.Second.Id));
+
+        private void PresentRecycleItems(List<ShellFiles.RecycledItem> entries)
+        {
+            byte[] anchor = null;
+            var scroller = Ui.VisualDescendants<ScrollViewer>(_items).FirstOrDefault();
+            if (_items.ItemsSource is RecycleGridRow[] previousRows
+                && scroller != null
+                && (int)scroller.VerticalOffset < previousRows.Length)
+                anchor = previousRows[(int)scroller.VerticalOffset].Items[0].Id;
+
+            int columns = Math.Min(4, Math.Max(1, entries.Count));
+            SetPanelWidth(Math.Max(260, columns * 76 + 26) * Ui.Scale);
+            var rows = entries.Chunk(columns).Select(items => new RecycleGridRow(items, BuildRow)).ToArray();
+            _snapshot = entries;
+            if (_selection.Count > 0) _selection.IntersectWith(entries.Select(RecycledKey));
+            _items.ItemsSource = rows;
+            if (anchor != null)
+            {
+                int rowIndex = Array.FindIndex(rows, row => row.Items.Any(item => item.Id.AsSpan().SequenceEqual(anchor)));
+                scroller.ScrollToVerticalOffset(Math.Max(0, rowIndex));
+            }
+            UpdateSelection();
+        }
+
+        private FrameworkElement BuildRow(ShellFiles.RecycledItem[] items)
+        {
+            var row = new StackPanel { Orientation = Orientation.Horizontal };
+            foreach (var item in items) row.Children.Add(MakeItem(item));
+            return row;
         }
 
         private Border MakeItem(ShellFiles.RecycledItem item)
@@ -305,6 +372,7 @@ namespace DesktopBar.UI
                     new FlyoutItem("永久删除", () => RunBinOperation(() => ShellFiles.Invoke(FileOperationOwner, item, "delete")), danger: true)
                 }, item.Name));
             };
+            PaintSelection(tile);
             return tile;
         }
 
@@ -320,7 +388,9 @@ namespace DesktopBar.UI
         {
             _selectMode.Content = _selecting ? $"已选 {_selection.Count} 项 · 退出" : "多选";
             _restoreSelected.Visibility = _selection.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
-            foreach (var tile in _items.Children.OfType<Border>()) PaintSelection(tile);
+            foreach (var row in Ui.VisualDescendants<RecycleRowHost>(_items))
+                if (row.Content is StackPanel panel)
+                    foreach (var tile in panel.Children.OfType<Border>()) PaintSelection(tile);
         }
 
         private void PaintSelection(Border tile)
@@ -335,7 +405,19 @@ namespace DesktopBar.UI
         {
             _disposed = true;
             _refreshTimer.Stop();
+            _filterTimer.Stop();
+            _viewRequest?.Cancel();
             base.Dispose();
+        }
+    }
+
+    internal sealed record RecycleGridRow(ShellFiles.RecycledItem[] Items, Func<ShellFiles.RecycledItem[], FrameworkElement> Build);
+
+    public sealed class RecycleRowHost : ContentControl
+    {
+        public RecycleRowHost()
+        {
+            DataContextChanged += (_, args) => Content = args.NewValue is RecycleGridRow row ? row.Build(row.Items) : null;
         }
     }
 }

@@ -154,7 +154,7 @@ namespace DesktopBar.UI
             {
                 var files = new DirectoryInfo(path).GetFileSystemInfos()
                     .OrderBy(item => item is DirectoryInfo ? 0 : 1)
-                    .ThenBy(item => item.Name, StringComparer.OrdinalIgnoreCase)
+                    .ThenBy(item => item.Name, Ui.FileNameOrder)
                     .ToArray();
                 return (files, watcher);
             }

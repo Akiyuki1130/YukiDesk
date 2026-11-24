@@ -2,6 +2,7 @@ using System;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
+using System.Windows.Media;
 
 namespace DesktopBar.UI
 {
@@ -52,6 +53,32 @@ namespace DesktopBar.UI
             var text = new TextBlock { Text = value, FontSize = 12 * Ui.Scale };
             text.SetResourceReference(TextBlock.ForegroundProperty, "ThemePanelText");
             return text;
+        }
+
+        internal static ListBox VirtualizedFileList<T>(double maxHeight) where T : FrameworkElement
+        {
+            var itemContainer = new Style(typeof(ListBoxItem));
+            itemContainer.Setters.Add(new Setter(UIElement.FocusableProperty, false));
+            itemContainer.Setters.Add(new Setter(Control.TemplateProperty, new ControlTemplate(typeof(ListBoxItem))
+            {
+                VisualTree = new FrameworkElementFactory(typeof(ContentPresenter))
+            }));
+            var list = new ListBox
+            {
+                MaxHeight = maxHeight,
+                Background = Brushes.Transparent,
+                BorderThickness = new Thickness(0),
+                Padding = new Thickness(0),
+                ItemsPanel = new ItemsPanelTemplate(new FrameworkElementFactory(typeof(VirtualizingStackPanel))),
+                ItemTemplate = new DataTemplate { VisualTree = new FrameworkElementFactory(typeof(T)) },
+                ItemContainerStyle = itemContainer
+            };
+            ScrollViewer.SetCanContentScroll(list, true);
+            ScrollViewer.SetHorizontalScrollBarVisibility(list, ScrollBarVisibility.Disabled);
+            ScrollViewer.SetVerticalScrollBarVisibility(list, ScrollBarVisibility.Auto);
+            VirtualizingPanel.SetIsVirtualizing(list, true);
+            VirtualizingPanel.SetVirtualizationMode(list, VirtualizationMode.Recycling);
+            return list;
         }
     }
 }

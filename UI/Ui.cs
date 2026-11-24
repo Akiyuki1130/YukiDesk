@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
@@ -9,6 +10,18 @@ namespace DesktopBar.UI
     public static class Ui
     {
         public static double Scale => Math.Max(0.75, Math.Min(1.5, App.Settings?.Scale ?? 1.0));
+        internal static readonly IComparer<string> FileNameOrder = Comparer<string>.Create(Interop.NativeMethods.StrCmpLogicalW);
+
+        internal static IEnumerable<T> VisualDescendants<T>(DependencyObject parent) where T : DependencyObject
+        {
+            if (parent == null) yield break;
+            for (int index = 0; index < VisualTreeHelper.GetChildrenCount(parent); index++)
+            {
+                var child = VisualTreeHelper.GetChild(parent, index);
+                if (child is T found) yield return found;
+                foreach (var nested in VisualDescendants<T>(child)) yield return nested;
+            }
+        }
 
         private const string FontDirectory = "Assets/Fonts";
         private const string FontFamilyName = "Resource Han Rounded SC";
