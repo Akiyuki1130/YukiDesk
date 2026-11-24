@@ -532,6 +532,7 @@ namespace DesktopBar.UI
 
     public class VolumeModule : ModuleBase
     {
+        private static readonly TimeSpan MixerReadTimeout = TimeSpan.FromSeconds(3);
         private readonly System.Windows.Shapes.Path _speakerWave1, _speakerWave2, _speakerMute;
         private readonly TextBlock _value;
         private readonly Slider _slider;
@@ -682,11 +683,21 @@ namespace DesktopBar.UI
         {
             int request = ++_mixerRequest;
             _mixerWorker ??= new AudioMixer();
-            if (_mixer.Content is StackPanel content && content.Children.OfType<ScrollViewer>().FirstOrDefault() is { } entries)
-                entries.IsEnabled = false;
-            var snapshot = await _mixerWorker.ReadAsync();
+            if (_mixer.Content is StackPanel content)
+            {
+                foreach (UIElement child in content.Children)
+                    if (child is Button or ScrollViewer) child.IsEnabled = false;
+            }
+            AudioMixer.Snapshot snapshot = null;
+            string emptyText = "暂无音频应用";
+            try
+            {
+                snapshot = await _mixerWorker.ReadAsync().WaitAsync(MixerReadTimeout);
+                if (snapshot == null) emptyText = "当前设备无法读取应用音量";
+            }
+            catch (TimeoutException) { emptyText = "读取超时，请刷新应用重试"; }
             if (_disposed || !_mixer.Expanded || request != _mixerRequest) return;
-            SetMixerContent(snapshot, snapshot == null ? "当前设备无法读取应用音量" : "暂无音频应用");
+            SetMixerContent(snapshot, emptyText);
         }
 
         private void SetMixerContent(AudioMixer.Snapshot snapshot, string emptyText)
