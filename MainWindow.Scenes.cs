@@ -3,6 +3,7 @@ using System.IO;
 using System.Linq;
 using System.Windows.Threading;
 using DesktopBar.Interop;
+using DesktopBar.Models;
 using DesktopBar.Services;
 
 namespace DesktopBar
@@ -64,22 +65,48 @@ namespace DesktopBar
         private void ApplyAppScene(string name)
         {
             var preset = S.DesktopPresets.FirstOrDefault(item => item.Name == name);
+            var before = App.ActiveSettings;
             try
             {
                 App.SceneSettings = preset == null ? null : DesktopPresets.ResolveScene(preset);
                 ActiveSceneName = preset?.Name;
-                SetEdgeReveal(App.ActiveSettings.RevealOnTopEdge);
-                ThemeService.Refresh();
-                GlassService.ApplyCaptureVisibility();
-                ApplySettings();
+                ApplyPresetVisuals(before);
             }
             catch (Exception ex)
             {
                 App.Log("应用临时预设失败: " + ex.Message);
+                var failed = App.ActiveSettings;
                 App.SceneSettings = null;
                 ActiveSceneName = null;
                 _sceneSuppressedProgram = _sceneCurrentProgram;
+                try { ApplyPresetVisuals(failed); }
+                catch (Exception restoreError) { App.Log("还原日常布局失败: " + restoreError.Message); }
             }
+        }
+
+        internal void ApplyPresetVisuals(AppSettings previous, bool importedAppearance = false)
+        {
+            var current = App.ActiveSettings;
+            SetEdgeReveal(current.RevealOnTopEdge);
+            ThemeService.Refresh();
+            bool captureChanged = previous.ShowInScreenCapture != current.ShowInScreenCapture
+                || previous.WallpaperOnlyCapture != current.WallpaperOnlyCapture;
+            if (captureChanged || importedAppearance) GlassService.ApplyCaptureVisibility();
+            if (importedAppearance || _barLayout == null || previous.PillMaterial != current.PillMaterial)
+            {
+                ApplySettings();
+                return;
+            }
+
+            if (previous.GlassStyle != current.GlassStyle || previous.GlassMaxFps != current.GlassMaxFps
+                || previous.FreezePanelGlass != current.FreezePanelGlass) GlassService.ApplyLive();
+            if (!previous.BarLayout.Select(Placement).SequenceEqual(current.BarLayout.Select(Placement))) RefreshBarLayout();
+            if (previous.ShowFavorites != current.ShowFavorites) RefreshFavorites();
+            ApplyModuleVisibility();
+            if (previous.ReserveDesktopSpace != current.ReserveDesktopSpace && (!IsOnSecondaryScreen || !current.ReserveDesktopSpace))
+                DesktopSpaceService.Apply(current);
+
+            static (string, int, bool) Placement(BarPlacement entry) => (entry.Id, entry.Zone, entry.KeepVisible);
         }
     }
 }

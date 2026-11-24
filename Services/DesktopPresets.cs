@@ -145,6 +145,7 @@ namespace DesktopBar.Services
         private static bool Apply(AppSettings next, HashSet<string> fields, List<DesktopPreset> importedPresets = null)
         {
             var s = App.Settings;
+            var previousAppearance = App.ActiveSettings.CloneForScene();
             var previousReveal = BarHotkey.FromSettings(s);
             var newReveal = fields.Contains("RevealHotkeyKey") ? BarHotkey.FromSettings(next) : previousReveal;
             bool revealChange = next.RevealWithHotkey != s.RevealWithHotkey || newReveal != previousReveal;
@@ -166,10 +167,8 @@ namespace DesktopBar.Services
                 }
             }
             App.Save();
-            bar?.SetEdgeReveal(s.RevealOnTopEdge);
-            ThemeService.Refresh();
-            GlassService.ApplyCaptureVisibility();
-            bar?.ApplySettings();
+            if (bar == null) ThemeService.Refresh();
+            else bar.ApplyPresetVisuals(previousAppearance, importedAppearance: importedPresets != null);
             if (importedPresets != null) bar?.RefreshAppSceneRules();
             return true;
         }

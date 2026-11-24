@@ -14,6 +14,8 @@ namespace DesktopBar
 {
     public partial class SettingsWindow
     {
+        private string _selectedPresetName;
+
         private FrameworkElement BuildPresetsCard()
         {
             var card = Card("顶栏预设", "从托盘切换。预设包含模块、布局、唤出方式和玻璃取景。", out var body);
@@ -22,10 +24,23 @@ namespace DesktopBar
             body.Children.Add(list);
             var actions = new WrapPanel();
             body.Children.Add(actions);
+            var selectionActions = new System.Collections.Generic.List<Button>();
+            list.SelectionChanged += (_, _) =>
+            {
+                _selectedPresetName = (list.SelectedItem as DesktopPreset)?.Name;
+                foreach (var button in selectionActions) button.IsEnabled = list.SelectedItem != null;
+            };
             void Refresh(DesktopPreset selected = null)
             {
                 list.ItemsSource = S.DesktopPresets.ToArray();
                 list.SelectedItem = selected;
+            }
+            void AddSelectionAction(string title, Action run)
+            {
+                var button = PanelControls.Button(title, run);
+                button.IsEnabled = list.SelectedItem != null;
+                selectionActions.Add(button);
+                actions.Children.Add(button);
             }
             bool TryName(string title, string initial, out string name)
             {
@@ -51,21 +66,21 @@ namespace DesktopBar
                 App.Save();
                 Refresh();
             }));
-            actions.Children.Add(PanelControls.Button("应用", () =>
+            AddSelectionAction("应用", () =>
             {
                 if (list.SelectedItem is not DesktopPreset preset) return;
                 CommitPendingSliders();
                 if (DesktopPresets.Apply(preset)) RefreshSettingsPages();
-            }));
-            actions.Children.Add(PanelControls.Button("复制…", () =>
+            });
+            AddSelectionAction("复制…", () =>
             {
                 if (list.SelectedItem is not DesktopPreset selected || !TryName("复制预设", selected.Name + "副本", out var name)) return;
                 var copy = new DesktopPreset { Name = name, Values = new(selected.Values) };
                 S.DesktopPresets.Add(copy);
                 App.Save();
                 Refresh(copy);
-            }));
-            actions.Children.Add(PanelControls.Button("改名…", () =>
+            });
+            AddSelectionAction("改名…", () =>
             {
                 if (list.SelectedItem is not DesktopPreset selected || !TryName("预设改名", selected.Name, out var name)) return;
                 string previous = selected.Name;
@@ -74,8 +89,8 @@ namespace DesktopBar
                 App.Save();
                 App.Bar?.RefreshAppSceneRules();
                 Refresh(selected);
-            }));
-            actions.Children.Add(PanelControls.Button("删除预设", () =>
+            });
+            AddSelectionAction("删除预设", () =>
             {
                 if (list.SelectedItem is not DesktopPreset selected) return;
                 S.DesktopPresets.Remove(selected);
@@ -83,8 +98,8 @@ namespace DesktopBar
                 App.Save();
                 App.Bar?.RefreshAppSceneRules();
                 Refresh();
-            }));
-            Refresh();
+            });
+            Refresh(S.DesktopPresets.FirstOrDefault(preset => preset.Name == _selectedPresetName));
             return card;
         }
 
@@ -107,26 +122,28 @@ namespace DesktopBar
             body.Children.Add(list);
             void Refresh() => list.ItemsSource = S.AppScenes.Select(item => new AppSceneRow(item)).ToArray();
             var actions = new WrapPanel();
-            actions.Children.Add(PanelControls.Button("关联应用…", () =>
+            var add = PanelControls.Button("关联应用…", () =>
             {
-                if (presetPicker.SelectedItem is not string preset)
-                {
-                    ConfirmDialog.Notice("先保存预设", "保存或添加一个预设后即可关联应用。");
-                    return;
-                }
+                if (presetPicker.SelectedItem is not string preset) return;
                 var dialog = new OpenFileDialog { Filter = "Windows 应用|*.exe", Title = "选择要关联的应用" };
                 if (dialog.ShowDialog(this) != true) return;
                 string executable = Path.GetFileName(dialog.FileName);
                 S.AppScenes.RemoveAll(item => string.Equals(item.Program, executable, StringComparison.OrdinalIgnoreCase));
                 S.AppScenes.Add(new AppSceneRule { Program = executable, Preset = preset });
                 Commit();
-            }));
-            actions.Children.Add(PanelControls.Button("移除关联", () =>
+            });
+            add.IsEnabled = presetPicker.SelectedItem != null;
+            presetPicker.SelectionChanged += (_, _) => add.IsEnabled = presetPicker.SelectedItem != null;
+            actions.Children.Add(add);
+            var remove = PanelControls.Button("移除关联", () =>
             {
                 if (list.SelectedItem is not AppSceneRow row) return;
                 S.AppScenes.Remove(row.Rule);
                 Commit();
-            }));
+            });
+            remove.IsEnabled = false;
+            list.SelectionChanged += (_, _) => remove.IsEnabled = list.SelectedItem != null;
+            actions.Children.Add(remove);
             body.Children.Add(actions);
             Refresh();
             return card;

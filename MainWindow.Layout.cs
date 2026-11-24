@@ -38,7 +38,7 @@ namespace DesktopBar
             Height = 46 * Ui.Scale;
             NativeMethods.PositionBar(new WindowInteropHelper(this).Handle, bounds.Left, bounds.Top,
                 bounds.Width, (int)Math.Round(Height * scale.DpiScaleY));
-            if (!secondary && App.ActiveSettings.ReserveDesktopSpace) DesktopSpaceService.Apply(App.ActiveSettings, new WindowInteropHelper(this).Handle);
+            if (!secondary) DesktopSpaceService.Apply(App.ActiveSettings, new WindowInteropHelper(this).Handle);
         }
 
         private void BuildBarModules(Grid root)
