@@ -1365,7 +1365,7 @@ namespace DesktopBar.UI
                     AddRow(body, "频率");
                     break;
                 case PerfMetric.Summary:
-                    foreach (var metric in EnabledMetrics()) AddRow(body, MetricName(metric));
+                    foreach (var metric in MonitorMetrics) AddRow(body, MetricName(metric));
                     _trendMetric = EnabledMetrics().FirstOrDefault();
                     _trendChoice = PanelControls.Button(MetricName(_trendMetric) + " · 最近 60 秒", ChooseTrend);
                     body.Children.Add(_trendChoice);
@@ -1391,6 +1391,24 @@ namespace DesktopBar.UI
             body.Children.Add(PanelControls.GlassButton(_metric == PerfMetric.Network ? "Windows 网络设置" : "任务管理器",
                 () => NativeMethods.ShellExecuteOpen(_metric == PerfMetric.Network ? "ms-settings:network-status" : "taskmgr.exe"), compact: true));
             Panel.Child = body;
+        }
+
+        private static readonly PerfMetric[] MonitorMetrics = { PerfMetric.Cpu, PerfMetric.Gpu, PerfMetric.Memory, PerfMetric.Network };
+
+        internal void RefreshSummaryMetrics()
+        {
+            if (_metric != PerfMetric.Summary) return;
+            var enabled = EnabledMetrics().ToHashSet();
+            foreach (var metric in MonitorMetrics)
+                if (_rows[MetricName(metric)].Parent is Grid row)
+                    row.Visibility = enabled.Contains(metric) ? Visibility.Visible : Visibility.Collapsed;
+            if (!enabled.Contains(_trendMetric))
+            {
+                _trendMetric = MonitorMetrics.FirstOrDefault(enabled.Contains);
+                _trendChoice.Content = MetricName(_trendMetric) + " · 最近 60 秒";
+                _panelSample = null;
+            }
+            if (PerfService.Instance.Latest is PerfSample sample) Apply(sample, preload: true);
         }
 
         internal static IEnumerable<PerfMetric> EnabledMetrics()

@@ -532,6 +532,7 @@ namespace DesktopBar
             SetModuleVisibility(_perfMemory, App.ActiveSettings.ShowMonitorMemory && !App.ActiveSettings.CombinePerfModules);
             SetModuleVisibility(_perfNetwork, App.ActiveSettings.ShowMonitorNetwork && !App.ActiveSettings.CombinePerfModules);
             SetModuleVisibility(_perfSummary, App.ActiveSettings.CombinePerfModules && PerfModule.EnabledMetrics().Any());
+            _perfSummary?.RefreshSummaryMetrics();
         }
 
         /// <summary>立即关闭所有独立展开页，防止顶栏隐藏后留下可交互的置顶窗口。</summary>

@@ -4,6 +4,7 @@ using System.Linq;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Threading;
 using DesktopBar.Models;
 using DesktopBar.Services;
 using DesktopBar.UI;
@@ -52,7 +53,9 @@ namespace DesktopBar
             }));
             actions.Children.Add(PanelControls.Button("应用", () =>
             {
-                if (list.SelectedItem is DesktopPreset preset && DesktopPresets.Apply(preset)) ReopenPage("Modules");
+                if (list.SelectedItem is not DesktopPreset preset) return;
+                CommitPendingSliders();
+                if (DesktopPresets.Apply(preset)) RefreshSettingsPages();
             }));
             actions.Children.Add(PanelControls.Button("复制…", () =>
             {
@@ -167,9 +170,11 @@ namespace DesktopBar
                     string material = options.PillMaterial switch { 4 => "液态玻璃", 3 => "高斯模糊", _ => "纯色" };
                     string shortcuts = "顶栏快捷键 " + BarHotkey.FromSettings(options).Display;
                     string folderDetail = import.IncludesFolders ? "\n包含直连目录、显示偏好和常用项。" : "";
-                    if (ConfirmDialog.Show("预览导入", $"{import.SettingCount} 项设置 · {import.Presets.Count} 个预设\n"
-                        + $"{material} · {options.Scale:P0}\n{shortcuts}{folderDetail}", "应用备份", okIsDefault: false)
-                        && DesktopPresets.Apply(import)) ReopenPage("General");
+                    if (!ConfirmDialog.Show("预览导入", $"{import.SettingCount} 项设置 · {import.Presets.Count} 个预设\n"
+                        + $"{material} · {options.Scale:P0}\n{shortcuts}{folderDetail}", "应用备份", okIsDefault: false))
+                        return;
+                    CommitPendingSliders();
+                    if (DesktopPresets.Apply(import)) RefreshSettingsPages();
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or ArgumentException or InvalidDataException)
                 { ConfirmDialog.Notice("导入失败", ex.Message); }
@@ -222,10 +227,21 @@ namespace DesktopBar
         private static string HotkeyStatus(bool enabled, bool? registered)
             => !enabled ? "关闭" : registered == true ? "已注册" : "未注册";
 
-        private void ReopenPage(string page)
+        private void RefreshSettingsPages()
         {
-            Close();
-            Dispatcher.BeginInvoke(new Action(() => App.ShowSettingsPage(page)));
+            var view = PagesGrid.Children.OfType<ScrollViewer>().FirstOrDefault(item => Equals(item.Tag, _currentPage));
+            double offset = view?.VerticalOffset ?? 0;
+            EndRevealShortcutCapture();
+            ApplyWindowTheme();
+            SettingsThemeHost.Content = BuildThemeModePicker();
+            BuildAppearancePage();
+            BuildTimePage();
+            BuildFoldersPage();
+            BuildModulesPage();
+            BuildGeneralPage();
+            BuildAboutPage();
+            if (view != null)
+                Dispatcher.BeginInvoke(DispatcherPriority.Loaded, new Action(() => view.ScrollToVerticalOffset(offset)));
         }
     }
 }

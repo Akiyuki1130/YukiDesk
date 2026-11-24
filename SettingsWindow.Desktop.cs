@@ -188,11 +188,13 @@ namespace DesktopBar
             var lists = new ListBox[3];
             var previewStrip = new Border();
             Point dragStart = default;
+            LayoutRow dragRow = null;
             bool isDragging = false;
             bool refreshing = false;
             BarPlacement selected = null;
             var rules = BarLayoutPanel.Rules.ToDictionary(rule => rule.Id);
             var layout = BarLayoutPanel.Placements();
+            Button moveLeft = null, moveRight = null, moveUp = null, moveDown = null, priority = null;
             for (int zone = 0; zone < lists.Length; zone++)
             {
                 int currentZone = zone;
@@ -208,17 +210,23 @@ namespace DesktopBar
                     selected = row.Placement;
                     foreach (var other in lists)
                         if (other != null && !ReferenceEquals(other, list)) other.UnselectAll();
+                    UpdateActions();
                 };
-                list.PreviewMouseLeftButtonDown += (_, e) => dragStart = e.GetPosition(list);
+                list.PreviewMouseLeftButtonDown += (_, e) =>
+                {
+                    dragStart = e.GetPosition(list);
+                    dragRow = (ItemsControl.ContainerFromElement(list, e.OriginalSource as DependencyObject) as ListBoxItem)?.Content as LayoutRow;
+                };
+                list.PreviewMouseLeftButtonUp += (_, _) => dragRow = null;
                 list.PreviewMouseMove += (_, e) =>
                 {
-                    if (isDragging || e.LeftButton != MouseButtonState.Pressed || list.SelectedItem is not LayoutRow row) return;
+                    if (isDragging || e.LeftButton != MouseButtonState.Pressed || dragRow is not LayoutRow row) return;
                     Point now = e.GetPosition(list);
                     if (Math.Abs(now.X - dragStart.X) < SystemParameters.MinimumHorizontalDragDistance
                         && Math.Abs(now.Y - dragStart.Y) < SystemParameters.MinimumVerticalDragDistance) return;
                     isDragging = true;
                     try { DragDrop.DoDragDrop(list, new DataObject(typeof(LayoutRow), row), DragDropEffects.Move); }
-                    finally { isDragging = false; }
+                    finally { isDragging = false; dragRow = null; }
                 };
                 list.DragOver += (_, e) =>
                 {
@@ -229,11 +237,12 @@ namespace DesktopBar
                 {
                     if (e.Data.GetData(typeof(LayoutRow)) is not LayoutRow row) return;
                     var target = ItemsControl.ContainerFromElement(list, e.OriginalSource as DependencyObject) as ListBoxItem;
-                    var before = (target?.Content as LayoutRow)?.Placement;
-                    if (ReferenceEquals(row.Placement, before)) return;
+                    var neighbor = (target?.Content as LayoutRow)?.Placement;
+                    if (ReferenceEquals(row.Placement, neighbor)) return;
                     layout.Remove(row.Placement);
                     row.Placement.Zone = currentZone;
-                    int pos = before == null ? layout.Count : layout.IndexOf(before);
+                    int pos = neighbor == null ? layout.Count : layout.IndexOf(neighbor);
+                    if (target != null && pos >= 0 && e.GetPosition(target).Y >= target.ActualHeight / 2) pos++;
                     layout.Insert(pos < 0 ? layout.Count : pos, row.Placement);
                     selected = row.Placement;
                     Commit();
@@ -252,11 +261,11 @@ namespace DesktopBar
             preview.Child = previewStrip;
             body.Children.Add(preview);
             var actions = new WrapPanel();
-            actions.Children.Add(PanelControls.Button("左移", () => MoveZone(-1)));
-            actions.Children.Add(PanelControls.Button("右移", () => MoveZone(1)));
-            actions.Children.Add(PanelControls.Button("上移", () => MoveOrder(-1)));
-            actions.Children.Add(PanelControls.Button("下移", () => MoveOrder(1)));
-            actions.Children.Add(PanelControls.Button("优先保留／取消", () =>
+            actions.Children.Add(moveLeft = PanelControls.Button("左移", () => MoveZone(-1)));
+            actions.Children.Add(moveRight = PanelControls.Button("右移", () => MoveZone(1)));
+            actions.Children.Add(moveUp = PanelControls.Button("上移", () => MoveOrder(-1)));
+            actions.Children.Add(moveDown = PanelControls.Button("下移", () => MoveOrder(1)));
+            actions.Children.Add(priority = PanelControls.Button("优先保留", () =>
             {
                 if (selected == null) return;
                 selected.KeepVisible = !selected.KeepVisible;
@@ -288,6 +297,19 @@ namespace DesktopBar
                     lists[zone].SelectedItem = rows.FirstOrDefault(row => ReferenceEquals(row.Placement, selected));
                 }
                 refreshing = false;
+                UpdateActions();
+            }
+            void UpdateActions()
+            {
+                if (priority == null) return;
+                moveLeft.IsEnabled = selected?.Zone > 0;
+                moveRight.IsEnabled = selected?.Zone < 2;
+                var group = selected != null ? layout.Where(item => item.Zone == selected.Zone).ToList() : new List<BarPlacement>();
+                int index = group.IndexOf(selected);
+                moveUp.IsEnabled = index > 0;
+                moveDown.IsEnabled = index >= 0 && index + 1 < group.Count;
+                priority.IsEnabled = selected != null;
+                priority.Content = selected?.KeepVisible == true ? "取消优先" : "优先保留";
             }
             void Commit()
             {

@@ -586,14 +586,18 @@
         <Style x:Key="DarkList" TargetType="ListBox">
             <Setter Property="Background" Value="Transparent"/>
             <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Foreground" Value="{DynamicResource SettingsTextBrush}"/>
             <Setter Property="ItemContainerStyle">
                 <Setter.Value>
                     <Style TargetType="ListBoxItem">
+                        <Setter Property="Foreground" Value="{DynamicResource SettingsTextBrush}"/>
+                        <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
                         <Setter Property="Template">
                             <Setter.Value>
                                 <ControlTemplate TargetType="ListBoxItem">
-                                    <Border x:Name="B" CornerRadius="18" Padding="12,8" Margin="0,2" Background="Transparent">
-                                        <ContentPresenter/>
+                                    <Border x:Name="B" CornerRadius="18" Padding="11,7" Margin="0,2" Background="Transparent"
+                                            BorderThickness="1" BorderBrush="Transparent">
+                                        <ContentPresenter TextElement.Foreground="{TemplateBinding Foreground}"/>
                                     </Border>
                                     <ControlTemplate.Triggers>
                                         <Trigger Property="IsMouseOver" Value="True">
@@ -601,6 +605,9 @@
                                         </Trigger>
                                         <Trigger Property="IsSelected" Value="True">
                                             <Setter TargetName="B" Property="Background" Value="{DynamicResource SettingsSelected}"/>
+                                        </Trigger>
+                                        <Trigger Property="IsKeyboardFocused" Value="True">
+                                            <Setter TargetName="B" Property="BorderBrush" Value="{DynamicResource SettingsAccent}"/>
                                         </Trigger>
                                     </ControlTemplate.Triggers>
                                 </ControlTemplate>

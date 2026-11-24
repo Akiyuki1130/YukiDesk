@@ -156,19 +156,28 @@
                         BorderBrush="{DynamicResource SettingsDivider}" BorderThickness="0,0,1,0">
                     <Grid>
                         <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
                             <RowDefinition Height="*"/>
                             <RowDefinition Height="Auto"/>
                         </Grid.RowDefinitions>
-                        <StackPanel Margin="14,19,14,0">
-                            <Grid Margin="0,0,0,10">
-                                <TextBox x:Name="SettingsSearchBox" Style="{StaticResource DarkBox}" Height="38" Padding="13,0"
-                                         TextChanged="Search_TextChanged" AutomationProperties.Name="搜索设置页面"
-                                         ToolTip="搜索设置页面（Ctrl+F）"/>
+                        <Grid Margin="14,19,14,10">
+                                <TextBox x:Name="SettingsSearchBox" Style="{StaticResource DarkBox}" Height="38" Padding="16,0,15,0"
+                                         TextChanged="Search_TextChanged" AutomationProperties.Name="搜索设置项"
+                                         ToolTip="搜索设置项（Ctrl+F）"/>
+                                <Path Data="M 6,1 A 5,5 0 1 1 5.99,1 Z M 10,10 L 14,14"
+                                      Width="14" Height="14" Stretch="Uniform" StrokeThickness="1.25"
+                                      Stroke="{DynamicResource SettingsSubTextBrush}" StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                                      VerticalAlignment="Center" HorizontalAlignment="Left" Margin="12,0,0,0" IsHitTestVisible="False"/>
                                 <TextBlock x:Name="SearchPlaceholder" Text="搜索设置"
                                            Foreground="{DynamicResource SettingsSubTextBrush}"
-                                           Margin="14,0" VerticalAlignment="Center" IsHitTestVisible="False"/>
-                            </Grid>
-                            <StackPanel x:Name="NavigationItems">
+                                           Margin="32,0,0,0" VerticalAlignment="Center" IsHitTestVisible="False"/>
+                                <Button x:Name="ClearSettingsSearch" Style="{StaticResource WindowCaptionButton}"
+                                        Content="&#xE8BB;" AutomationProperties.Name="清空搜索" ToolTip="清空搜索（Esc）" Click="ClearSearch_Click"
+                                        Height="26" Width="26" Margin="0,0,4,0" HorizontalAlignment="Right"
+                                        VerticalAlignment="Center" Visibility="Collapsed"/>
+                        </Grid>
+                        <Grid Grid.Row="1" Margin="14,0,14,11">
+                            <StackPanel x:Name="NavigationItems" VerticalAlignment="Top">
                                 <RadioButton Style="{StaticResource NavRadio}" GroupName="SettingsPages" IsChecked="True"
                                              AutomationProperties.Name="外观" Checked="Nav_Checked" Tag="Appearance">
                                     <StackPanel Orientation="Horizontal">
@@ -212,11 +221,26 @@
                                     </StackPanel>
                                 </RadioButton>
                             </StackPanel>
-                            <TextBlock x:Name="SearchEmpty" Text="没有匹配的设置页面"
+                            <ListBox x:Name="SettingsSearchResults" Style="{StaticResource DarkList}"
+                                     ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                                     ScrollViewer.VerticalScrollBarVisibility="Auto" AutomationProperties.Name="设置搜索结果"
+                                     PreviewMouseLeftButtonUp="SearchResult_MouseUp" Visibility="Collapsed">
+                                <ListBox.ItemTemplate>
+                                    <DataTemplate>
+                                        <StackPanel>
+                                            <TextBlock Text="{Binding Label}" TextTrimming="CharacterEllipsis"
+                                                       Foreground="{DynamicResource SettingsTextBrush}"/>
+                                            <TextBlock Text="{Binding Context}" FontSize="11.5" Margin="0,3,0,0" TextTrimming="CharacterEllipsis"
+                                                       Foreground="{DynamicResource SettingsSubTextBrush}"/>
+                                        </StackPanel>
+                                    </DataTemplate>
+                                </ListBox.ItemTemplate>
+                            </ListBox>
+                            <TextBlock x:Name="SearchEmpty" Text="没有匹配的设置项"
                                        Foreground="{DynamicResource SettingsSubTextBrush}"
-                                       Margin="12,8,0,0" Visibility="Collapsed"/>
-                        </StackPanel>
-                        <StackPanel Grid.Row="1" Margin="16,0,16,17">
+                                       Margin="12,8,0,0" VerticalAlignment="Top" Visibility="Collapsed"/>
+                        </Grid>
+                        <StackPanel Grid.Row="2" Margin="16,0,16,17">
                             <Border Height="1" Background="{DynamicResource SettingsDivider}" Margin="0,0,0,12"/>
                             <TextBlock Text="设置主题" Foreground="{DynamicResource SettingsSubTextBrush}" FontSize="12.5" Margin="1,0,0,7"/>
                             <ContentControl x:Name="SettingsThemeHost" HorizontalContentAlignment="Stretch"/>
