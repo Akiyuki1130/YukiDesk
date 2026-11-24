@@ -109,20 +109,21 @@ namespace DesktopBar.Services
             }
 
             s.StorageRoot = NormalizeRoot(s.StorageRoot);
-            s.LinkedFolders = (s.LinkedFolders ?? new List<string>()).Where(path => !string.IsNullOrWhiteSpace(path) && Path.IsPathFullyQualified(path))
-                .Select(path => Path.TrimEndingDirectorySeparator(path)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            s.LinkedFolders = (s.LinkedFolders ?? new List<string>()).Select(NormalizeLinkedPath).Where(path => path != null)
+                .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
             s.FolderViews = new Dictionary<string, FolderPreferences>(
                 (s.FolderViews ?? new()).Where(pair => pair.Value != null)
-                    .GroupBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase)
+                    .GroupBy(pair => NormalizeLinkedPath(pair.Key) ?? pair.Key, StringComparer.OrdinalIgnoreCase)
                     .ToDictionary(group => group.Key, group => group.Last().Value),
                 StringComparer.OrdinalIgnoreCase);
             foreach (var view in s.FolderViews.Values)
             {
                 if (view.Sort is not ("name" or "modified" or "size" or "type" or "arrived")) view.Sort = "name";
                 view.Pinned = (view.Pinned ?? new()).Where(IsValidFolderName).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-                view.Arrivals = new Dictionary<string, DateTime>(view.Arrivals ?? new(), StringComparer.OrdinalIgnoreCase);
+                view.Arrivals = (view.Arrivals ?? new()).GroupBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase)
+                    .ToDictionary(group => group.Key, group => group.Max(pair => pair.Value), StringComparer.OrdinalIgnoreCase);
             }
-            s.InboxFolder ??= "";
+            s.InboxFolder = NormalizeLinkedPath(s.InboxFolder) ?? "";
             s.DesktopLinks = (s.DesktopLinks ?? new()).Where(link => link != null && UI.DesktopActions.IsSupportedTarget(link.Target)).ToList();
             s.RecentDesktopTargets = (s.RecentDesktopTargets ?? new()).Where(UI.DesktopActions.IsSupportedTarget).Take(20).ToList();
             s.BarLayout ??= new();
@@ -131,7 +132,7 @@ namespace DesktopBar.Services
             s.SecondTimeZoneId ??= "";
             s.AppScenes = (s.AppScenes ?? new()).Where(rule => rule != null && IsValidFolderName(rule.Program)
                 && !string.IsNullOrWhiteSpace(rule.Preset)).ToList();
-            s.FolderShortcuts = (s.FolderShortcuts ?? Array.Empty<string>()).Take(3)
+            s.FolderShortcuts = (s.FolderShortcuts ?? Array.Empty<string>()).Take(3).Select(NormalizeLinkedPath)
                 .Concat(new string[3]).Take(3).ToArray();
             s.PreferredMediaSource ??= "";
             s.BarBgColor = NormalizeColor(s.BarBgColor, "#000000");
@@ -205,6 +206,13 @@ namespace DesktopBar.Services
                 return Path.GetFullPath(path);
             }
             catch { return fallback; }
+        }
+
+        private static string NormalizeLinkedPath(string path)
+        {
+            if (string.IsNullOrWhiteSpace(path) || !Path.IsPathFullyQualified(path)) return null;
+            try { return Path.TrimEndingDirectorySeparator(Path.GetFullPath(path)); }
+            catch (Exception ex) when (ex is IOException or ArgumentException or NotSupportedException) { return null; }
         }
 
         private static string NormalizeColor(string value, string fallback)
