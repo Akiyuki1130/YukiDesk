@@ -66,9 +66,27 @@ namespace DesktopBar.Services
         private static DispatcherTimer _autoTimer;
         private static int _busy;
         private static int _autoCheckRunning;
+        private static CancellationTokenSource _downloadCancellation;
 
         /// <summary>是否正在进行检查/下载。</summary>
         public static bool Busy => Volatile.Read(ref _busy) != 0;
+        internal static string Status { get; private set; } = "";
+        internal static bool CanCancelDownload => _downloadCancellation is { IsCancellationRequested: false };
+        internal static event Action StatusChanged;
+
+        internal static void CancelDownload()
+        {
+            if (!CanCancelDownload) return;
+            var cancellation = _downloadCancellation;
+            cancellation.Cancel();
+            if (ReferenceEquals(_downloadCancellation, cancellation)) PublishStatus("正在取消下载…");
+        }
+
+        private static void PublishStatus(string status)
+        {
+            Status = status;
+            StatusChanged?.Invoke();
+        }
 
         private static Version Normalize(Version v)
             => new Version(v.Major, v.Minor, Math.Max(v.Build, 0), Math.Max(v.Revision, 0));
@@ -360,10 +378,10 @@ namespace DesktopBar.Services
         // ---------- 高层入口 ----------
 
         /// <summary>
-        /// 一次完整的"检查 → 询问 → 下载 → 询问安装"流程,状态文本通过 status 回调上屏。
+        /// 一次完整的"检查 → 询问 → 下载 → 询问安装"流程，由应用的 Dispatcher 发起。
         /// autoDownload=true 时跳过第一步询问(用于"自动下载更新"开关)。
         /// </summary>
-        public static async Task RunCheckAsync(Action<string> status, bool autoDownload, UpdateInfo preChecked = null)
+        public static async Task RunCheckAsync(bool autoDownload, UpdateInfo preChecked = null)
         {
             if (Interlocked.Exchange(ref _busy, 1) != 0) return;
             try
@@ -371,72 +389,97 @@ namespace DesktopBar.Services
                 UpdateInfo info = preChecked;
                 if (info == null)
                 {
-                    status?.Invoke("正在检查更新…");
+                    PublishStatus("正在检查更新…");
                     try { info = await CheckLatestAsync(CancellationToken.None); }
-                    catch (Exception ex) { status?.Invoke("检查更新失败: " + ex.Message); return; }
+                    catch (Exception ex) { PublishStatus("检查更新失败: " + ex.Message); return; }
                 }
 
-                if (info == null) { status?.Invoke("当前已是最新版本 (v" + CurrentVersionLabel + ")"); return; }
-                status?.Invoke("发现新版本 v" + info.Version);
+                if (info == null) { PublishStatus("当前已是最新版本 (v" + CurrentVersionLabel + ")"); return; }
+                PublishStatus("发现新版本 v" + info.Version);
 
                 if (!autoDownload)
                 {
                     if (!ConfirmDialog.Show("YukiDesk 更新",
                         "发现新版本 v" + info.Version + "(当前 v" + CurrentVersionLabel + ")。\n\n是否立即下载并安装?", "下载并安装"))
                     {
-                        status?.Invoke("已取消。");
+                        PublishStatus("已取消。");
                         return;
                     }
                 }
 
-                string path;
-                int downloading = 1;
-                try
-                {
-                    status?.Invoke("正在下载 v" + info.Version + "…");
-                    var progress = status == null ? null : new Progress<double>(p =>
-                    {
-                        if (Volatile.Read(ref downloading) != 0) status("正在下载 v" + info.Version + "… " + Math.Round(p) + "%");
-                    });
-                    path = await DownloadAsync(info, progress, CancellationToken.None);
-                }
-                catch (Exception ex) { status?.Invoke("下载失败: " + ex.Message); return; }
-                finally { Volatile.Write(ref downloading, 0); }
+                string path = await DownloadUpdateAsync(info);
+                if (path == null) return;
 
                 // 完整性校验:Release 附带 SHA256SUMS 时比对安装包哈希,不符即删。
                 try
                 {
-                    status?.Invoke("正在校验安装包…");
+                    PublishStatus("正在校验安装包…");
                     await VerifyChecksumAsync(path, info);
                     await VerifySignatureAsync(path);
                 }
                 catch (Exception ex)
                 {
                     DeleteDownloadedInstaller(path);
-                    status?.Invoke("安装包校验失败: " + ex.Message);
+                    PublishStatus("安装包校验失败: " + ex.Message);
                     ConfirmDialog.Notice("更新已取消", "下载的安装包未通过完整性校验,已删除。\n" + ex.Message);
                     return;
                 }
 
-                status?.Invoke("下载完成,可以安装。");
+                PublishStatus("下载完成，可以安装。");
                 // 安装会退出应用,默认键/焦点必须在"取消"侧,回车不能直接触发安装。
                 if (!ConfirmDialog.Show("YukiDesk 更新",
                     "新版本 v" + info.Version + " 已下载完成。\n\n立即安装吗?安装时会先退出 YukiDesk。", "立即安装",
                     okIsDefault: false))
                 {
                     DeleteDownloadedInstaller(path);
-                    status?.Invoke("已取消安装。");
+                    PublishStatus("已取消安装。");
                     return;
                 }
-                status?.Invoke("正在启动安装程序…");
+                PublishStatus("正在启动安装程序…");
                 if (!await InstallAndRestartAsync(path))
                 {
                     DeleteDownloadedInstaller(path);
-                    status?.Invoke("安装未启动。");
+                    PublishStatus("安装未启动。");
                     ConfirmDialog.Notice("更新未完成", "安装程序未能启动或已取消，YukiDesk 将继续运行。");
                 }
             }
-            finally { Volatile.Write(ref _busy, 0); }
+            finally
+            {
+                Volatile.Write(ref _busy, 0);
+                StatusChanged?.Invoke();
+            }
+        }
+
+        private static async Task<string> DownloadUpdateAsync(UpdateInfo info)
+        {
+            using var cancellation = new CancellationTokenSource();
+            _downloadCancellation = cancellation;
+            string path = null;
+            string message = "正在下载 v" + info.Version + "…";
+            try
+            {
+                PublishStatus(message);
+                var progress = new Progress<double>(percent =>
+                {
+                    if (ReferenceEquals(_downloadCancellation, cancellation) && !cancellation.IsCancellationRequested)
+                        PublishStatus(message + " " + Math.Round(percent) + "%");
+                });
+                path = await DownloadAsync(info, progress, cancellation.Token);
+                cancellation.Token.ThrowIfCancellationRequested();
+                return path;
+            }
+            catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+            {
+                if (path != null) DeleteDownloadedInstaller(path);
+                PublishStatus("已取消下载。");
+                return null;
+            }
+            catch (Exception ex)
+            {
+                PublishStatus("下载失败: " + ex.Message);
+                return null;
+            }
+            finally { _downloadCancellation = null; }
         }
 
         /// <summary>启动自动检查:开机 25 秒后首次检查,之后每 24 小时一次。</summary>
@@ -460,7 +503,7 @@ namespace DesktopBar.Services
                             {
                                 App.Log("更新: 发现新版本 v" + info.Version);
                                 if (App.Settings.AutoUpdate)
-                                    await RunCheckAsync(null, autoDownload: true, info);
+                                    await RunCheckAsync(autoDownload: true, info);
                                 else
                                     App.ShowTrayBalloon("YukiDesk 有新版本",
                                         "v" + info.Version + " 已发布,可在 设置 → 关于 中手动更新。");

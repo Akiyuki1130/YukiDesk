@@ -47,6 +47,7 @@ namespace DesktopBar
             BuildAboutPage();
             ShowPage("Appearance");
             ThemeService.Changed += OnThemeChanged;
+            UpdateService.StatusChanged += RefreshUpdateStatus;
             Microsoft.Win32.SystemEvents.UserPreferenceChanged += OnSystemThemeChanged;
             Closing += (s, e) => CommitPendingSliders();
             Closed += (s, e) =>
@@ -55,6 +56,7 @@ namespace DesktopBar
                 RemoveDesktopObservers();
                 EndRevealShortcutCapture();
                 ThemeService.Changed -= OnThemeChanged;
+                UpdateService.StatusChanged -= RefreshUpdateStatus;
                 Microsoft.Win32.SystemEvents.UserPreferenceChanged -= OnSystemThemeChanged;
                 _tempStatusTimer?.Stop();
                 _tempStatusTimer = null;
@@ -1650,20 +1652,18 @@ namespace DesktopBar
             _checkButton = new Button { Content = "检查更新", Style = (Style)FindResource("BtnAccent") };
             _checkButton.Click += async (s, e) =>
             {
-                if (UpdateService.Busy) return;
-                _checkButton.IsEnabled = false;
-                try { await UpdateService.RunCheckAsync(SetUpdateStatus, autoDownload: S.AutoUpdate); }
-                finally { _checkButton.IsEnabled = true; }
+                if (UpdateService.CanCancelDownload) UpdateService.CancelDownload();
+                else await UpdateService.RunCheckAsync(autoDownload: S.AutoUpdate);
             };
             ub.Children.Add(Row("手动检查更新", _checkButton));
             _updateStatus = new TextBlock
             {
-                Text = "",
                 FontSize = 12.5,
                 Margin = new Thickness(0, 10, 0, 0),
                 TextWrapping = TextWrapping.Wrap
             };
             _updateStatus.SetResourceReference(TextElement.ForegroundProperty, "SettingsSubTextBrush");
+            RefreshUpdateStatus();
             ub.Children.Add(_updateStatus);
             ub.Children.Add(MakeHint("「自动下载更新」需要开启「自动检查更新」;下载完成后会先询问,确认后才安装。" +
                                      "安装新版本时会退出 YukiDesk 并启动安装程序,设置与小文件夹不会丢失。", 14));
@@ -1721,10 +1721,13 @@ namespace DesktopBar
             return button;
         }
 
-        private void SetUpdateStatus(string text)
+        private void RefreshUpdateStatus()
         {
-            if (_updateStatus == null) return;
-            _updateStatus.Text = text;
+            bool cancelable = UpdateService.CanCancelDownload;
+            _checkButton.Content = cancelable ? "取消下载" : "检查更新";
+            _checkButton.IsEnabled = cancelable || !UpdateService.Busy;
+            _updateStatus.Text = UpdateService.Status;
+            _updateStatus.Visibility = _updateStatus.Text.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
         }
     }
 }
