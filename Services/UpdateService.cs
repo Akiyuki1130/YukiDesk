@@ -396,6 +396,7 @@ namespace DesktopBar.Services
 
                 if (info == null) { PublishStatus("当前已是最新版本 (v" + CurrentVersionLabel + ")"); return; }
                 PublishStatus("发现新版本 v" + info.Version);
+                WindowsUpdateNotifications.Available(info.Version);
 
                 if (!autoDownload)
                 {
@@ -426,6 +427,7 @@ namespace DesktopBar.Services
                 }
 
                 PublishStatus("下载完成，可以安装。");
+                WindowsUpdateNotifications.Downloaded(info.Version);
                 // 安装会退出应用,默认键/焦点必须在"取消"侧,回车不能直接触发安装。
                 if (!ConfirmDialog.Show("YukiDesk 更新",
                     "新版本 v" + info.Version + " 已下载完成。\n\n立即安装吗?安装时会先退出 YukiDesk。", "立即安装",
@@ -505,8 +507,7 @@ namespace DesktopBar.Services
                                 if (App.Settings.AutoUpdate)
                                     await RunCheckAsync(autoDownload: true, info);
                                 else
-                                    App.ShowTrayBalloon("YukiDesk 有新版本",
-                                        "v" + info.Version + " 已发布,可在 设置 → 关于 中手动更新。");
+                                    WindowsUpdateNotifications.Available(info.Version);
                             }
                         }
                         finally { Volatile.Write(ref _autoCheckRunning, 0); }

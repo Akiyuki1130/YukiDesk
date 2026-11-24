@@ -26,6 +26,7 @@
 
 #define MyAppName "YukiDesk"
 #define MyAppExe "YukiDesk.exe"
+#define MyAppUserModelId "Akiyuki1130.YukiDesk"
 #define MyAppVersion GetVersionNumbersString(AddBackslash(SourcePath) + PublishDir + "\YukiDesk.exe")
 
 [Setup]
@@ -74,7 +75,8 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Source: "{#PublishDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"
+; 仅展示更新状态的本地通知，用固定 CLSID 让 Windows 保留通知记录。
+Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"; AppUserModelID: "{#MyAppUserModelId}"; AppUserModelToastActivatorCLSID: "24B72C03-33B1-4D8A-B007-6952845F68EE"
 Name: "{group}\卸载 {#MyAppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"; Tasks: desktopicon
 
