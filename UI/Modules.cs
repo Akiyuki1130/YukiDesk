@@ -484,59 +484,55 @@ namespace DesktopBar.UI
 
     public class VolumeModule : ModuleBase
     {
-        private readonly VolumeService _volume = new VolumeService();
-        private readonly FrameworkElement _summary;
-        private readonly System.Windows.Shapes.Path _speakerWave1, _speakerWave2;
+        private readonly System.Windows.Shapes.Path _speakerWave1, _speakerWave2, _speakerMute;
         private readonly TextBlock _value;
         private readonly Slider _slider;
         private readonly TextBlock _output;
+        private readonly Button _muteButton;
         private readonly AnimatedPanelSection _mixer;
+        private AudioOutput _outputWorker;
+        private string _outputId;
+        private long _requestedVolume, _requestedMute;
+        private int _outputUiQueued;
         private AudioMixer _mixerWorker;
         private int _mixerRequest;
-        private DispatcherTimer _poll;
-        private DispatcherTimer _writeTimer;
-        private (float Value, string OutputId)? _pendingVolume;
-        private DateTime _lastUserAdjustUtc;
         private bool _syncing;
         private bool _muted;
-        private bool _volumeAvailable;
         private bool _volumeWritesEnabled;
-        private bool _disposed;
+        private volatile bool _disposed;
         public VolumeModule(TabStyle st) : base(st)
         {
             Pill.Width = 38 * Ui.Scale;
             Pill.MinWidth = Pill.MaxWidth = 38 * Ui.Scale;
             Pill.Padding = new Thickness(0);
             Pill.HorizontalAlignment = HorizontalAlignment.Left;
-            _summary = CenterIcon(MakeSpeakerGlyph(out _speakerWave1, out _speakerWave2, 23));
-            Pill.Child = _summary;
-            // 读取启动值只用于显示；初始化期间禁止任何回写系统音量。
-            _syncing = true;
-            float? initialVolumeRead = _volume.GetVolume();
-            bool initialVolumeAvailable = initialVolumeRead.HasValue;
-            _volumeAvailable = initialVolumeAvailable;
-            float initialVolume = initialVolumeRead ?? 0;
-            _muted = _volume.GetMute() ?? false;
-            _syncing = false;
+            Pill.Child = CenterIcon(MakeSpeakerGlyph(out _speakerWave1, out _speakerWave2, out _speakerMute, 23));
             var body = new StackPanel { Width = 230 * Ui.Scale };
             body.Children.Add(MakePanelTitle("音量"));
-            _output = MakeText("默认输出", -1);
+            var outputRow = new DockPanel { Margin = new Thickness(0, 3 * Ui.Scale, 0, 5 * Ui.Scale) };
+            _muteButton = PanelControls.GlassButton("静音", ToggleMute, compact: true);
+            _muteButton.MinWidth = 74 * Ui.Scale;
+            _muteButton.IsEnabled = false;
+            DockPanel.SetDock(_muteButton, Dock.Right);
+            outputRow.Children.Add(_muteButton);
+            _output = MakeText("正在读取输出设备…", -1);
             _output.TextTrimming = TextTrimming.CharacterEllipsis;
-            _output.Margin = new Thickness(0, 3, 0, 5);
-            body.Children.Add(_output);
+            _output.VerticalAlignment = VerticalAlignment.Center;
+            outputRow.Children.Add(_output);
+            body.Children.Add(outputRow);
             _slider = new Slider
             {
                 Minimum = 0,
                 Maximum = 1,
-                Value = initialVolume,
                 Style = (Style)Application.Current.FindResource("CapsuleSlider"),
+                IsEnabled = false,
                 LargeChange = 0.02,
                 SmallChange = 0.01
             };
             _slider.SetResourceReference(Control.BackgroundProperty, "ThemePanelControl");
             PanelControls.ReleasePointerFocus(_slider);
             System.Windows.Automation.AutomationProperties.SetName(_slider, "音量");
-            _value = MakeText(initialVolumeAvailable ? Math.Round(initialVolume * 100) + "%" : "读取失败");
+            _value = MakeText("—");
             _value.FontWeight = FontWeights.Bold;
             body.Children.Add(Ui.SliderWithValue(_slider, _value, 52 * Ui.Scale, panel: true));
             body.Children.Add(PanelControls.GlassButton("Windows 声音设置", () => NativeMethods.ShellExecuteOpen("ms-settings:sound")));
@@ -554,87 +550,21 @@ namespace DesktopBar.UI
             applicationMixer.Margin = new Thickness(0, 10 * Ui.Scale, 0, 0);
             body.Children.Add(applicationMixer);
             body.Children.Add(_mixer);
-            _volume.OutputChanged += () =>
-            {
-                if (_disposed || Dispatcher.HasShutdownStarted) return;
-                Dispatcher.BeginInvoke(new Action(() =>
-                {
-                    if (_disposed || !Open) return;
-                    _volume.SyncDefaultIfChanged();
-                    SyncFromDevice();
-                    UpdateOutputName();
-                    if (_mixer.Expanded) UpdateMixer();
-                }));
-            };
-            _slider.IsEnabled = initialVolumeAvailable;
             Panel.Child = body;
-            // 写音量经 120ms 合并:一次拖动只落一次系统写,不逐刻度跨进程写。
-            _writeTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(120) };
-            _writeTimer.Tick += (s, e) =>
-            {
-                _writeTimer.Stop();
-                var pending = _pendingVolume;
-                _pendingVolume = null;
-                if (pending is { } write && _volumeAvailable && _volumeWritesEnabled && IsLoaded
-                    && !_volume.SetVolumeForOutput(write.Value, write.OutputId))
-                {
-                    _volume.SyncDefaultIfChanged();
-                    SyncFromDevice();
-                }
-            };
             _slider.ValueChanged += (s, e) =>
             {
                 _value.Text = Math.Round(e.NewValue * 100) + "%";
-                UpdateIcon(e.NewValue, _muted);
-                if (!_syncing && _volumeAvailable && _volumeWritesEnabled && IsLoaded)
-                {
-                    _pendingVolume = ((float)e.NewValue, _volume.OutputId);
-                    _lastUserAdjustUtc = DateTime.UtcNow;
-                    _writeTimer.Stop();
-                    _writeTimer.Start();
-                }
+                UpdateIcon(e.NewValue);
+                if (!_syncing && _volumeWritesEnabled && IsLoaded)
+                    _requestedVolume = _outputWorker?.SetVolume(_outputId, (float)e.NewValue) ?? 0;
             };
-            Pill.MouseLeftButtonUp += (s, e) =>
-            {
-                _volumeWritesEnabled = true;
-                _muted = !_muted;
-                if (_volumeAvailable && _volumeWritesEnabled && IsLoaded)
-                {
-                    // 静音写入前先跟随默认设备,否则设备切换后 800ms 内会把静音写到旧端点。
-                    _volume.SyncDefaultIfChanged();
-                    _volume.SetMute(_muted);
-                }
-                UpdateIcon(_slider.Value, _muted);
-            };
-            UpdateIcon(initialVolume, _muted);
-            // 启动阶段只读系统音量；必须先发生明确的用户操作才允许写回。
+            Pill.MouseLeftButtonUp += (_, _) => ToggleMute();
+            UpdateIcon(0);
+            Loaded += (_, _) => StartOutput();
+            IsVisibleChanged += (_, _) => StartOutput();
             Unloaded += (s, e) => _volumeWritesEnabled = false;
             _slider.PreviewMouseLeftButtonDown += (s, e) => _volumeWritesEnabled = true;
             _slider.PreviewKeyDown += (s, e) => _volumeWritesEnabled = true;
-            _poll = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(800) };
-            _poll.Tick += (s, e) =>
-            {
-                // 每个轮询周期都跟随默认设备;只在面板打开时轮询,一条 COM 查询开销可忽略。
-                _volume.SyncDefaultIfChanged();
-                float? current = _volume.GetVolume();
-                bool? muted = _volume.GetMute();
-                if (current.HasValue)
-                {
-                    _volumeAvailable = true;
-                    _slider.IsEnabled = true;
-                    UpdateIcon(current.Value, muted ?? _muted);
-                    // 用户正在调整(1.2 秒内)时不要把滑块拽回设备值,避免拖动中跳变。
-                    if ((DateTime.UtcNow - _lastUserAdjustUtc).TotalMilliseconds > 1200)
-                        SyncControls(current.Value);
-                }
-                else
-                {
-                    _volumeAvailable = false;
-                    _slider.IsEnabled = false;
-                    _value.Text = "读取失败";
-                }
-                if (muted.HasValue) _muted = muted.Value;
-            };
             Pill.MouseWheel += (s, e) => { _volumeWritesEnabled = true; Adjust(e.Delta); };
             Panel.MouseWheel += (s, e) =>
             {
@@ -646,26 +576,49 @@ namespace DesktopBar.UI
 
         protected override void OnPanelShown()
         {
-            _volume.SyncDefaultIfChanged();
-            SyncFromDevice();
-            _volume.WatchOutput();
-            UpdateOutputName();
-            _poll.Start();
+            StartOutput();
+            _outputWorker?.RequestRefresh();
         }
 
-        private void UpdateOutputName()
+        private void StartOutput()
         {
-            _output.Text = _volume.DefaultOutputName() ?? "暂无默认播放设备";
+            if (!_disposed && IsLoaded && IsVisible && _outputWorker == null)
+                _outputWorker = new AudioOutput(QueueOutputUpdate);
+        }
+
+        private void QueueOutputUpdate()
+        {
+            if (_disposed || Dispatcher.HasShutdownStarted || Interlocked.Exchange(ref _outputUiQueued, 1) != 0) return;
+            Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() =>
+            {
+                Interlocked.Exchange(ref _outputUiQueued, 0);
+                if (!_disposed && _outputWorker?.Current is { } snapshot) ApplyOutput(snapshot);
+            }));
+        }
+
+        private void ApplyOutput(AudioOutput.Snapshot snapshot)
+        {
+            bool changedDevice = !string.Equals(snapshot.Id, _outputId, StringComparison.OrdinalIgnoreCase);
+            _outputId = snapshot.Id;
+            if (changedDevice) _requestedVolume = _requestedMute = 0;
+            if (snapshot.MuteRevision >= _requestedMute) _muted = snapshot.Muted ?? false;
+            _output.Text = snapshot.Name ?? (snapshot.Id != null ? "默认输出" : "暂无默认播放设备");
             _output.ToolTip = _output.Text;
+            _slider.IsEnabled = snapshot.Volume.HasValue;
+            _muteButton.IsEnabled = snapshot.Muted.HasValue;
+            if (snapshot.Volume is float value)
+            {
+                if (changedDevice || !_slider.IsMouseCaptureWithin && snapshot.VolumeRevision >= _requestedVolume)
+                    SyncControls(value);
+            }
+            else _value.Text = "—";
+            UpdateIcon(snapshot.Volume == null ? 0 : _slider.Value);
+            if (changedDevice && _mixer.Expanded) UpdateMixer();
         }
 
         protected override Size GetPanelEnvelope(Size content) => new(content.Width, content.Height + 265 * Ui.Scale);
 
-        protected override void OnPanelHidden()
-        {
-            _poll.Stop();
-            CloseMixer();
-        }
+        protected override void OnPanelHidden() => CloseMixer();
 
         private void CloseMixer(bool animate = false)
         {
@@ -685,7 +638,7 @@ namespace DesktopBar.UI
                 entries.IsEnabled = false;
             var snapshot = await _mixerWorker.ReadAsync();
             if (_disposed || !_mixer.Expanded || request != _mixerRequest) return;
-            SetMixerContent(snapshot, snapshot == null ? "当前设备无法读取应用音量" : "暂无正在播放的应用");
+            SetMixerContent(snapshot, snapshot == null ? "当前设备无法读取应用音量" : "暂无音频应用");
         }
 
         private void SetMixerContent(AudioMixer.Snapshot snapshot, string emptyText)
@@ -707,7 +660,31 @@ namespace DesktopBar.UI
             var entries = new StackPanel();
             foreach (var item in snapshot.Entries)
             {
-                entries.Children.Add(PanelControls.Text(item.Name));
+                var title = new DockPanel { Margin = new Thickness(0, 0, 0, 2 * Ui.Scale) };
+                bool muted = item.Muted;
+                Button mute = null;
+                mute = PanelControls.GlassButton("", () =>
+                {
+                    muted = !muted;
+                    _mixerWorker?.SetMute(snapshot.Revision, item.Index, muted);
+                    ShowMuteState();
+                }, compact: true);
+                mute.MinWidth = 74 * Ui.Scale;
+                void ShowMuteState()
+                {
+                    string action = muted ? "取消静音" : "静音";
+                    mute.Content = action;
+                    System.Windows.Automation.AutomationProperties.SetName(mute, item.Name + " " + action);
+                }
+                ShowMuteState();
+                DockPanel.SetDock(mute, Dock.Right);
+                title.Children.Add(mute);
+                var name = PanelControls.Text(item.Name);
+                name.VerticalAlignment = VerticalAlignment.Center;
+                name.TextTrimming = TextTrimming.CharacterEllipsis;
+                name.ToolTip = item.Name;
+                title.Children.Add(name);
+                entries.Children.Add(title);
                 var slider = new Slider { Minimum = 0, Maximum = 1, Value = item.Volume, SmallChange = .02,
                     Style = (Style)Application.Current.FindResource("CapsuleSlider") };
                 slider.SetResourceReference(Control.BackgroundProperty, "ThemePanelControl");
@@ -733,44 +710,35 @@ namespace DesktopBar.UI
             _syncing = false;
         }
 
-        private void SyncFromDevice()
+        private void ToggleMute()
         {
-            float? value = _volume.GetVolume();
-            bool? muted = _volume.GetMute();
-            if (muted.HasValue) _muted = muted.Value;
-            if (value.HasValue)
-            {
-                _volumeAvailable = true;
-                _slider.IsEnabled = true;
-                SyncControls(value.Value);
-                UpdateIcon(value.Value, _muted);
-            }
-            else
-            {
-                _volumeAvailable = false;
-                _slider.IsEnabled = false;
-                _value.Text = "读取失败";
-            }
+            if (_outputId == null || !_muteButton.IsEnabled) return;
+            _muted = !_muted;
+            UpdateIcon(_slider.Value);
+            _requestedMute = _outputWorker?.SetMute(_outputId, _muted) ?? 0;
         }
-        private void UpdateIcon(double volume, bool muted)
+
+        private void UpdateIcon(double volume)
         {
-            _speakerWave1.Opacity = muted || volume < 0.01 ? 0 : 1;
-            _speakerWave2.Opacity = muted || volume < 0.34 ? 0 : 1;
+            _speakerWave1.Opacity = _muted || volume < 0.01 ? 0 : 1;
+            _speakerWave2.Opacity = _muted || volume < 0.34 ? 0 : 1;
+            _speakerMute.Opacity = _muted ? 1 : 0;
+            _muteButton.Content = _muted ? "取消静音" : "静音";
+            Pill.ToolTip = _outputId == null ? _output.Text
+                : $"{_output.Text} · {volume:P0}" + (_muted ? " · 已静音" : "");
         }
         private void Adjust(int delta)
         {
-            _lastUserAdjustUtc = DateTime.UtcNow;
+            if (!_slider.IsEnabled || delta == 0) return;
             _slider.Value = Math.Max(0, Math.Min(1, _slider.Value + (delta > 0 ? 0.04 : -0.04)));
         }
         public override void Dispose()
         {
             if (_disposed) return;
             _disposed = true;
-            _poll.Stop();
-            _writeTimer?.Stop();
             CloseMixer();
             _mixerWorker?.Dispose();
-            _volume.Dispose();
+            _outputWorker?.Dispose();
             base.Dispose();
         }
     }

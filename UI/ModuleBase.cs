@@ -1130,7 +1130,7 @@ namespace DesktopBar.UI
             return IconViewbox(size, canvas);
         }
 
-        protected FrameworkElement MakeSpeakerGlyph(out Path wave1, out Path wave2, double size = 23)
+        protected FrameworkElement MakeSpeakerGlyph(out Path wave1, out Path wave2, out Path mute, double size = 23)
         {
             var canvas = new Canvas { Width = 24, Height = 24 };
             var body = new Path
@@ -1163,6 +1163,15 @@ namespace DesktopBar.UI
             wave2.SetResourceReference(Shape.StrokeProperty, ContentInkKey);
             canvas.Children.Add(wave1);
             canvas.Children.Add(wave2);
+            mute = new Path
+            {
+                Data = Geometry.Parse("M15.5,10 L20.5,15 M20.5,10 L15.5,15"),
+                Stroke = Ui.Brush(ThemeService.Text, 1), StrokeThickness = 1.7,
+                StrokeStartLineCap = PenLineCap.Round, StrokeEndLineCap = PenLineCap.Round,
+                Opacity = 0
+            };
+            mute.SetResourceReference(Shape.StrokeProperty, ContentInkKey);
+            canvas.Children.Add(mute);
             return IconViewbox(size, canvas);
         }
 

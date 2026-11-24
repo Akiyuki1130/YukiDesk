@@ -16,7 +16,9 @@ namespace DesktopBar.Services
         private bool _disposed;
         private EndpointNotifications _notifications;
         private IntPtr _notificationsPointer;
+        private IntPtr _volumeNotificationsPointer;
         internal event Action OutputChanged;
+        internal event Action VolumeChanged;
         internal string OutputId => _endpoint == null ? null : _selectedId;
 
         internal bool IsBoundToDefaultOutput()
@@ -79,18 +81,25 @@ namespace DesktopBar.Services
                 Ensure();
                 if (outputId != null && (!DeviceIdsEqual(_selectedId, outputId)
                     || !DeviceIdsEqual(GetDefaultDeviceId(), outputId))) return false;
-                Check(_endpoint.SetMasterVolumeLevelScalar(Math.Max(0, Math.Min(1, value)), Guid.Empty), "设置系统音量");
+                Check(_endpoint.SetMasterVolumeLevelScalar(Math.Max(0, Math.Min(1, value)), IntPtr.Zero), "设置系统音量");
                 return true;
             }
             catch (Exception ex) { App.Log("设置系统音量失败: " + ex.Message); InvalidateEndpoint(); return false; }
         }
 
-        public bool SetMute(bool mute)
+        public bool SetMute(bool mute) => SetMute(mute, null);
+
+        internal bool SetMuteForOutput(bool mute, string outputId)
+            => !string.IsNullOrEmpty(outputId) && SetMute(mute, outputId);
+
+        private bool SetMute(bool mute, string outputId)
         {
             try
             {
                 Ensure();
-                Check(_endpoint.SetMute(mute, Guid.Empty), "设置静音");
+                if (outputId != null && (!DeviceIdsEqual(_selectedId, outputId)
+                    || !DeviceIdsEqual(GetDefaultDeviceId(), outputId))) return false;
+                Check(_endpoint.SetMute(mute, IntPtr.Zero), "设置静音");
                 return true;
             }
             catch (Exception ex) { App.Log("设置静音失败: " + ex.Message); InvalidateEndpoint(); return false; }
@@ -108,10 +117,12 @@ namespace DesktopBar.Services
         {
             try
             {
-                Ensure();
+                EnsureEnumerator();
                 string defaultId = GetDefaultDeviceId();
-                if (string.IsNullOrEmpty(defaultId) || DeviceIdsEqual(_selectedId, defaultId)) return false;
-                return TryBindEndpoint(defaultId);
+                if (_endpoint != null && defaultId.Length != 0 && DeviceIdsEqual(_selectedId, defaultId)) return false;
+                if (TryBindEndpoint(defaultId)) return true;
+                InvalidateEndpoint();
+                return false;
             }
             catch (Exception ex) { App.Log("跟随默认播放设备失败: " + ex.Message); return false; }
         }
@@ -134,27 +145,25 @@ namespace DesktopBar.Services
                 _enumerator = (IMMDeviceEnumerator)Activator.CreateInstance(Type.GetTypeFromCLSID(EnumeratorClass));
         }
 
-        internal string DefaultOutputName()
+        internal string BoundOutputName()
         {
-            IMMDevice device = null;
+            if (_device == null) return null;
             IAudioPropertyStore store = null;
             try
             {
-                EnsureEnumerator();
-                Check(_enumerator.GetDefaultAudioEndpoint(EDataFlow.Render, ERole.Multimedia, out device), "查找播放设备");
-                Check(device.OpenPropertyStore(0, out store), "读取播放设备属性");
+                Check(_device.OpenPropertyStore(0, out store), "读取播放设备属性");
                 var key = new AudioPropertyKey { Format = new Guid("A45C254E-DF1C-4EFD-8020-67D146A850E0"), Id = 14 };
                 Check(store.GetValue(ref key, out var value), "读取播放设备名称");
                 try { return value.Type == 31 ? Marshal.PtrToStringUni(value.Text) : null; }
                 finally { PropVariantClear(ref value); }
             }
             catch (Exception) { return null; }
-            finally { Release(store); Release(device); }
+            finally { Release(store); }
         }
 
-        internal void WatchOutput()
+        internal bool WatchOutput()
         {
-            if (_notificationsPointer != IntPtr.Zero) return;
+            if (_notificationsPointer != IntPtr.Zero) return true;
             IntPtr pointer = IntPtr.Zero;
             try
             {
@@ -163,12 +172,35 @@ namespace DesktopBar.Services
                 pointer = Marshal.GetComInterfaceForObject(_notifications, typeof(IAudioEndpointNotifications));
                 Check(_enumerator.RegisterEndpointNotificationCallback(pointer), "监听播放设备");
                 _notificationsPointer = pointer;
+                return true;
             }
             catch (Exception ex)
             {
                 if (pointer != IntPtr.Zero) Marshal.Release(pointer);
                 _notifications = null;
                 App.Log("播放设备通知注册失败: " + ex.Message);
+                return false;
+            }
+        }
+
+        internal bool WatchVolume()
+        {
+            if (_volumeNotificationsPointer != IntPtr.Zero) return true;
+            if (_endpoint == null) return false;
+            IntPtr pointer = IntPtr.Zero;
+            try
+            {
+                var notifications = new VolumeNotifications(() => VolumeChanged?.Invoke());
+                pointer = Marshal.GetComInterfaceForObject(notifications, typeof(IAudioVolumeNotifications));
+                Check(_endpoint.RegisterControlChangeNotify(pointer), "监听系统音量");
+                _volumeNotificationsPointer = pointer;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                if (pointer != IntPtr.Zero) Marshal.Release(pointer);
+                App.Log("系统音量通知注册失败: " + ex.Message);
+                return false;
             }
         }
 
@@ -270,6 +302,12 @@ namespace DesktopBar.Services
 
         private void ReleaseEndpointOnly()
         {
+            if (_volumeNotificationsPointer != IntPtr.Zero)
+            {
+                try { _endpoint.UnregisterControlChangeNotify(_volumeNotificationsPointer); }
+                catch (COMException) { }
+                finally { Marshal.Release(_volumeNotificationsPointer); _volumeNotificationsPointer = IntPtr.Zero; }
+            }
             Release(_endpoint);
             _endpoint = null;
         }
@@ -285,6 +323,7 @@ namespace DesktopBar.Services
             }
             _notifications = null;
             OutputChanged = null;
+            VolumeChanged = null;
             ReleaseEndpointOnly();
             Release(_device);
             Release(_enumerator);
@@ -305,9 +344,9 @@ namespace DesktopBar.Services
         private interface IMMDeviceEnumerator
         {
             // 保留 COM vtable 的完整方法槽位，否则后续方法会错位调用。
-            int EnumAudioEndpoints(EDataFlow dataFlow, uint stateMask, out IntPtr devices);
-            int GetDefaultAudioEndpoint(EDataFlow dataFlow, ERole role, out IMMDevice endpoint);
-            int GetDevice([MarshalAs(UnmanagedType.LPWStr)] string id, out IMMDevice device);
+            [PreserveSig] int EnumAudioEndpoints(EDataFlow dataFlow, uint stateMask, out IntPtr devices);
+            [PreserveSig] int GetDefaultAudioEndpoint(EDataFlow dataFlow, ERole role, out IMMDevice endpoint);
+            [PreserveSig] int GetDevice([MarshalAs(UnmanagedType.LPWStr)] string id, out IMMDevice device);
             [PreserveSig] int RegisterEndpointNotificationCallback(IntPtr client);
             [PreserveSig] int UnregisterEndpointNotificationCallback(IntPtr client);
         }
@@ -317,10 +356,9 @@ namespace DesktopBar.Services
         {
             [PreserveSig] int Activate(ref Guid iid, uint clsctx, IntPtr activationParams,
                 [MarshalAs(UnmanagedType.IUnknown)] out object endpoint);
-            // 保留槽位；属性存储暂未使用。
             [PreserveSig] int OpenPropertyStore(uint access, out IAudioPropertyStore store);
-            int GetId(out IntPtr id);
-            int GetState(out uint state);
+            [PreserveSig] int GetId(out IntPtr id);
+            [PreserveSig] int GetState(out uint state);
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -371,31 +409,41 @@ namespace DesktopBar.Services
             public int OnPropertyValueChanged(string id, AudioPropertyKey key) => 0;
         }
 
+        [ComVisible(true), Guid("657804FA-D6AD-4496-8A60-352752AF4F89"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        public interface IAudioVolumeNotifications
+        {
+            [PreserveSig] int OnNotify(IntPtr data);
+        }
+
+        [ComVisible(true), ClassInterface(ClassInterfaceType.None)]
+        private sealed class VolumeNotifications : IAudioVolumeNotifications
+        {
+            private readonly Action _notify;
+            internal VolumeNotifications(Action notify) => _notify = notify;
+            public int OnNotify(IntPtr data) { _notify(); return 0; }
+        }
+
         [ComImport, Guid("5CDF2C82-841E-4546-9722-0CF74078229A"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
         private interface IAudioEndpointVolume
         {
-            int RegisterControlChangeNotify(IntPtr notify);
-            int UnregisterControlChangeNotify(IntPtr notify);
-            int GetChannelCount(out uint channels);
-            int SetMasterVolumeLevel(float level, Guid context);
-            int SetMasterVolumeLevelScalar(float level, Guid context);
-            int GetMasterVolumeLevel(out float level);
-            int GetMasterVolumeLevelScalar(out float level);
-            int SetChannelVolumeLevel(uint channel, float level, Guid context);
-            int SetChannelVolumeLevelScalar(uint channel, float level, Guid context);
-            int GetChannelVolumeLevel(uint channel, out float level);
-            int GetChannelVolumeLevelScalar(uint channel, out float scalar);
-            int SetMute([MarshalAs(UnmanagedType.Bool)] bool mute, Guid context);
-            // IAudioEndpointVolume 的 BOOL 是 4 字节;不带 MarshalAs 的 bool 按 VARIANT_BOOL(2 字节)
-            // 封送,GetMute 存在 2 字节越界写,必须显式指定。
-            int GetMute([MarshalAs(UnmanagedType.Bool)] out bool mute);
-            int GetVolumeStepInfo(out uint step, out uint stepCount);
-            int VolumeStepUp(Guid context);
-            int VolumeStepDown(Guid context);
-            int QueryHardwareSupport(out uint mask);
-            // 真实 vtable 末槽是 GetVolumeRange(min/max/increment dB);以前误命名为
-            // GetHardwareVolumeStepInfo,语义完全不同,虽从未调用也应改名防误用。
-            int GetVolumeRange(out float min, out float max, out float step);
+            [PreserveSig] int RegisterControlChangeNotify(IntPtr notify);
+            [PreserveSig] int UnregisterControlChangeNotify(IntPtr notify);
+            [PreserveSig] int GetChannelCount(out uint channels);
+            [PreserveSig] int SetMasterVolumeLevel(float level, IntPtr context);
+            [PreserveSig] int SetMasterVolumeLevelScalar(float level, IntPtr context);
+            [PreserveSig] int GetMasterVolumeLevel(out float level);
+            [PreserveSig] int GetMasterVolumeLevelScalar(out float level);
+            [PreserveSig] int SetChannelVolumeLevel(uint channel, float level, IntPtr context);
+            [PreserveSig] int SetChannelVolumeLevelScalar(uint channel, float level, IntPtr context);
+            [PreserveSig] int GetChannelVolumeLevel(uint channel, out float level);
+            [PreserveSig] int GetChannelVolumeLevelScalar(uint channel, out float scalar);
+            [PreserveSig] int SetMute([MarshalAs(UnmanagedType.Bool)] bool mute, IntPtr context);
+            [PreserveSig] int GetMute([MarshalAs(UnmanagedType.Bool)] out bool mute);
+            [PreserveSig] int GetVolumeStepInfo(out uint step, out uint stepCount);
+            [PreserveSig] int VolumeStepUp(IntPtr context);
+            [PreserveSig] int VolumeStepDown(IntPtr context);
+            [PreserveSig] int QueryHardwareSupport(out uint mask);
+            [PreserveSig] int GetVolumeRange(out float min, out float max, out float step);
         }
     }
 }

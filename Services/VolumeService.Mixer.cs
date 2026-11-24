@@ -12,20 +12,30 @@ namespace DesktopBar.Services
         {
             private readonly List<object> _sessions = new();
             internal string Name { get; }
-            internal float Volume { get; }
+            internal float Volume { get; private set; }
+            internal bool Muted { get; private set; } = true;
+            internal bool Active { get; private set; }
 
-            internal ApplicationVolume(string name, float volume)
+            internal ApplicationVolume(string name) => Name = name;
+
+            internal void Add(object session, float volume, bool muted, bool active)
             {
-                Name = name;
-                Volume = volume;
+                if (_sessions.Count == 0 || active && !Active) Volume = volume;
+                Muted &= muted;
+                Active |= active;
+                _sessions.Add(session);
             }
 
-            internal void Add(object session) => _sessions.Add(session);
-
-            internal void Write(float value)
+            internal void Write(float? level, bool? muted)
             {
+                int failure = 0;
                 foreach (var item in _sessions)
-                    if (item is ISimpleAudioVolume volume) volume.SetMasterVolume(Math.Clamp(value, 0, 1), Guid.Empty);
+                {
+                    if (item is not ISimpleAudioVolume volume) continue;
+                    if (level.HasValue) failure = Math.Min(failure, volume.SetMasterVolume(Math.Clamp(level.Value, 0, 1), IntPtr.Zero));
+                    if (muted.HasValue) failure = Math.Min(failure, volume.SetMute(muted.Value, IntPtr.Zero));
+                }
+                Check(failure, "设置应用音量或静音");
             }
 
             public void Dispose()
@@ -53,17 +63,18 @@ namespace DesktopBar.Services
                     bool retained = false;
                     try
                     {
-                        if (item is not IAudioSessionControl2 control || control.GetState(out int state) < 0 || state != 1
+                        if (item is not IAudioSessionControl2 control || control.GetState(out int state) < 0 || state is < 0 or > 1
                             || control.GetProcessId(out uint pid) < 0 || item is not ISimpleAudioVolume volume
-                            || volume.GetMasterVolume(out float level) < 0) continue;
+                            || volume.GetMasterVolume(out float level) < 0 || volume.GetMute(out bool muted) < 0) continue;
                         if (!groups.TryGetValue(pid, out var group))
-                            groups[pid] = group = new ApplicationVolume(SessionName(pid), level);
-                        group.Add(item);
+                            groups[pid] = group = new ApplicationVolume(SessionName(pid));
+                        group.Add(item, level, muted, state == 1);
                         retained = true;
                     }
                     finally { if (!retained) Release(item); }
                 }
-                return groups.Values.OrderBy(group => group.Name, StringComparer.CurrentCultureIgnoreCase).ToArray();
+                return groups.Values.OrderByDescending(group => group.Active)
+                    .ThenBy(group => group.Name, StringComparer.CurrentCultureIgnoreCase).ToArray();
             }
             catch (Exception ex)
             {
@@ -120,8 +131,10 @@ namespace DesktopBar.Services
         [ComImport, Guid("87CE5498-68D6-44E5-9215-6DA47EF883D8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
         private interface ISimpleAudioVolume
         {
-            [PreserveSig] int SetMasterVolume(float value, [MarshalAs(UnmanagedType.LPStruct)] Guid context);
+            [PreserveSig] int SetMasterVolume(float value, IntPtr context);
             [PreserveSig] int GetMasterVolume(out float value);
+            [PreserveSig] int SetMute([MarshalAs(UnmanagedType.Bool)] bool muted, IntPtr context);
+            [PreserveSig] int GetMute([MarshalAs(UnmanagedType.Bool)] out bool muted);
         }
     }
 }

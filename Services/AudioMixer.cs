@@ -8,13 +8,14 @@ namespace DesktopBar.Services
 {
     internal sealed class AudioMixer : IDisposable
     {
-        internal sealed record Entry(int Index, string Name, float Volume);
+        internal sealed record Entry(int Index, string Name, float Volume, bool Muted);
         internal sealed record Snapshot(int Revision, Entry[] Entries);
         private sealed record Refresh(int Revision, TaskCompletionSource<Snapshot> Completion);
+        private readonly record struct Change(float? Volume, bool? Muted);
         private const int WriteIntervalMs = 60;
 
         private readonly object _gate = new();
-        private readonly Dictionary<(int Revision, int Index), float> _writes = new();
+        private readonly Dictionary<(int Revision, int Index), Change> _writes = new();
         private Refresh _refresh;
         private int _revision;
         private long _writeAt;
@@ -51,13 +52,18 @@ namespace DesktopBar.Services
             }
         }
 
-        internal void SetVolume(int revision, int index, float value)
+        internal void SetVolume(int revision, int index, float value) => QueueChange(revision, index, value, null);
+
+        internal void SetMute(int revision, int index, bool value) => QueueChange(revision, index, null, value);
+
+        private void QueueChange(int revision, int index, float? volume, bool? muted)
         {
             lock (_gate)
             {
                 if (_disposed || revision != _revision) return;
                 if (_writes.Count == 0) _writeAt = Environment.TickCount64 + WriteIntervalMs;
-                _writes[(revision, index)] = value;
+                var pending = _writes.GetValueOrDefault((revision, index));
+                _writes[(revision, index)] = new Change(volume ?? pending.Volume, muted ?? pending.Muted);
                 Monitor.Pulse(_gate);
             }
         }
@@ -72,7 +78,7 @@ namespace DesktopBar.Services
                 while (true)
                 {
                     Refresh refresh;
-                    KeyValuePair<(int Revision, int Index), float>[] writes;
+                    KeyValuePair<(int Revision, int Index), Change>[] writes;
                     lock (_gate)
                     {
                         while (!_disposed && _refresh == null)
@@ -97,7 +103,7 @@ namespace DesktopBar.Services
                         foreach (var write in writes)
                         {
                             if (write.Key.Revision != revision || (uint)write.Key.Index >= sessions.Length) continue;
-                            try { sessions[write.Key.Index].Write(write.Value); }
+                            try { sessions[write.Key.Index].Write(write.Value.Volume, write.Value.Muted); }
                             catch (Exception ex) { App.Log("写入应用音量失败: " + ex.Message); }
                         }
                     }
@@ -110,7 +116,7 @@ namespace DesktopBar.Services
                     sessions = volume.ReadApplicationVolumes();
                     revision = refresh.Revision;
                     var snapshot = sessions == null ? null : new Snapshot(revision,
-                        sessions.Select((item, index) => new Entry(index, item.Name, item.Volume)).ToArray());
+                        sessions.Select((item, index) => new Entry(index, item.Name, item.Volume, item.Muted)).ToArray());
                     lock (_gate)
                         refresh.Completion.TrySetResult(!_disposed && _revision == revision ? snapshot : null);
                 }
