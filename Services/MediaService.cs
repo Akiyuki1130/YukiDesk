@@ -26,10 +26,15 @@ namespace DesktopBar.Services
         public TimeSpan Duration { get; }
         public bool SeekSupported { get; }
         public BitmapSource Cover { get; }
+        internal TimeSpan Start { get; }
+        internal TimeSpan SeekFrom { get; }
+        internal TimeSpan SeekTo { get; }
+        internal double PlaybackRate { get; }
 
         public MediaInfo(long generation, bool hasSession, string sessionKey, string trackKey,
             string thumbnailKey, string title, string artist, BitmapSource cover, bool playing,
-            TimeSpan position, TimeSpan duration, bool seekSupported)
+            TimeSpan position, TimeSpan duration, bool seekSupported, TimeSpan start = default,
+            TimeSpan seekFrom = default, TimeSpan? seekTo = null, double playbackRate = 1)
         {
             Generation = generation;
             HasSession = hasSession;
@@ -43,6 +48,10 @@ namespace DesktopBar.Services
             Position = position;
             Duration = duration;
             SeekSupported = seekSupported;
+            Start = start;
+            SeekFrom = seekFrom;
+            SeekTo = seekTo ?? duration;
+            PlaybackRate = double.IsFinite(playbackRate) ? playbackRate : 1;
         }
     }
 
@@ -54,12 +63,13 @@ namespace DesktopBar.Services
         private readonly Dispatcher _dispatcher;
         private GlobalSystemMediaTransportControlsSessionManager _manager;
         private GlobalSystemMediaTransportControlsSession _session;
-        private DispatcherTimer _timer;
+        private DispatcherTimer _timer, _retryTimer;
         private long _sessionGeneration;
         private long _refreshGeneration;
         private long _publishedGeneration;
         private bool _started;
         private bool _disposed;
+        private bool _progressDemand;
         private string _sessionKey = "";
         private MediaInfo _current = new MediaInfo(0, false, "", "", "", "", "", null,
             false, TimeSpan.Zero, TimeSpan.Zero, false);
@@ -76,13 +86,23 @@ namespace DesktopBar.Services
 
         public MediaService(Dispatcher dispatcher) { _dispatcher = dispatcher; }
 
-        public async Task SeekAsync(TimeSpan position)
+        internal async Task<bool> SeekAsync(MediaInfo expected, TimeSpan position)
         {
             var session = _session;
-            if (_disposed || session == null) return;
-            try { await session.TryChangePlaybackPositionAsync((long)Math.Max(0, position.Ticks)); }
-            catch (Exception ex) { App.Log("媒体定位失败: " + ex.Message); }
+            if (_disposed || session == null || !_current.SeekSupported || !SameTrack(expected, _current)) return false;
+            long ticks = _current.Start.Ticks + Math.Clamp(position.Ticks, _current.SeekFrom.Ticks, _current.SeekTo.Ticks);
+            try
+            {
+                bool changed = await session.TryChangePlaybackPositionAsync(ticks);
+                if (changed) Push(session);
+                return changed;
+            }
+            catch (Exception ex) { App.Log("媒体定位失败: " + ex.Message); return false; }
         }
+
+        internal static bool SameTrack(MediaInfo left, MediaInfo right)
+            => left is { HasSession: true } && right is { HasSession: true }
+                && left.TrackKey.Length > 0 && left.TrackKey == right.TrackKey && left.SessionKey == right.SessionKey;
 
         public async Task StartAsync()
         {
@@ -90,8 +110,9 @@ namespace DesktopBar.Services
             _started = true;
             try
             {
-                _manager = await GlobalSystemMediaTransportControlsSessionManager.RequestAsync();
+                var manager = await GlobalSystemMediaTransportControlsSessionManager.RequestAsync();
                 if (_disposed) return;
+                _manager = manager;
             }
             catch (Exception ex)
             {
@@ -99,16 +120,7 @@ namespace DesktopBar.Services
                 _started = false;
                 Post(() => Hook(null));
                 // 初始化瞬间 SMTC 不可用时不能永久放弃,否则音乐胶囊直到重启都不再出现。
-                Post(() =>
-                {
-                    try
-                    {
-                        var retry = new DispatcherTimer { Interval = TimeSpan.FromSeconds(60) };
-                        retry.Tick += (s, e) => { retry.Stop(); _ = StartAsync(); };
-                        retry.Start();
-                    }
-                    catch { }
-                });
+                Post(ScheduleRetry);
                 return;
             }
 
@@ -119,8 +131,33 @@ namespace DesktopBar.Services
 
             _timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(500) };
             _timer.Tick += OnTimerTick;
-            _timer.Start();
             SelectSession();
+        }
+
+        private void ScheduleRetry()
+        {
+            if (_disposed || _started) return;
+            _retryTimer ??= new DispatcherTimer(TimeSpan.FromSeconds(60), DispatcherPriority.Background, RetryStartup, _dispatcher);
+            _retryTimer.Start();
+        }
+
+        private void RetryStartup(object sender, EventArgs args)
+        {
+            _retryTimer.Stop();
+            _ = StartAsync();
+        }
+
+        internal void SetProgressDemand(bool active)
+        {
+            if (_disposed || _progressDemand == active) return;
+            _progressDemand = active;
+            UpdatePolling();
+            if (active && _session is { } session) Post(() => Push(session));
+        }
+
+        private void UpdatePolling()
+        {
+            if (_timer != null) _timer.IsEnabled = _progressDemand && _session != null;
         }
 
         internal (string Id, string Title)[] Sources()
@@ -199,6 +236,7 @@ namespace DesktopBar.Services
             _sessionGeneration++;
             _refreshGeneration++;
             _sessionKey = session?.SourceAppUserModelId ?? "";
+            UpdatePolling();
             PublishEmpty(session != null);
 
             if (session == null)
@@ -243,18 +281,15 @@ namespace DesktopBar.Services
             {
                 var props = await session.TryGetMediaPropertiesAsync();
                 if (!IsCurrent(session, sessionGeneration, refreshGeneration)) return;
-                var timeline = session.GetTimelineProperties();
                 string title = props?.Title ?? "";
                 string artist = props?.Artist ?? "";
                 string sessionKey = session.SourceAppUserModelId ?? "";
                 string trackKey = BuildTrackKey(sessionKey, props);
-                bool seekSupported = timeline.MaxSeekTime > timeline.MinSeekTime;
-                GetPlayback(session, timeline, out bool playing, out TimeSpan position);
 
                 var previous = _current;
                 bool sameTrack = string.Equals(previous.TrackKey, trackKey, StringComparison.Ordinal);
-                Publish(new MediaInfo(NextPublishedGeneration(), true, sessionKey, trackKey, sameTrack ? previous.ThumbnailKey : "", title,
-                    artist, sameTrack ? previous.Cover : null, playing, position, timeline.EndTime, seekSupported));
+                Publish(ReadPlayback(session, sessionKey, trackKey, sameTrack ? previous.ThumbnailKey : "", title,
+                    artist, sameTrack ? previous.Cover : null));
 
                 var cover = await LoadCoverAsync(props?.Thumbnail);
                 if (!IsCurrent(session, sessionGeneration, refreshGeneration)) return;
@@ -262,11 +297,7 @@ namespace DesktopBar.Services
                     cover = new CoverResult(previous.Cover, previous.ThumbnailKey);
 
                 // 封面读取期间时间线可能推进；发布封面前再次读取，避免旧快照回退进度。
-                timeline = session.GetTimelineProperties();
-                seekSupported = timeline.MaxSeekTime > timeline.MinSeekTime;
-                GetPlayback(session, timeline, out playing, out position);
-                Publish(new MediaInfo(NextPublishedGeneration(), true, sessionKey, trackKey, cover.Key,
-                    title, artist, cover.Image, playing, position, timeline.EndTime, seekSupported));
+                Publish(ReadPlayback(session, sessionKey, trackKey, cover.Key, title, artist, cover.Image));
             }
             catch (Exception ex)
             {
@@ -291,14 +322,28 @@ namespace DesktopBar.Services
                 props?.TrackNumber.ToString() ?? "");
         }
 
-        private static void GetPlayback(GlobalSystemMediaTransportControlsSession session,
-            GlobalSystemMediaTransportControlsSessionTimelineProperties timeline, out bool playing,
-            out TimeSpan position)
+        private MediaInfo ReadPlayback(GlobalSystemMediaTransportControlsSession session, string sessionKey, string trackKey,
+            string thumbnailKey, string title, string artist, BitmapSource cover)
         {
+            var timeline = session.GetTimelineProperties();
             var playback = session.GetPlaybackInfo();
-            playing = playback != null && playback.PlaybackStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing;
-            position = ProjectPosition(timeline.Position, timeline.EndTime, timeline.LastUpdatedTime,
-                DateTimeOffset.UtcNow, playing, playback?.PlaybackRate ?? 1);
+            bool playing = playback?.PlaybackStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing;
+            double rate = playback?.PlaybackRate ?? 1;
+            var absolute = ProjectPosition(timeline.Position, timeline.EndTime, timeline.LastUpdatedTime, DateTimeOffset.UtcNow, playing, rate);
+            var (start, duration, position, seekFrom, seekTo) = RelativeTimeline(timeline.StartTime, timeline.EndTime, absolute,
+                timeline.MinSeekTime, timeline.MaxSeekTime);
+            bool seekSupported = playback?.Controls?.IsPlaybackPositionEnabled == true && seekTo > seekFrom;
+            return new MediaInfo(NextPublishedGeneration(), true, sessionKey, trackKey, thumbnailKey, title, artist, cover,
+                playing, position, duration, seekSupported, start, seekFrom, seekTo, rate);
+        }
+
+        internal static (TimeSpan Start, TimeSpan Duration, TimeSpan Position, TimeSpan SeekFrom, TimeSpan SeekTo) RelativeTimeline(
+            TimeSpan start, TimeSpan end, TimeSpan current, TimeSpan minSeek, TimeSpan maxSeek)
+        {
+            long first = Math.Max(0, start.Ticks);
+            long last = Math.Max(first, end.Ticks);
+            TimeSpan Offset(TimeSpan value) => TimeSpan.FromTicks(Math.Clamp(value.Ticks, first, last) - first);
+            return (TimeSpan.FromTicks(first), TimeSpan.FromTicks(last - first), Offset(current), Offset(minSeek), Offset(maxSeek));
         }
 
         internal static TimeSpan ProjectPosition(TimeSpan position, TimeSpan end, DateTimeOffset updated,
@@ -319,11 +364,8 @@ namespace DesktopBar.Services
             if (_disposed || session == null || !ReferenceEquals(_session, session) || !_current.HasSession) return;
             try
             {
-                var timeline = session.GetTimelineProperties();
-                GetPlayback(session, timeline, out bool playing, out TimeSpan position);
-                Publish(new MediaInfo(NextPublishedGeneration(), true, _current.SessionKey, _current.TrackKey,
-                    _current.ThumbnailKey, _current.Title, _current.Artist, _current.Cover, playing, position,
-                    timeline.EndTime, timeline.MaxSeekTime > timeline.MinSeekTime));
+                Publish(ReadPlayback(session, _current.SessionKey, _current.TrackKey, _current.ThumbnailKey,
+                    _current.Title, _current.Artist, _current.Cover));
             }
             catch (Exception ex)
             {
@@ -397,6 +439,8 @@ namespace DesktopBar.Services
         {
             if (_disposed) return;
             _disposed = true;
+            _retryTimer?.Stop();
+            _retryTimer = null;
             _sessionGeneration++;
             _refreshGeneration++;
             if (_timer != null)

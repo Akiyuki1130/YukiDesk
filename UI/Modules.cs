@@ -189,7 +189,7 @@ namespace DesktopBar.UI
         public override void Dispose() { _timer.Stop(); base.Dispose(); }
     }
 
-    public class MusicModule : ModuleBase
+    public partial class MusicModule : ModuleBase
     {
         private readonly Image _smallImg, _bigImg;
         private readonly MarqueeText _pillMarquee, _panelMarquee;
@@ -241,6 +241,7 @@ namespace DesktopBar.UI
             buttons.Children.Add(ShellButton(Glyph("⏭", 19), () => Skip(1), pressFeedback: true));
             var body = new StackPanel { Width = 300 * Ui.Scale };
             body.Children.Add(_panelTransition);
+            body.Children.Add(BuildTimeline());
             body.Children.Add(buttons);
             _sourceButton = PanelControls.GlassButton("播放来源", ShowSources);
             _sourceButton.HorizontalAlignment = HorizontalAlignment.Center;
@@ -299,6 +300,7 @@ namespace DesktopBar.UI
             string sourceLabel = "来源 · " + MediaService.SourceTitle(info.SessionKey);
             if (!Equals(_sourceButton.Content, sourceLabel)) _sourceButton.Content = sourceLabel;
             _lastMediaGeneration = info.Generation;
+            UpdateTimeline(info);
             if (info.HasSession && info.TrackKey.Length == 0) return;
 
             bool trackChanged = !string.Equals(_trackKey, info.TrackKey, StringComparison.Ordinal);
@@ -348,6 +350,7 @@ namespace DesktopBar.UI
 
         protected override void OnPanelHidden()
         {
+            StopTimeline();
             _panelTransition.Reset();
             _bigImg.BeginAnimation(OpacityProperty, null);
         }
