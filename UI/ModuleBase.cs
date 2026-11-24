@@ -50,6 +50,7 @@ namespace DesktopBar.UI
         private static ModuleBase _active;
         internal bool MenuIsOpen => _openMenu?.IsOpen == true;
         internal bool HasVisiblePanel => PanelWindow.IsVisible;
+        internal bool HasOpenUi => Open || _closing || HasVisiblePanel || MenuIsOpen;
         internal event Action<ModuleBase> PanelHidden;
         internal static bool ActivePanelKeepsBarRevealed => _active?.PanelWindow.IsVisible == true
             && (_active.PanelWindow.IsMouseOver || _active.HasPanelInteraction);

@@ -23,8 +23,9 @@ namespace DesktopBar
             _appSceneTimer.Tick += AdvanceAppScene;
             _sceneCandidate = null;
             _sceneCandidateAt = 0;
-            _appSceneTimer.IsEnabled = S.AppScenes.Count > 0;
-            if (!_appSceneTimer.IsEnabled && ActiveSceneName != null) ApplyAppScene(null);
+            bool hasRules = S.AppScenes.Count > 0;
+            _appSceneTimer.IsEnabled = hasRules && !PresentationSuspended;
+            if (!hasRules && ActiveSceneName != null) ApplyAppScene(null);
         }
 
         internal void EndAppSceneForSettings()
@@ -42,7 +43,7 @@ namespace DesktopBar
 
         private void AdvanceAppScene(object sender, EventArgs args)
         {
-            if (_closing || App.IsSettingsOpen || HasRevealInteraction) return;
+            if (_closing || PresentationSuspended || App.IsSettingsOpen || HasRevealInteraction) return;
             string program = NativeMethods.ForegroundProgramName();
             if (string.IsNullOrWhiteSpace(program) || program.Equals("YukiDesk", StringComparison.OrdinalIgnoreCase)) return;
             long tick = Environment.TickCount64;

@@ -110,19 +110,19 @@ namespace DesktopBar
                 {
                     if (_closing || Visibility != Visibility.Visible) return;
                     PinToDesktopLayer();
-                    // 诊断开关:YUKI_NO_REPIN=1 关掉 3 秒保底重钉,用来量化重钉本身的开销。
-                    if (Environment.GetEnvironmentVariable("YUKI_NO_REPIN") != "1") _pinTimer.Start();
-                    _moduleDemandTimer.Start();
+                    UpdatePresentationTimers();
                 }));
             };
             IsVisibleChanged += (s, e) =>
             {
                 if (!IsVisible) ClosePanels();
-                _moduleDemandTimer.IsEnabled = IsVisible;
+                UpdatePresentationTimers();
                 if (!IsVisible) RefreshModuleDemandNow();
             };
             // 分辨率/缩放/显示器变化:顶栏宽度只在构造时定过一次,不跟事件就会停留旧值。
             Microsoft.Win32.SystemEvents.DisplaySettingsChanged += OnDisplaySettingsChanged;
+            Microsoft.Win32.SystemEvents.SessionSwitch += OnSessionSwitch;
+            Microsoft.Win32.SystemEvents.PowerModeChanged += OnPowerModeChanged;
             Closed += (s, e) =>
             {
                 _closing = true;
@@ -135,6 +135,8 @@ namespace DesktopBar
                 _folderRootWatcher?.Dispose();
                 _reveal.Dispose();
                 Microsoft.Win32.SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;
+                Microsoft.Win32.SystemEvents.SessionSwitch -= OnSessionSwitch;
+                Microsoft.Win32.SystemEvents.PowerModeChanged -= OnPowerModeChanged;
                 DisposeModules();
                 try { _media?.Dispose(); } catch { }
                 _media = null;
@@ -162,7 +164,7 @@ namespace DesktopBar
 
         internal void PinToDesktopLayer()
         {
-            if (_reveal.IsRaised) return;
+            if (_reveal.IsRaised || PresentationSuspended) return;
             var hwnd = new WindowInteropHelper(this).Handle;
             if (hwnd != IntPtr.Zero) NativeMethods.PinAboveDesktop(hwnd);
         }
@@ -195,7 +197,7 @@ namespace DesktopBar
                 if (module is not (PerfModule or SpectrumModule)) continue;
                 bool active = false;
                 var pill = module.Pill;
-                if (IsVisible && module.IsVisible)
+                if (IsVisible && !PresentationSuspended && module.IsVisible)
                 {
                     active = module.HasVisiblePanel;
                     if (!active && _barLayout.IsDrawn(module) && pill.ActualWidth > 0 && pill.ActualHeight > 0)
@@ -218,7 +220,7 @@ namespace DesktopBar
         internal void ShowForReveal()
         {
             base.Show();
-            GlassService.SetActive(!IsOnSecondaryScreen);
+            UpdatePresentationTimers();
         }
 
         public void ApplySettings()
@@ -555,7 +557,7 @@ namespace DesktopBar
         {
             if (!CheckAccess()) { Dispatcher.BeginInvoke(new Action(ClosePanels)); return; }
             foreach (var module in _modules)
-                module.ClosePanelImmediately();
+                if (module.HasOpenUi) module.ClosePanelImmediately();
         }
 
         /// <summary>隐藏顶栏前先收起独立展开页，保持胶囊和面板的生命周期一致。</summary>
@@ -563,21 +565,16 @@ namespace DesktopBar
         {
             ClosePanels();
             _reveal.Reset();
-            _pinTimer.Stop();
             Hide();
             Opacity = 1;
-            GlassService.SetActive(false);
+            UpdatePresentationTimers();
         }
 
         public new void Show()
         {
             base.Show();
-            if (!_closing)
-            {
-                PinToDesktopLayer();
-                _pinTimer.Start();
-            }
-            GlassService.SetActive(true);
+            if (!_closing) PinToDesktopLayer();
+            UpdatePresentationTimers();
         }
 
         private static void SetModuleVisibility(ModuleBase module, bool visible)

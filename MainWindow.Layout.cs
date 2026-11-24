@@ -31,7 +31,7 @@ namespace DesktopBar
                 IsOnSecondaryScreen = secondary;
                 foreach (var module in _modules) module.RefreshThemeForScreen();
                 if (_barGlassHost != null) _barGlassHost.Visibility = secondary ? Visibility.Hidden : Visibility.Visible;
-                GlassService.SetActive(!secondary && IsVisible);
+                UpdatePresentationTimers();
             }
             var scale = VisualTreeHelper.GetDpi(this);
             Width = bounds.Width / scale.DpiScaleX;
@@ -52,7 +52,7 @@ namespace DesktopBar
             _thisPc = Add(new ThisPcModule(S.SettingsBtn), "thispc",
                 () => NativeMethods.ShellExecuteOpen("shell:MyComputerFolder"));
             _recycle = Add(new RecycleBinModule(S.SettingsBtn), "recycle");
-            Add(new ClockModule(S.Clock), "clock");
+            Add(new ClockModule(S.Clock), "clock").SetPresentationDemand(!PresentationSuspended);
             _perfNetwork = Add(new PerfModule(PerfMetric.Network, S.SettingsBtn), "network");
             _perfMemory = Add(new PerfModule(PerfMetric.Memory, S.SettingsBtn), "memory");
             _perfGpu = Add(new PerfModule(PerfMetric.Gpu, S.SettingsBtn), "gpu");

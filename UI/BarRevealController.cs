@@ -22,6 +22,7 @@ namespace DesktopBar.UI
         private int _animationVersion;
         private int _hotkeyAfterShowMs;
         private BarHotkey _hotkey;
+        private bool _suspended;
         private bool _edgeEnabled, _edgeChecked, _edgeReveal, _wasHidden, _preparing, _showing, _dismissing;
         private long? _edgeEnteredAt;
         private long _pointerUntil, _hotkeyUntil;
@@ -117,7 +118,7 @@ namespace DesktopBar.UI
 
         private IntPtr OnMessage(IntPtr hwnd, int message, IntPtr wParam, IntPtr lParam, ref bool handled)
         {
-            if (message != NativeMethods.WM_HOTKEY) return IntPtr.Zero;
+            if (_suspended || message != NativeMethods.WM_HOTKEY) return IntPtr.Zero;
             int slot = wParam.ToInt32() - 10;
             if ((uint)slot < _folderRegistrations.Length && _folderRegistrations[slot])
             {
@@ -159,6 +160,7 @@ namespace DesktopBar.UI
 
         private void Tick(object sender, EventArgs args)
         {
+            if (_suspended || _source == null) return;
             long now = Environment.TickCount64;
             bool pointerValid = NativeMethods.TryGetCursorPosition(out int x, out int y);
             var cursor = new System.Drawing.Point(x, y);
@@ -384,7 +386,16 @@ namespace DesktopBar.UI
             if (IsRaised) FinishDismiss();
         }
 
-        private void UpdateTimer() => _timer.IsEnabled = _edgeEnabled || IsRaised;
+        internal void SetSuspended(bool suspended)
+        {
+            _suspended = suspended;
+            _edgeEnteredAt = null;
+            _edgeChecked = false;
+            if (suspended && IsRaised) FinishDismiss();
+            UpdateTimer();
+        }
+
+        private void UpdateTimer() => _timer.IsEnabled = !_suspended && (_edgeEnabled || IsRaised);
 
         public void Dispose()
         {

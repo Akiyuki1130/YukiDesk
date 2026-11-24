@@ -130,6 +130,7 @@ namespace DesktopBar.UI
         private readonly ClockTools _clockTools;
         private DateTime _detailsDate;
         private bool _disposed;
+        private bool _presentationDemand = true;
         public ClockModule(TabStyle st) : base(st)
         {
             _pillText = MakePillText("");
@@ -158,8 +159,14 @@ namespace DesktopBar.UI
         protected override Size GetPanelEnvelope(Size content) => new(content.Width, content.Height + 252 * Ui.Scale);
         private void SyncClockTimer()
         {
-            if (_disposed || !IsVisible || !IsLoaded) _timer.Stop();
+            if (_disposed || !_presentationDemand || !IsVisible || !IsLoaded) _timer.Stop();
             else { Refresh(); _timer.Start(); }
+        }
+
+        internal void SetPresentationDemand(bool demand)
+        {
+            _presentationDemand = demand;
+            SyncClockTimer();
         }
 
         private void OnSystemTimeChanged(object sender, EventArgs args)
