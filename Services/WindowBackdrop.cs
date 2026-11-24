@@ -39,14 +39,14 @@ namespace DesktopBar.Services
             public bool Ready;
         }
 
-        private readonly List<Layer> _layers = new(MaxLayers);
+        private List<Layer> _layers = new(MaxLayers), _nextLayers = new(MaxLayers);
         private readonly StringBuilder _windowClass = new(80);
         private bool _initialized, _supported;
         private IntPtr _anchor;
         private Int32Rect _area;
         private long _nextScan;
         private long? _missingBackdropSince;
-        private byte[] _composed;
+        private byte[] _composed, _composedWallpaper;
 
         private bool _waitingForWindowFrame;
         internal bool HasSources => _layers.Count > 0;
@@ -55,6 +55,7 @@ namespace DesktopBar.Services
         {
             _nextScan = 0;
             _missingBackdropSince = null;
+            _composedWallpaper = null;
         }
 
         internal bool ShouldWaitForWindowFrame(bool hasWindowPixels, long now, bool expectWindow = false)
@@ -70,51 +71,70 @@ namespace DesktopBar.Services
             return now - _missingBackdropSince.Value < FirstFrameGraceMs;
         }
 
-        internal byte[] Composite(IntPtr anchor, Int32Rect area, byte[] wallpaper)
+        internal byte[] Composite(IntPtr anchor, Int32Rect area, byte[] wallpaper, bool wallpaperChanging = false)
         {
             _waitingForWindowFrame = false;
             if (anchor == IntPtr.Zero || !Initialize()) return wallpaper;
             lock (Gate)
             {
                 long now = Environment.TickCount64;
-                if (_anchor != anchor || _area != area || now >= _nextScan)
+                bool geometryChanged = _anchor != anchor || _area != area;
+                bool dirty = geometryChanged || wallpaperChanging;
+                if (geometryChanged || now >= _nextScan)
                 {
                     _anchor = anchor;
                     _area = area;
                     _nextScan = now + 100;
-                    ReadLayers(anchor, area);
-                    if (_layers.Count == 0) Readers.Remove(this);
-                    else Readers.Add(this);
-                    TrimSessions();
+                    bool layersChanged = ReadLayers(anchor, area);
+                    bool readersChanged = _layers.Count == 0 ? Readers.Remove(this) : Readers.Add(this);
+                    if (layersChanged || readersChanged) TrimSessions();
+                    dirty |= layersChanged;
                 }
-                if (_layers.Count == 0 || !EnsureDevice(now)) return wallpaper;
+                if (_layers.Count == 0 || !EnsureDevice(now)) return ShowWallpaper(wallpaper);
 
-                foreach (var layer in _layers) layer.Ready = ReadPixels(layer, now);
-                byte[] result = wallpaper;
-                for (int i = _layers.Count - 1; i >= 0; i--)
+                foreach (var layer in _layers)
                 {
-                    var layer = _layers[i];
-                    if (!layer.Ready) continue;
-                    if (ReferenceEquals(result, wallpaper))
-                    {
-                        if (_composed?.Length != wallpaper.Length) _composed = new byte[wallpaper.Length];
-                        wallpaper.CopyTo(_composed, 0);
-                        result = _composed;
-                    }
-                    BlendLayer(result, area.Width / 2, layer);
+                    var source = layer.Source;
+                    long sequence = layer.Sequence;
+                    var destination = layer.PixelsAt;
+                    var crop = layer.Crop;
+                    bool ready = ReadPixels(layer, now);
+                    dirty |= ready != layer.Ready || (ready && (source != layer.Source || sequence != layer.Sequence
+                        || destination != layer.PixelsAt || crop != layer.Crop));
+                    layer.Ready = ready;
                 }
-                return result;
+                return ComposeReadyLayers(wallpaper, dirty);
             }
+        }
+
+        private byte[] ComposeReadyLayers(byte[] wallpaper, bool dirty)
+        {
+            if (!_layers.Exists(layer => layer.Ready)) return ShowWallpaper(wallpaper);
+            if (!dirty && ReferenceEquals(wallpaper, _composedWallpaper)) return _composed;
+            if (_composed?.Length != wallpaper.Length) _composed = new byte[wallpaper.Length];
+            wallpaper.CopyTo(_composed, 0);
+            for (int i = _layers.Count - 1; i >= 0; i--)
+                if (_layers[i].Ready) BlendLayer(_composed, _area.Width / 2, _layers[i]);
+            _composedWallpaper = wallpaper;
+            return _composed;
+        }
+
+        private byte[] ShowWallpaper(byte[] wallpaper)
+        {
+            _composedWallpaper = null;
+            return wallpaper;
         }
 
         internal void Suspend()
         {
             _missingBackdropSince = null;
+            _composedWallpaper = null;
             if (_anchor == IntPtr.Zero) return;
             lock (Gate)
             {
                 _anchor = IntPtr.Zero;
                 _layers.Clear();
+                _nextLayers.Clear();
                 Readers.Remove(this);
                 TrimSessions();
             }
@@ -148,16 +168,15 @@ namespace DesktopBar.Services
             }
         }
 
-        private void ReadLayers(IntPtr anchor, Int32Rect area)
+        private bool ReadLayers(IntPtr anchor, Int32Rect area)
         {
-            var previous = _layers.ToArray();
-            _layers.Clear();
+            _nextLayers.Clear();
             const uint NextWindow = 2;
             const uint Cloaked = 14, ExtendedFrame = 9;
             const int Layered = 0x80000;
             int visited = 0;
             for (var window = GetWindow(anchor, NextWindow);
-                window != IntPtr.Zero && _layers.Count < MaxLayers && visited++ < 256;
+                window != IntPtr.Zero && _nextLayers.Count < MaxLayers && visited++ < 256;
                 window = GetWindow(window, NextWindow))
             {
                 if (!IsWindowVisible(window) || IsIconic(window) || !GetWindowRect(window, out var bounds)
@@ -174,15 +193,19 @@ namespace DesktopBar.Services
                 var frame = GetFrameBounds(window, ExtendedFrame, out var extended, Marshal.SizeOf<Rect>()) == 0
                     && extended.Right > extended.Left && extended.Bottom > extended.Top ? extended : bounds;
                 if (!Intersects(frame, area)) continue;
-                var layer = Array.Find(previous, entry => entry.Window == window) ?? new Layer { Window = window };
+                var layer = _layers.Find(entry => entry.Window == window) ?? new Layer { Window = window };
                 layer.Frame = frame.ToRect();
                 layer.WindowBounds = bounds.ToRect();
-                _layers.Add(layer);
+                _nextLayers.Add(layer);
                 int style = GetWindowLong(window, -20);
                 // An opaque window covering the entire region hides all lower layers.
                 if ((style & Layered) == 0 && frame.Left <= area.X && frame.Top <= area.Y
                     && frame.Right >= area.X + area.Width && frame.Bottom >= area.Y + area.Height) break;
             }
+            bool changed = !_layers.SequenceEqual(_nextLayers);
+            (_layers, _nextLayers) = (_nextLayers, _layers);
+            _nextLayers.Clear();
+            return changed;
         }
 
         private static bool Intersects(Rect rect, Int32Rect area) => rect.Left < area.X + area.Width
@@ -253,6 +276,13 @@ namespace DesktopBar.Services
                 {
                     int alpha = pixels[source + 3];
                     if (alpha == 0) continue;
+                    if (alpha == 255)
+                    {
+                        output[target] = pixels[source];
+                        output[target + 1] = pixels[source + 1];
+                        output[target + 2] = pixels[source + 2];
+                        continue;
+                    }
                     int inverse = 255 - alpha;
                     output[target] = Blend(pixels[source], output[target], inverse);
                     output[target + 1] = Blend(pixels[source + 1], output[target + 1], inverse);

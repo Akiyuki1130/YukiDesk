@@ -1968,7 +1968,8 @@ namespace DesktopBar.Services
                     }
 
                     var backdrop = spec.UseWindowBackdrop
-                        ? windowBackdrop.Composite(Volatile.Read(ref _barWindow), new Int32Rect(0, 0, capW, capH), halfRaw)
+                        ? windowBackdrop.Composite(Volatile.Read(ref _barWindow), new Int32Rect(0, 0, capW, capH), halfRaw,
+                            wallpaperChanging: fadeTo != null)
                         : halfRaw;
                     if (revealed && !hasBaseline && spec.UseWindowBackdrop
                         && windowBackdrop.ShouldWaitForWindowFrame(!ReferenceEquals(backdrop, halfRaw), Environment.TickCount64,
