@@ -168,7 +168,7 @@
                             <RowDefinition Height="Auto"/>
                         </Grid.RowDefinitions>
                         <Grid Margin="14,19,14,10">
-                                <TextBox x:Name="SettingsSearchBox" Style="{StaticResource DarkBox}" Height="38" Padding="16,0,15,0"
+                                <TextBox x:Name="SettingsSearchBox" Style="{StaticResource DarkBox}" Height="38" Padding="32,0,34,0"
                                          TextChanged="Search_TextChanged" AutomationProperties.Name="搜索设置项"
                                          ToolTip="搜索设置项（Ctrl+F）"/>
                                 <Path Data="M 6,1 A 5,5 0 1 1 5.99,1 Z M 10,10 L 14,14"
