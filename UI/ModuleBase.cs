@@ -50,6 +50,7 @@ namespace DesktopBar.UI
         private static ModuleBase _active;
         internal bool MenuIsOpen => _openMenu?.IsOpen == true;
         internal bool HasVisiblePanel => PanelWindow.IsVisible;
+        internal event Action<ModuleBase> PanelHidden;
         internal static bool ActivePanelKeepsBarRevealed => _active?.PanelWindow.IsVisible == true
             && (_active.PanelWindow.IsMouseOver || _active.HasPanelInteraction);
 
@@ -961,7 +962,11 @@ namespace DesktopBar.UI
             PanelWindow.Visibility = Visibility.Hidden;
             Panel.Visibility = Visibility.Collapsed;
             if (ReferenceEquals(_active, this)) _active = null;
-            if (wasOpen) OnPanelHidden();
+            if (wasOpen)
+            {
+                OnPanelHidden();
+                PanelHidden?.Invoke(this);
+            }
         }
 
         public virtual void Dispose()

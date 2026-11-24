@@ -63,12 +63,14 @@ namespace DesktopBar.UI
             if (_source == null || (uint)slot >= _folderRegistrations.Length) return false;
             if (_folderRegistrations[slot] == enabled) return true;
             int id = 10 + slot;
-            if (enabled && !NativeMethods.RegisterHotKey(_source.Handle, id,
-                    (uint)(ModifierKeys.Control | ModifierKeys.Alt) | NativeMethods.MOD_NOREPEAT, 0x31u + (uint)slot)) return false;
+            if (enabled && !Register(id, BarHotkey.ForFolder(slot))) return false;
             if (!enabled) NativeMethods.UnregisterHotKey(_source.Handle, id);
             _folderRegistrations[slot] = enabled;
             return true;
         }
+
+        internal bool IsFolderShortcutRegistered(int slot)
+            => (uint)slot < _folderRegistrations.Length && _folderRegistrations[slot];
 
         internal void SetEdgeEnabled(bool enabled)
         {
@@ -96,14 +98,15 @@ namespace DesktopBar.UI
 
             // 先注册新组合。遇到被占用的组合时，原快捷键仍能使用。
             int id = _hotkeyId == 1 ? 2 : 1;
-            uint modifiers = (uint)hotkey.Modifiers | NativeMethods.MOD_NOREPEAT;
-            if (!NativeMethods.RegisterHotKey(_source.Handle, id, modifiers, (uint)KeyInterop.VirtualKeyFromKey(hotkey.Key)))
-                return false;
+            if (!Register(id, hotkey)) return false;
             UnregisterHotkey();
             _hotkeyId = id;
             _hotkey = hotkey;
             return true;
         }
+
+        private bool Register(int id, BarHotkey hotkey) => NativeMethods.RegisterHotKey(_source.Handle, id,
+            (uint)hotkey.Modifiers | NativeMethods.MOD_NOREPEAT, (uint)KeyInterop.VirtualKeyFromKey(hotkey.Key));
 
         private void UnregisterHotkey()
         {
@@ -118,6 +121,12 @@ namespace DesktopBar.UI
             int slot = wParam.ToInt32() - 10;
             if ((uint)slot < _folderRegistrations.Length && _folderRegistrations[slot])
             {
+                handled = true;
+                if (CaptureHotkey != null)
+                {
+                    CaptureHotkey(BarHotkey.ForFolder(slot));
+                    return IntPtr.Zero;
+                }
                 string path = App.Settings.FolderShortcuts[slot];
                 if (!string.IsNullOrEmpty(path) && App.ActiveSettings.ShowFolders)
                 {
@@ -132,7 +141,6 @@ namespace DesktopBar.UI
                         if (!_preparing && !_showing && !_dismissing) UsePendingFolder();
                     }
                 }
-                handled = true;
                 return IntPtr.Zero;
             }
             if (_hotkeyId == 0 || wParam.ToInt32() != _hotkeyId) return IntPtr.Zero;

@@ -232,6 +232,7 @@ namespace DesktopBar
             var view = PagesGrid.Children.OfType<ScrollViewer>().FirstOrDefault(item => Equals(item.Tag, _currentPage));
             double offset = view?.VerticalOffset ?? 0;
             EndRevealShortcutCapture();
+            RemoveDesktopObservers();
             ApplyWindowTheme();
             SettingsThemeHost.Content = BuildThemeModePicker();
             BuildAppearancePage();

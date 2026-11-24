@@ -14,6 +14,26 @@ namespace DesktopBar
 {
     public partial class SettingsWindow
     {
+        private Action _removeDesktopObservers;
+
+        private void WatchDesktopChanges(Action refresh, bool watchFolderCatalog = false)
+        {
+            DesktopActions.Changed += refresh;
+            var bar = watchFolderCatalog ? App.Bar : null;
+            if (bar != null) bar.FolderCatalogChanged += refresh;
+            _removeDesktopObservers += () =>
+            {
+                DesktopActions.Changed -= refresh;
+                if (bar != null) bar.FolderCatalogChanged -= refresh;
+            };
+        }
+
+        private void RemoveDesktopObservers()
+        {
+            _removeDesktopObservers?.Invoke();
+            _removeDesktopObservers = null;
+        }
+
         private FrameworkElement BuildEdgeExclusionsCard()
         {
             var card = Card("触顶例外", "这些应用在前台时，鼠标触顶保持安静。快捷键仍可唤出。", out var body);
@@ -60,25 +80,18 @@ namespace DesktopBar
                     if (refreshing || picker.SelectedItem is not ShortcutFolder folder) return;
                     if (App.Bar?.SetFolderShortcut(index, folder.Path != null) != true)
                     {
-                        status.Text = "该快捷键已被占用。";
                         Refresh();
+                        status.Text = $"Ctrl + Alt + {index + 1} 无法注册，可能已被其他应用占用。";
                         return;
                     }
                     S.FolderShortcuts[index] = folder.Path;
                     App.Save();
-                    status.Text = "";
+                    RefreshStatus();
                 };
                 body.Children.Add(Row($"Ctrl + Alt + {slot + 1}", picker));
             }
             body.Children.Add(status);
-            DesktopActions.Changed += Refresh;
-            var bar = App.Bar;
-            if (bar != null) bar.FolderCatalogChanged += Refresh;
-            Closed += (_, _) =>
-            {
-                DesktopActions.Changed -= Refresh;
-                if (bar != null) bar.FolderCatalogChanged -= Refresh;
-            };
+            WatchDesktopChanges(Refresh, watchFolderCatalog: true);
             Refresh();
             return card;
 
@@ -97,6 +110,16 @@ namespace DesktopBar
                         ?? folders[0];
                 }
                 refreshing = false;
+                RefreshStatus();
+            }
+
+            void RefreshStatus()
+            {
+                var bar = App.Bar;
+                var missing = Enumerable.Range(0, pickers.Length)
+                    .Where(slot => S.FolderShortcuts[slot] != null && bar?.IsFolderShortcutRegistered(slot) == false)
+                    .Select(slot => $"Ctrl + Alt + {slot + 1}").ToArray();
+                status.Text = missing.Length == 0 ? "" : string.Join("、", missing) + " 当前无法使用。";
             }
         }
 
@@ -170,8 +193,7 @@ namespace DesktopBar
                 value => { S.TrackRecentDesktopTargets = value; App.Save(); }));
             body.Children.Add(PanelControls.Button("清空最近打开", () => { S.RecentDesktopTargets.Clear(); App.Save(); }));
             Refresh();
-            DesktopActions.Changed += Refresh;
-            Closed += (_, _) => DesktopActions.Changed -= Refresh;
+            WatchDesktopChanges(Refresh);
             return card;
         }
 
@@ -398,8 +420,7 @@ namespace DesktopBar
                 Refresh();
             }));
             Refresh();
-            DesktopActions.Changed += Refresh;
-            Closed += (_, _) => DesktopActions.Changed -= Refresh;
+            WatchDesktopChanges(Refresh);
             return card;
         }
     }

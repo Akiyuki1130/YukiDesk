@@ -60,9 +60,9 @@ namespace DesktopBar.UI
 
         internal void SetEntries(IEnumerable<Entry> entries)
         {
-            _preferred = null;
             _entries.Clear();
             _entries.AddRange(entries);
+            if (_preferred != null && !_entries.Contains(_preferred)) SetPreferred(null);
             var expected = _entries.Select(entry => entry.Module).ToHashSet();
             expected.Add(_more);
             for (int index = Children.Count - 1; index >= 0; index--)
@@ -93,14 +93,16 @@ namespace DesktopBar.UI
 
             if (total > available)
             {
+                var displaced = new HashSet<ModuleBase>();
                 foreach (var entry in visible.AsEnumerable().Reverse()
-                    .OrderBy(entry => ReferenceEquals(entry, _preferred) ? 2 : _rank[entry.Id].Rule.KeepVisible ? 1 : 0).ToArray())
+                    .OrderBy(OverflowPriority))
                 {
                     if (total + moreWidth <= available) break;
-                    visible.Remove(entry);
-                    _overflow.Insert(0, entry);
+                    displaced.Add(entry.Module);
                     total -= DesiredWidth(entry);
                 }
+                _overflow.AddRange(visible.Where(entry => displaced.Contains(entry.Module)));
+                visible.RemoveAll(entry => displaced.Contains(entry.Module));
             }
 
             var zones = Enumerable.Range(0, 3).Select(zone => visible.Where(entry => _rank[entry.Id].Rule.Zone == zone).ToArray()).ToArray();
@@ -133,13 +135,37 @@ namespace DesktopBar.UI
 
         private static double DesiredWidth(Entry entry) => entry.Module.DesiredSize.Width;
 
+        private int OverflowPriority(Entry entry)
+        {
+            if (ReferenceEquals(entry, _preferred)) return 3;
+            if (entry.Module.HasVisiblePanel) return 2;
+            return _rank[entry.Id].Rule.KeepVisible ? 1 : 0;
+        }
+
+        private void SetPreferred(Entry next)
+        {
+            if (ReferenceEquals(_preferred, next)) return;
+            if (_preferred != null) _preferred.Module.PanelHidden -= ReleasePreferred;
+            _preferred = next;
+            if (next != null) next.Module.PanelHidden += ReleasePreferred;
+            InvalidateArrange();
+        }
+
+        private void ReleasePreferred(ModuleBase module)
+        {
+            if (ReferenceEquals(_preferred?.Module, module)) SetPreferred(null);
+        }
+
         internal void OpenOverflowEntry(Entry entry)
         {
             if (entry.Launch != null) { entry.Launch(); return; }
-            _preferred = entry;
-            InvalidateArrange();
-            UpdateLayout();
+            if (!IsDrawn(entry.Module))
+            {
+                SetPreferred(entry);
+                UpdateLayout();
+            }
             if (IsDrawn(entry.Module)) entry.Module.ShowPanel();
+            else SetPreferred(null);
         }
     }
 

@@ -108,5 +108,6 @@ namespace DesktopBar
         }
 
         internal bool SetFolderShortcut(int index, bool enabled) => _reveal.SetFolderShortcut(index, enabled);
+        internal bool IsFolderShortcutRegistered(int index) => _reveal.IsFolderShortcutRegistered(index);
     }
 }

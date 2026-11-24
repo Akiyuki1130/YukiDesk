@@ -52,6 +52,7 @@ namespace DesktopBar
             Closed += (s, e) =>
             {
                 if (folderBar != null) folderBar.FolderCatalogChanged -= RefreshFolderList;
+                RemoveDesktopObservers();
                 EndRevealShortcutCapture();
                 ThemeService.Changed -= OnThemeChanged;
                 Microsoft.Win32.SystemEvents.UserPreferenceChanged -= OnSystemThemeChanged;
@@ -1570,6 +1571,12 @@ namespace DesktopBar
             if (!shortcut.IsValid)
             {
                 ShowRevealShortcutStatus("请使用有效的组合键或功能键。按 Esc 取消。");
+                return;
+            }
+            int slot = shortcut.FolderSlot;
+            if (slot >= 0 && !string.IsNullOrEmpty(S.FolderShortcuts[slot]))
+            {
+                ShowRevealShortcutStatus("这组键已分配给小文件夹，请试试其他组合。按 Esc 取消。");
                 return;
             }
             if (S.RevealWithHotkey && App.Bar?.TrySetRevealHotkey(true, shortcut) != true)
