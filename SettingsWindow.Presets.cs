@@ -174,7 +174,7 @@ namespace DesktopBar
                 if (picker.ShowDialog(this) != true) return;
                 actions.IsEnabled = false;
                 try { await DesktopPresets.ExportAsync(picker.FileName, includeFolders); }
-                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or ArgumentException)
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or ArgumentException or InvalidDataException)
                 {
                     if (IsVisible) ConfirmDialog.Notice("导出失败", ex.Message);
                     else App.Log("导出备份失败: " + ex.Message);

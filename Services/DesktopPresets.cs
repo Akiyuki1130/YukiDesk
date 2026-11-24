@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
 using DesktopBar.Models;
@@ -12,6 +13,8 @@ namespace DesktopBar.Services
 {
     internal static class DesktopPresets
     {
+        private const int MaxArchiveMiB = 8;
+
         private sealed class Archive
         {
             public int Format { get; set; }
@@ -96,23 +99,31 @@ namespace DesktopBar.Services
         {
             var archive = new Archive
             {
-                Format = 1, Settings = Capture(App.Settings, ArchiveFields), Presets = App.Settings.DesktopPresets,
+                Format = 1, Settings = Capture(App.Settings, ArchiveFields),
+                Presets = App.Settings.DesktopPresets.Select(preset => new DesktopPreset
+                {
+                    Name = preset.Name,
+                    Values = new(preset.Values)
+                }).ToList(),
                 Folders = includeFolders ? Capture(App.Settings, FolderFields) : null
             };
-            var content = JsonSerializer.Serialize(archive, Options);
-            return Task.Run(() => SettingsService.WriteAtomicText(path, content));
+            return Task.Run(() =>
+            {
+                var content = JsonSerializer.Serialize(archive, Options);
+                CheckArchiveSize(Encoding.UTF8.GetByteCount(content));
+                SettingsService.WriteAtomicText(path, content);
+            });
         }
 
         internal static async Task<ImportData> ReadImportAsync(string path)
         {
-            string content = await Task.Run(() =>
+            var archive = await Task.Run(() =>
             {
                 using var stream = File.OpenRead(path);
-                if (stream.Length > 1024 * 1024) throw new InvalidDataException("备份文件超过 1 MB。");
+                CheckArchiveSize(stream.Length);
                 using var reader = new StreamReader(stream);
-                return reader.ReadToEnd();
+                return JsonSerializer.Deserialize<Archive>(reader.ReadToEnd(), Options);
             });
-            var archive = JsonSerializer.Deserialize<Archive>(content, Options);
             if (archive?.Format != 1 || archive.Settings == null || archive.Settings.Keys.All(key => !ArchiveFields.Contains(key)))
                 throw new InvalidDataException("这不是支持的 YukiDesk 布局备份。");
             var values = archive.Settings.Where(pair => ArchiveFields.Contains(pair.Key)).ToDictionary(pair => pair.Key, pair => pair.Value);
@@ -128,6 +139,12 @@ namespace DesktopBar.Services
                 presets.Add(new DesktopPreset { Name = preset.Name.Trim(), Values = Capture(parsed, PresetFields) });
             }
             return new ImportData(settings, presets, values.Count, includesFolders);
+        }
+
+        private static void CheckArchiveSize(long bytes)
+        {
+            if (bytes > MaxArchiveMiB * 1024 * 1024)
+                throw new InvalidDataException($"备份文件超过 {MaxArchiveMiB} MB。");
         }
 
         internal static bool Apply(ImportData import)
