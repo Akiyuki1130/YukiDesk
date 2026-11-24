@@ -1,4 +1,6 @@
 using System;
+using System.Globalization;
+using System.Text;
 using System.Windows;
 using System.Windows.Automation;
 using System.Windows.Controls;
@@ -38,13 +40,24 @@ namespace DesktopBar.UI
         internal static bool TryCountdownDuration(string minuteText, string secondText, out TimeSpan duration)
         {
             duration = default;
-            if (!int.TryParse(minuteText, out int minutes) || minutes is < 0 or > 720
-                || !int.TryParse(secondText, out int seconds) || seconds is < 0 or > 59)
+            if (!TryPart(minuteText, 720, out int minutes) || !TryPart(secondText, 59, out int seconds))
                 return false;
             int totalSeconds = minutes * 60 + seconds;
             if (totalSeconds is < 1 or > 720 * 60) return false;
             duration = TimeSpan.FromSeconds(totalSeconds);
             return true;
+
+            static bool TryPart(string text, int max, out int value)
+            {
+                value = 0;
+                if (string.IsNullOrWhiteSpace(text)) return true;
+                try
+                {
+                    return int.TryParse(text.Normalize(NormalizationForm.FormKC), NumberStyles.Integer, CultureInfo.CurrentCulture, out value)
+                        && value >= 0 && value <= max;
+                }
+                catch (ArgumentException) { return false; }
+            }
         }
 
         private static TextBox Field(string label, string initial, out StackPanel field)

@@ -128,6 +128,8 @@ namespace DesktopBar.UI
         private readonly TextBlock _pillText, _pTime, _pWeek, _pDate, _pLunar, _pFest;
         private readonly DispatcherTimer _timer;
         private readonly ClockTools _clockTools;
+        private DateTime _detailsDate;
+        private bool _disposed;
         public ClockModule(TabStyle st) : base(st)
         {
             _pillText = MakePillText("");
@@ -144,34 +146,58 @@ namespace DesktopBar.UI
             _clockTools = new ClockTools();
             body.Children.Add(_clockTools);
             Panel.Child = body;
-            _timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(250) }; _timer.Tick += (s, e) => Refresh(); _timer.Start(); Refresh();
-            // 模块隐藏(或整条顶栏隐藏)时停表,不再空转刷新 5 个 TextBlock。
-            IsVisibleChanged += (s, e) =>
-            {
-                if (IsVisible) { Refresh(); _timer.Start(); }
-                else _timer.Stop();
-            };
+            _timer = new DispatcherTimer(DispatcherPriority.Background, Dispatcher);
+            _timer.Tick += (_, _) => Refresh();
+            ClockTools.CountdownChanged += Refresh;
+            Microsoft.Win32.SystemEvents.TimeChanged += OnSystemTimeChanged;
+            Loaded += (_, _) => SyncClockTimer();
+            IsVisibleChanged += (_, _) => SyncClockTimer();
+            Refresh();
         }
         protected override bool CenterPanelOnPill => true;
         protected override Size GetPanelEnvelope(Size content) => new(content.Width, content.Height + 252 * Ui.Scale);
+        private void SyncClockTimer()
+        {
+            if (_disposed || !IsVisible || !IsLoaded) _timer.Stop();
+            else { Refresh(); _timer.Start(); }
+        }
+
+        private void OnSystemTimeChanged(object sender, EventArgs args)
+        {
+            if (!Dispatcher.HasShutdownStarted) Dispatcher.BeginInvoke(new Action(Refresh));
+        }
+
+        internal void RefreshPreferences()
+        {
+            _clockTools.UpdateTimeZone();
+            Refresh();
+        }
+
         private void Refresh()
         {
+            if (_disposed) return;
             var now = DateTime.Now;
-            var parts = new List<string> { now.ToString(App.Settings.ShowSeconds ? "HH:mm:ss" : "HH:mm") };
-            if (App.Settings.ShowDate) parts.Add(now.ToString("M月d日"));
-            if (App.Settings.ShowWeekday) parts.Add("周" + "日一二三四五六"[(int)now.DayOfWeek]);
-            if (ClockTools.CapsuleCountdown is string timer) parts.Add(timer);
-            string pill = string.Join("  ", parts);
+            bool showSeconds = App.Settings.ShowSeconds;
+            bool showDetails = Open || HasVisiblePanel;
+            int delay = ClockTools.CountdownRunning ? 250 : showSeconds || showDetails ? 1000 - now.Millisecond
+                : 60_000 - (now.Second * 1000 + now.Millisecond);
+            _timer.Interval = TimeSpan.FromMilliseconds(Math.Max(20, delay));
+            string pill = now.ToString(showSeconds ? "HH:mm:ss" : "HH:mm");
+            if (App.Settings.ShowDate) pill += "  " + now.ToString("M月d日");
+            if (App.Settings.ShowWeekday) pill += "  周" + "日一二三四五六"[(int)now.DayOfWeek];
+            if (ClockTools.CapsuleCountdown is string timer) pill += "  " + timer;
             // 只在文字真的变了才赋值:分层窗口每次被弄脏都会整条重呈,同值赋值是纯浪费。
             if (_pillText.Text != pill) _pillText.Text = pill;
             // 面板没打开时不刷面板那 5 个 TextBlock(打开时 OnPanelShown 会补一次)。
-            if (Panel == null || !Panel.IsVisible) return;
+            if (!showDetails) return;
             _clockTools.Refresh(now);
-            string time = now.ToString("HH:mm:ss"), week = WeekNames[(int)now.DayOfWeek], date = now.ToString("yyyy年M月d日"), lunar = Lunar.ToLunarString(now);
+            string time = now.ToString("HH:mm:ss");
             if (_pTime.Text != time) _pTime.Text = time;
-            if (_pWeek.Text != week) _pWeek.Text = week;
-            if (_pDate.Text != date) _pDate.Text = date;
-            if (_pLunar.Text != lunar) _pLunar.Text = lunar;
+            if (_detailsDate == now.Date) return;
+            _detailsDate = now.Date;
+            _pWeek.Text = WeekNames[(int)now.DayOfWeek];
+            _pDate.Text = now.ToString("yyyy年M月d日");
+            _pLunar.Text = Lunar.ToLunarString(now);
             string fest = Festivals.GetTodayLabel(now);
             string festText = fest.Length > 0 ? "今 " + fest : "";
             if (_pFest.Text != festText) _pFest.Text = festText;
@@ -184,8 +210,21 @@ namespace DesktopBar.UI
             base.OnPanelShown();
             Refresh();
         }
-        protected override void OnPanelHidden() => _clockTools.CloseCalendar();
-        public override void Dispose() { _timer.Stop(); base.Dispose(); }
+        protected override void OnPanelHidden()
+        {
+            _clockTools.CloseCalendar();
+            Refresh();
+        }
+
+        public override void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            ClockTools.CountdownChanged -= Refresh;
+            Microsoft.Win32.SystemEvents.TimeChanged -= OnSystemTimeChanged;
+            _timer.Stop();
+            base.Dispose();
+        }
     }
 
     public partial class MusicModule : ModuleBase

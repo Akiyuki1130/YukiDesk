@@ -19,7 +19,8 @@ namespace DesktopBar.UI
         private readonly AnimatedPanelSection _calendar;
         private readonly StackPanel _timerActions;
         private readonly Grid _days;
-        private readonly TimeZoneInfo _secondZone;
+        private TimeZoneInfo _secondZone;
+        private string _zoneId;
         private DateTime _month;
         private DateTime _renderedDate;
         private bool _copyingDate;
@@ -27,9 +28,11 @@ namespace DesktopBar.UI
         private static long _pausedRemaining;
         private static bool _finished;
         private static DispatcherTimer _countdown;
+        internal static event Action CountdownChanged;
 
         private static long RemainingMs => _pausedRemaining > 0 ? _pausedRemaining : Math.Max(0, _timerDeadline - Environment.TickCount64);
         private static bool HasCountdown => _timerDeadline != 0 || _pausedRemaining > 0;
+        internal static bool CountdownRunning => _timerDeadline != 0;
         internal static string CapsuleCountdown => HasCountdown ? FormatRemaining(RemainingMs) : _finished ? "计时到点" : null;
 
         internal ClockTools()
@@ -38,15 +41,8 @@ namespace DesktopBar.UI
             Margin = new Thickness(1, 7, 1, 2);
             _zone = PanelControls.Text("");
             _zone.TextWrapping = TextWrapping.Wrap;
-            try
-            {
-                if (!string.IsNullOrWhiteSpace(App.Settings.SecondTimeZoneId))
-                    _secondZone = TimeZoneInfo.FindSystemTimeZoneById(App.Settings.SecondTimeZoneId);
-            }
-            catch (TimeZoneNotFoundException) { }
-            catch (InvalidTimeZoneException) { }
-            _zone.Visibility = _secondZone == null ? Visibility.Collapsed : Visibility.Visible;
             Children.Add(_zone);
+            UpdateTimeZone();
             _monthTitle = PanelControls.Text("");
             _monthTitle.HorizontalAlignment = HorizontalAlignment.Center;
             _monthTitle.VerticalAlignment = VerticalAlignment.Center;
@@ -57,7 +53,13 @@ namespace DesktopBar.UI
             DockPanel.SetDock(next, Dock.Right);
             nav.Children.Add(previous);
             nav.Children.Add(next);
-            nav.Children.Add(_monthTitle);
+            var currentMonth = PanelControls.GlassButton("", ShowCurrentMonth, compact: true);
+            currentMonth.Content = _monthTitle;
+            currentMonth.ToolTip = "回到本月";
+            currentMonth.HorizontalAlignment = HorizontalAlignment.Center;
+            currentMonth.Margin = new Thickness(0);
+            System.Windows.Automation.AutomationProperties.SetName(currentMonth, "回到本月");
+            nav.Children.Add(currentMonth);
             _days = new Grid();
             for (int column = 0; column < 7; column++) _days.ColumnDefinitions.Add(new ColumnDefinition());
             for (int row = 0; row < 7; row++) _days.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
@@ -126,6 +128,26 @@ namespace DesktopBar.UI
             _calendarToggle.Content = expanded ? "收起日历" : "日历";
         }
 
+        private void ShowCurrentMonth()
+        {
+            var today = DateTime.Today;
+            if (_month.Year == today.Year && _month.Month == today.Month) return;
+            _month = new DateTime(today.Year, today.Month, 1);
+            RenderCalendar(today);
+        }
+
+        internal void UpdateTimeZone()
+        {
+            string id = App.Settings.SecondTimeZoneId ?? "";
+            if (_zoneId == id) return;
+            _zoneId = id;
+            _secondZone = null;
+            try { if (id.Length > 0) _secondZone = TimeZoneInfo.FindSystemTimeZoneById(id); }
+            catch (TimeZoneNotFoundException) { }
+            catch (InvalidTimeZoneException) { }
+            _zone.Visibility = _secondZone == null ? Visibility.Collapsed : Visibility.Visible;
+        }
+
         internal void CloseCalendar()
         {
             DateTime today = DateTime.Today;
@@ -186,6 +208,7 @@ namespace DesktopBar.UI
             {
                 var label = PanelControls.Text(text);
                 label.TextAlignment = TextAlignment.Center;
+                label.VerticalAlignment = VerticalAlignment.Center;
                 label.FontWeight = isToday ? FontWeights.Bold : FontWeights.Normal;
                 label.Opacity = row == 0 ? 0.66 : 1;
                 var cell = new Border { Height = 22 * Ui.Scale, CornerRadius = new CornerRadius(11 * Ui.Scale), Child = label };
@@ -218,7 +241,7 @@ namespace DesktopBar.UI
         private void StartTimer()
         {
             if (Prompt.ShowCountdown() is not TimeSpan duration) return;
-            StopTimer();
+            StopCountdown();
             _timerDeadline = Environment.TickCount64 + (long)duration.TotalMilliseconds;
             _countdown ??= new DispatcherTimer(TimeSpan.FromMilliseconds(250), DispatcherPriority.Background, (_, _) =>
             {
@@ -226,12 +249,13 @@ namespace DesktopBar.UI
                 StopCountdown();
                 _finished = true;
                 App.NotifyTimerDone();
+                CountdownChanged?.Invoke();
             }, Dispatcher);
             _countdown.Start();
-            Refresh(DateTime.Now);
+            RefreshCountdown();
         }
 
-        private void StopTimer() { StopCountdown(); Refresh(DateTime.Now); }
+        private void StopTimer() { StopCountdown(); RefreshCountdown(); }
 
         private void TogglePause()
         {
@@ -247,14 +271,20 @@ namespace DesktopBar.UI
                 _timerDeadline = 0;
                 _countdown?.Stop();
             }
-            Refresh(DateTime.Now);
+            RefreshCountdown();
         }
 
         private void ExtendTimer()
         {
             if (_pausedRemaining > 0) _pausedRemaining = Math.Min(720 * 60000L, _pausedRemaining + 60000);
             else if (_timerDeadline != 0) _timerDeadline = Environment.TickCount64 + Math.Min(720 * 60000L, RemainingMs + 60000);
+            RefreshCountdown();
+        }
+
+        private void RefreshCountdown()
+        {
             Refresh(DateTime.Now);
+            CountdownChanged?.Invoke();
         }
 
         private static void StopCountdown()

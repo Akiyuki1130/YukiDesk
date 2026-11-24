@@ -100,6 +100,8 @@ namespace DesktopBar
 
         internal void RefreshBarLayout() => _barLayout?.RefreshPlacements();
 
+        internal void RefreshClockDisplay() => _modules.OfType<ClockModule>().FirstOrDefault()?.RefreshPreferences();
+
         internal void OpenFolderShortcut(string path)
         {
             var entry = _folderEntries.FirstOrDefault(item => item.Module is FolderModule folder

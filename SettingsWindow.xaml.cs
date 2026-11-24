@@ -702,9 +702,9 @@ namespace DesktopBar
             posPanel.Children.Add(r2);
             body.Children.Add(Row("显示位置", posPanel));
 
-            body.Children.Add(ToggleRow("显示秒数", S.ShowSeconds, v => { S.ShowSeconds = v; App.Save(); }));
-            body.Children.Add(ToggleRow("显示日期", S.ShowDate, v => { S.ShowDate = v; App.Save(); }));
-            body.Children.Add(ToggleRow("显示星期", S.ShowWeekday, v => { S.ShowWeekday = v; App.Save(); }));
+            body.Children.Add(ToggleRow("显示秒数", S.ShowSeconds, v => { S.ShowSeconds = v; SaveClockDisplay(); }));
+            body.Children.Add(ToggleRow("显示日期", S.ShowDate, v => { S.ShowDate = v; SaveClockDisplay(); }));
+            body.Children.Add(ToggleRow("显示星期", S.ShowWeekday, v => { S.ShowWeekday = v; SaveClockDisplay(); }));
             var zoneLabels = new[] { ("", "关闭") }.Concat(TimeZoneInfo.GetSystemTimeZones().Select(zone => (zone.Id, zone.DisplayName))).ToArray();
             var zonePicker = new ComboBox { Width = 245, MinHeight = 32, ItemsSource = zoneLabels.Select(item => item.Item2).ToArray(),
                 Style = (Style)FindResource("DarkCombo") };
@@ -713,11 +713,17 @@ namespace DesktopBar
             {
                 if (zonePicker.SelectedIndex < 0) return;
                 S.SecondTimeZoneId = zoneLabels[zonePicker.SelectedIndex].Item1;
-                Save();
+                SaveClockDisplay();
             };
             body.Children.Add(Row("展开页第二时区", zonePicker));
             body.Children.Add(MakeHint("鼠标悬停在时间选项卡上时,会展开显示星期、日期和农历日期。", 14));
             TimeHost.Children.Add(card);
+
+            void SaveClockDisplay()
+            {
+                App.Save();
+                App.Bar?.RefreshClockDisplay();
+            }
         }
 
         // ---------- 小文件夹 ----------
