@@ -33,7 +33,9 @@ namespace DesktopBar.UI
         private FolderTile[] _tiles = Array.Empty<FolderTile>();
         private FileSystemInfo[] _matchedFiles = Array.Empty<FileSystemInfo>();
         private CancellationTokenSource _filterRequest;
-        private int _loadVersion;
+        private int _loadVersion, _readingVersion = -1;
+        private string _readingDirectory;
+        private bool _readAgain;
         private volatile bool _disposed;
         internal string FolderName => _name;
         internal string FolderPath => _directory;
@@ -81,7 +83,7 @@ namespace DesktopBar.UI
                 if (Environment.TickCount64 - Interlocked.Read(ref _lastFolderChange) < ReloadDelayMs) return;
                 _debounce.Stop();
                 Interlocked.Exchange(ref _reloadQueued, 0);
-                _ = LoadFilesAsync();
+                _ = LoadFilesAsync(contentsChanged: true);
             };
             _ = LoadFilesAsync();
         }
@@ -107,24 +109,63 @@ namespace DesktopBar.UI
 
         protected override void OnFileDropSettled() => _ = ShowFilesAsync();
 
-        private async Task LoadFilesAsync()
+        private async Task LoadFilesAsync(bool contentsChanged = false)
         {
             if (_directory == null || _disposed) return;
-            int version = ++_loadVersion;
-            bool watch = _watcher == null;
             string path = CurrentDirectory;
-            var snapshot = await Task.Run(() => ReadFolder(path, watch));
-            if (_disposed || version != _loadVersion)
+            if (_readingVersion == _loadVersion && string.Equals(_readingDirectory, path, StringComparison.OrdinalIgnoreCase))
             {
-                snapshot.Watcher?.Dispose();
+                _readAgain |= contentsChanged;
                 return;
             }
-            _watcher ??= snapshot.Watcher;
-            UpdateFolderSnapshot(snapshot.Files);
-            for (int i = 0; i < Math.Min(PrefetchLimit, _files.Length); i++)
-                IconCache.LoadAsync(_files[i]);
-            if (Open) await ShowFilesAsync();
+            int version = ++_loadVersion;
+            _readingVersion = version;
+            _readingDirectory = path;
+            _readAgain = false;
+            bool watch = _watcher == null;
+            var previous = _files;
+            bool wasAvailable = _available;
+            try
+            {
+                var (files, watcher, unchanged) = await Task.Run(() =>
+                {
+                    var snapshot = ReadFolder(path, watch);
+                    bool same = previous != null && (snapshot.Files == null
+                        ? !wasAvailable : wasAvailable && SameFolderContents(previous, snapshot.Files));
+                    return (snapshot.Files, snapshot.Watcher, same);
+                });
+                if (_disposed || version != _loadVersion)
+                {
+                    watcher?.Dispose();
+                    return;
+                }
+                _watcher ??= watcher;
+                if (!unchanged)
+                {
+                    UpdateFolderSnapshot(files);
+                    for (int i = 0; i < Math.Min(PrefetchLimit, _files.Length); i++) IconCache.LoadAsync(_files[i]);
+                }
+                if (Open) await ShowFilesAsync();
+            }
+            finally
+            {
+                if (_readingVersion == version)
+                {
+                    _readingVersion = -1;
+                    _readingDirectory = null;
+                    bool readAgain = _readAgain;
+                    _readAgain = false;
+                    if (readAgain && !_disposed) _ = LoadFilesAsync();
+                }
+            }
         }
+
+        private static bool SameFolderContents(FileSystemInfo[] first, FileSystemInfo[] second)
+            => first.Length == second.Length && first.Zip(second).All(pair => SameFileMetadata(pair.First, pair.Second));
+
+        private static bool SameFileMetadata(FileSystemInfo first, FileSystemInfo second)
+            => first.Name == second.Name && first.Attributes == second.Attributes
+                && first.LastWriteTimeUtc == second.LastWriteTimeUtc && ReadFileSize(first) == ReadFileSize(second);
 
         private (FileSystemInfo[] Files, FileSystemWatcher Watcher) ReadFolder(string path, bool watch)
         {
@@ -136,6 +177,7 @@ namespace DesktopBar.UI
                     watcher = new FileSystemWatcher(path)
                     {
                         NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.LastWrite
+                            | NotifyFilters.Attributes | NotifyFilters.Size
                     };
                     watcher.Created += (_, _) => ScheduleReload();
                     watcher.Changed += (_, _) => ScheduleReload();
@@ -239,8 +281,7 @@ namespace DesktopBar.UI
                 for (int i = 0; i < items.Length; i++)
                 {
                     var file = items[i];
-                    if (existing.TryGetValue(file.FullName, out var tile) && file.GetType() == tile.File.GetType()
-                        && file.LastWriteTimeUtc == tile.File.LastWriteTimeUtc)
+                    if (existing.TryGetValue(file.FullName, out var tile) && SameFileMetadata(tile.File, file))
                     {
                         next[i] = tile;
                         continue;
@@ -305,8 +346,8 @@ namespace DesktopBar.UI
                 ? Path.GetFileNameWithoutExtension(item.Name) : item.Name;
             double scale = Ui.Scale;
             var image = new Image { Width = 40 * scale, Height = 40 * scale, Stretch = Stretch.Uniform };
-            IconCache.LoadAsync(item, icon => { if (!_disposed) image.Source = icon; });
-            image.Source ??= IconCache.GetFallback(isDir, item.Extension);
+            image.Source = IconCache.GetFallback(isDir, item.Extension);
+            image.Loaded += (_, _) => { if (!_disposed) IconCache.LoadAsync(item, image); };
             RenderOptions.SetBitmapScalingMode(image, BitmapScalingMode.HighQuality);
             var label = new TextBlock
             {
@@ -383,7 +424,7 @@ namespace DesktopBar.UI
             if (path == null) return;
             var actions = new List<FlyoutItem>
             {
-                new FlyoutItem("重新读取", () => _ = LoadFilesAsync()),
+                new FlyoutItem("重新读取", () => _ = LoadFilesAsync(contentsChanged: true)),
                 new FlyoutItem("固定到常用项", () => DesktopActions.Add(path)),
                 new FlyoutItem("在资源管理器中打开", () => ShellOpen.OpenFolder(path))
             };

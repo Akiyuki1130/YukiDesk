@@ -15,12 +15,20 @@ namespace DesktopBar.UI
 
         internal static bool IsImage(string extension) => Extensions.Contains(extension);
 
+        internal static bool NeedsLocalData(FileAttributes attributes)
+        {
+            const FileAttributes recallOnOpen = (FileAttributes)0x00040000;
+            const FileAttributes recallOnDataAccess = (FileAttributes)0x00400000;
+            return attributes != (FileAttributes)(-1)
+                && (attributes & (FileAttributes.Offline | recallOnOpen | recallOnDataAccess)) != 0;
+        }
+
         internal static BitmapSource ReadThumbnail(string path, int pixels)
         {
             if (!IsImage(Path.GetExtension(path))) return null;
             try
             {
-                if ((File.GetAttributes(path) & FileAttributes.Offline) != 0) return null;
+                if (NeedsLocalData(File.GetAttributes(path))) return null;
                 using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
                 if (stream.Length > 50 * 1024 * 1024) return null;
                 var frame = BitmapDecoder.Create(stream, BitmapCreateOptions.DelayCreation, BitmapCacheOption.None).Frames[0];
