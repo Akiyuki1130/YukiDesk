@@ -63,7 +63,7 @@ namespace DesktopBar.Services
 
         private static readonly object Gate = new object();
         private static readonly HashSet<IntPtr> _excluded = new HashSet<IntPtr>();
-        private static readonly Dictionary<IntPtr, long> _wdaReady = new Dictionary<IntPtr, long>();
+        private static readonly Dictionary<IntPtr, long> _hiddenPanelExclusions = new();
         private static double ReadEnvDouble(string name, double fallback)
         {
             double v;
@@ -81,6 +81,8 @@ namespace DesktopBar.Services
         private static volatile int _barBackdropGeneration;
         private static volatile bool _revealNeedsWindow;
         private static long _holdUntil;
+        private sealed record PanelExclusion(int Session, long Until);
+        private static volatile PanelExclusion _panelExclusion;
         private static IntPtr _barWindow;
 
         // ---- 诊断/取证 ----(双用途:YUKI_GLASS_DUMP 与 --glassshot;常开计数开销可忽略)
@@ -611,19 +613,39 @@ namespace DesktopBar.Services
         }
 
         /// <summary>主窗/悬停面板注册:玻璃启用期间排除出屏幕捕获;未启用时先登记,启用时统一设置。</summary>
-        internal static void RegisterWindow(IntPtr hwnd)
+        internal static void RegisterWindow(IntPtr hwnd, bool hiddenPanel = false)
         {
             if (hwnd == IntPtr.Zero || _stopped) return;
-            lock (Gate)
-            {
-                _excluded.Add(hwnd);
-                _wdaReady[hwnd] = Environment.TickCount64 + HoldMs;
-            }
+            lock (Gate) _excluded.Add(hwnd);
             if (ShouldExcludeWindows && !_shotPause && NativeMethods.ExcludeFromCapture(hwnd))
             {
-                Volatile.Write(ref _holdUntil, Environment.TickCount64 + HoldMs);
+                long until = Environment.TickCount64 + HoldMs;
+                // 隐藏的展开页还没有进入桌面画面，两条采样线程都可以继续取景。
+                if (hiddenPanel)
+                {
+                    lock (Gate) _hiddenPanelExclusions[hwnd] = until;
+                    return;
+                }
+                Volatile.Write(ref _holdUntil, until);
                 _wake.Set();
             }
+        }
+
+        internal static void PreparePanelVisibility(IntPtr hwnd)
+        {
+            lock (Gate)
+            {
+                if (!_hiddenPanelExclusions.Remove(hwnd, out long until) || until <= Environment.TickCount64
+                    || !ShouldExcludeWindows || _panelRequest is not { } request || request.Window != hwnd) return;
+                _panelExclusion = new PanelExclusion(request.Session, until);
+            }
+        }
+
+        private static long ScreenHoldUntil(PanelRequest request = null)
+        {
+            long hold = Volatile.Read(ref _holdUntil);
+            var panel = _panelExclusion;
+            return panel != null && (request == null || panel.Session == request.Session) ? Math.Max(hold, panel.Until) : hold;
         }
 
         internal static void SetBarWindow(IntPtr hwnd) => Volatile.Write(ref _barWindow, hwnd);
@@ -635,7 +657,7 @@ namespace DesktopBar.Services
             lock (Gate)
             {
                 _excluded.Remove(hwnd);
-                _wdaReady.Remove(hwnd);
+                _hiddenPanelExclusions.Remove(hwnd);
             }
             if (_enabled) NativeMethods.RestoreCapture(hwnd);
         }
@@ -757,7 +779,10 @@ namespace DesktopBar.Services
 
         // ---------- 展开页玻璃(实时) ----------
 
-        private sealed record PanelOptions(bool Liquid, int Blur, Color Tint, double TintOpacity, bool UseWindowBackdrop, bool WallpaperOnly);
+        private sealed record PanelOptions(bool Liquid, int Blur, Color Tint, double TintOpacity, bool UseWindowBackdrop, bool WallpaperOnly)
+        {
+            public bool UsesScreen => !UseWindowBackdrop && !WallpaperOnly;
+        }
         private enum PanelRead { Failed, Unchanged, Changed }
         private sealed record PanelRequest(Int32Rect Bounds, double Dpi, int Session, IntPtr Window, PanelOptions Options, bool Freeze);
 
@@ -878,6 +903,8 @@ namespace DesktopBar.Services
 
             internal void SuspendWindows() => _backdrop.Suspend();
 
+            public void ResetBaseline() => _previousRequest = null;
+
             private void DestroyScreenCapture() => NativeMethods.DestroyStripCapture(ref _screenDc, ref _memoryDc, ref _dib);
 
             public void Dispose()
@@ -954,13 +981,7 @@ namespace DesktopBar.Services
             _panelFps = App.ActiveSettings.GlassMaxFps;
             _panelRequest = request;
             if (request.Options.Liquid) SetOptics(_panelEffect, App.ActiveSettings);
-            var fallback = request.Options.UseWindowBackdrop
-                ? Ui.Brush("#222228", 0.55)
-                : panel.TryFindResource("ThemePanelBackground") as Brush ?? Ui.Brush(App.ActiveSettings.GlassTint);
-            surface.Fill = fallback;
-            surface.Opacity = App.ActiveSettings.GlassOpacity;
-            if (request.Options.UseWindowBackdrop && UsesAdaptiveInk(App.ActiveSettings))
-                ModuleBase.SetGlassInk(panel, 0, panel: true);
+            surface.Fill = Brushes.Transparent;
 
             // A foreground window can change between opens even at the same screen position.
             long verified;
@@ -1128,8 +1149,8 @@ namespace DesktopBar.Services
                     _panelWake.WaitOne();
                     continue;
                 }
-                long hold = Volatile.Read(ref _holdUntil) - Environment.TickCount64;
-                if (!request.Options.UseWindowBackdrop && !request.Options.WallpaperOnly && hold > 0)
+                long hold = request.Options.UsesScreen ? ScreenHoldUntil(request) - Environment.TickCount64 : 0;
+                if (hold > 0)
                 {
                     _panelWake.WaitOne((int)Math.Min(hold, 100));
                     continue;
@@ -1155,6 +1176,11 @@ namespace DesktopBar.Services
                         lock (Gate)
                         {
                             if (_shotPause || _panelCapturePaused || !ReferenceEquals(_panelRequest, request)) continue;
+                            if (request.Options.UsesScreen && Environment.TickCount64 < ScreenHoldUntil(request))
+                            {
+                                capture.ResetBaseline();
+                                continue;
+                            }
                             frame.Request = request;
                             frame.Region = region;
                             frame.CaptureTick = start;
@@ -1695,7 +1721,8 @@ namespace DesktopBar.Services
                         _wake.WaitOne(400);
                         continue;
                     }
-                    if (!spec.UseWindowBackdrop && !spec.WallpaperOnly && Environment.TickCount64 < Volatile.Read(ref _holdUntil))
+                    bool samplesScreen = !spec.UseWindowBackdrop && !spec.WallpaperOnly;
+                    if (samplesScreen && Environment.TickCount64 < ScreenHoldUntil())
                     {
                         _loopPhase = 2;
                         Thread.Sleep(100);
@@ -2013,6 +2040,12 @@ namespace DesktopBar.Services
                         {
                             if (_stopThread || !_enabled || _shotPause || backdropGeneration != _barBackdropGeneration
                                 || !SameCaptureSpec(_spec, spec)) continue;
+                            if (samplesScreen && Environment.TickCount64 < ScreenHoldUntil())
+                            {
+                                hasBaseline = false;
+                                hasDxgiPixels = false;
+                                continue;
+                            }
                             _latestSpec = spec;
                             _latestBackdropGeneration = backdropGeneration;
                             _latestSequence++;

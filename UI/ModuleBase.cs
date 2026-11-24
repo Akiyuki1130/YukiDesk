@@ -207,7 +207,7 @@ namespace DesktopBar.UI
                 NativeMethods.ApplyNoActivateToolStyle(h);
                 // 实时模式下登记为排除窗口，避免面板进入顶栏或展开页自己的采样。
                 // 窗口懒创建:SourceInitialized 在首次 ShowPanel 时才触发,正合适。
-                GlassService.RegisterWindow(h);
+                GlassService.RegisterWindow(h, hiddenPanel: true);
             };
             w.MouseEnter += (s, e) => _closeTimer.Stop();
             w.MouseLeave += (s, e) => { if (Open) StartCloseTimer(); };
@@ -247,7 +247,12 @@ namespace DesktopBar.UI
         {
             if (!NativeMethods.TryGetCursorPosition(out int x, out int y)) return Root.IsMouseOver || PanelWindow.IsMouseOver;
             var point = new Point(x, y);
-            return ContainsScreenPoint(Pill, point) || (_panelSurface.Opacity > 0 && ContainsScreenPoint(_panelSurface, point));
+            if (ContainsScreenPoint(Pill, point)) return true;
+            if (_panelSurface.Opacity > 0) return ContainsScreenPoint(_panelSurface, point);
+            if (!Open || !UsesPanelGlass) return false;
+            // 等首帧期间，指针已经移到展开页将要出现的位置就继续等待。
+            var dpi = VisualTreeHelper.GetDpi(Pill);
+            return GetPanelBounds().Contains(x / dpi.DpiScaleX, y / dpi.DpiScaleY);
         }
 
         private IntPtr _previousPanelForeground;
@@ -598,7 +603,8 @@ namespace DesktopBar.UI
             }
             // Register capture affinity on a hidden HWND before the first frame starts.
             // Modules that are never opened do not need a native flyout window at startup.
-            try { new System.Windows.Interop.WindowInteropHelper(PanelWindow).EnsureHandle(); }
+            IntPtr hwnd;
+            try { hwnd = new System.Windows.Interop.WindowInteropHelper(PanelWindow).EnsureHandle(); }
             catch (Exception ex)
             {
                 App.Log("无法创建展开页窗口: " + ex.Message);
@@ -685,6 +691,7 @@ namespace DesktopBar.UI
                 {
                     App.Log($"面板显形 {GetType().Name} Effect={_panelGlass.Effect?.GetType().Name} Fill={_panelGlass.Fill}");
                 }
+                if (glass && !windowBackdrop) GlassService.PreparePanelVisibility(hwnd);
                 PanelWindow.Visibility = Visibility.Visible;
                 AnimatePanel(open: true);
             }
@@ -725,17 +732,17 @@ namespace DesktopBar.UI
 
             async void RevealOnTimeout()
             {
-                await System.Threading.Tasks.Task.Delay(windowBackdrop ? 48 : 32);
+                // 首帧就绪会直接开始动画。只在采样持续不可用时显示备用材质。
+                await System.Threading.Tasks.Task.Delay(750);
                 if (revealed || openVersion != _panelGeneration || !Open || _closing) return;
-                if (_panelGlass.Fill is SolidColorBrush fallback)
-                {
-                    _panelBackdropFade.Fill = fallback;
-                    _fallbackOpacity = _panelGlass.Opacity;
-                    _fallbackAlpha = fallback.Color.A / 255.0 * fallback.Opacity * _fallbackOpacity;
-                    _panelBackdropFade.Opacity = _fallbackOpacity;
-                    _panelBackdropFade.Visibility = Visibility.Visible;
-                    _panelLiveLayer.Opacity = 0;
-                }
+                var fallback = Ui.Brush("#222228", 0.75);
+                _panelBackdropFade.Fill = fallback;
+                _fallbackOpacity = Math.Max(0.9, App.ActiveSettings.GlassOpacity);
+                _fallbackAlpha = fallback.Color.A / 255.0 * fallback.Opacity * _fallbackOpacity;
+                _panelBackdropFade.Opacity = _fallbackOpacity;
+                _panelBackdropFade.Visibility = Visibility.Visible;
+                _panelLiveLayer.Opacity = 0;
+                SetGlassInk(Panel, 0, panel: true);
                 Reveal();
             }
         }
@@ -963,8 +970,8 @@ namespace DesktopBar.UI
             _panelSurface.Clip = null;
             StopPanelTracking();
             ClearPanelBackdropFade();
-            GlassService.StopLivePanel(Panel);
             PanelWindow.Visibility = Visibility.Hidden;
+            GlassService.StopLivePanel(Panel);
             Panel.Visibility = Visibility.Collapsed;
             if (ReferenceEquals(_active, this)) _active = null;
             if (wasOpen)
