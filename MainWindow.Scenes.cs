@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Windows.Threading;
@@ -101,13 +102,14 @@ namespace DesktopBar
 
             if (previous.GlassStyle != current.GlassStyle || previous.GlassMaxFps != current.GlassMaxFps
                 || previous.FreezePanelGlass != current.FreezePanelGlass) GlassService.ApplyLive();
-            if (!previous.BarLayout.Select(Placement).SequenceEqual(current.BarLayout.Select(Placement))) RefreshBarLayout();
+            if (!ConfiguredPlacements(previous).SequenceEqual(ConfiguredPlacements(current))) RefreshBarLayout();
             if (previous.ShowFavorites != current.ShowFavorites) RefreshFavorites();
             ApplyModuleVisibility();
             if (previous.ReserveDesktopSpace != current.ReserveDesktopSpace && (!IsOnSecondaryScreen || !current.ReserveDesktopSpace))
                 DesktopSpaceService.Apply(current);
 
-            static (string, int, bool) Placement(BarPlacement entry) => (entry.Id, entry.Zone, entry.KeepVisible);
+            static IEnumerable<(string, int, bool)> ConfiguredPlacements(AppSettings settings) =>
+                settings.BarLayout.Where(entry => entry != null).Select(entry => (entry.Id, entry.Zone, entry.KeepVisible));
         }
     }
 }

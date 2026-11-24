@@ -531,6 +531,7 @@ namespace DesktopBar
         public void ApplyModuleVisibility()
         {
             if (!CheckAccess()) { Dispatcher.BeginInvoke(new Action(ApplyModuleVisibility)); return; }
+            PerfService.Instance.ConfigureMetrics(App.ActiveSettings);
             SetModuleVisibility(_power, App.ActiveSettings.ShowPower);
             SetModuleVisibility(_thisPc, App.ActiveSettings.ShowThisPc);
             SetModuleVisibility(_recycle, App.ActiveSettings.ShowRecycleBin);

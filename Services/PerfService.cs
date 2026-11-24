@@ -5,10 +5,18 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
+using DesktopBar.Models;
 using Microsoft.Win32;
 
 namespace DesktopBar.Services
 {
+    [Flags]
+    internal enum PerfComponents
+    {
+        None = 0, Cpu = 1, Gpu = 2, Memory = 4, Network = 8,
+        All = Cpu | Gpu | Memory | Network
+    }
+
     /// <summary>一块显卡的信息(DXGI 枚举)。属性绑定用于设置页下拉框。</summary>
     public sealed class GpuAdapterInfo
     {
@@ -28,6 +36,7 @@ namespace DesktopBar.Services
     /// <summary>一次性能采样快照。数值 -1 表示暂时未知(首个采样周期/计数器不可用)。</summary>
     public sealed class PerfSample
     {
+        internal PerfComponents Components;
         public double CpuPercent;
         public ulong MemUsedBytes;
         public ulong MemTotalBytes;
@@ -54,8 +63,7 @@ namespace DesktopBar.Services
     /// </summary>
     public sealed class PerfService
     {
-        private static PerfService _instance;
-        public static PerfService Instance => _instance ??= new PerfService();
+        public static PerfService Instance { get; } = new PerfService();
 
         private readonly object _gate = new object();
         private int _users;
@@ -65,6 +73,7 @@ namespace DesktopBar.Services
         private int _consecutiveFailures;
         private long _retryNotBefore;
         private volatile PerfSample _latest;
+        private volatile PerfComponents _components = PerfComponents.All;
         private readonly Queue<(long Time, PerfSample Sample)> _history = new();
 
         internal (long Time, PerfSample Sample)[] RecentSamples()
@@ -80,16 +89,35 @@ namespace DesktopBar.Services
         /// <summary>最近一次采样快照(采样线程写入,读取方只读)。</summary>
         public PerfSample Latest => _latest;
 
+        internal PerfSample LatestForConfiguration
+        {
+            get
+            {
+                var sample = _latest;
+                return sample?.Components == _components ? sample : null;
+            }
+        }
+
         /// <summary>每次采样后触发;处理器运行在采样线程,UI 使用前需自行调度。</summary>
         public event Action<PerfSample> Updated;
 
         private PerfService() { }
 
+        internal void ConfigureMetrics(AppSettings settings)
+        {
+            var components = PerfComponents.None;
+            if (settings.ShowMonitorCpu) components |= PerfComponents.Cpu;
+            if (settings.ShowMonitorGpu) components |= PerfComponents.Gpu;
+            if (settings.ShowMonitorMemory) components |= PerfComponents.Memory;
+            if (settings.ShowMonitorNetwork) components |= PerfComponents.Network;
+            _components = components;
+        }
+
         internal void RequestInitialSample()
         {
             lock (_gate)
             {
-                if (_latest != null || _initialSampleRequested) return;
+                if (LatestForConfiguration != null || _initialSampleRequested) return;
                 _initialSampleRequested = true;
                 StartWorkerLocked();
             }
@@ -139,11 +167,10 @@ namespace DesktopBar.Services
                 long wait = _retryNotBefore - Environment.TickCount64;
                 if (wait > 0 && token.WaitHandle.WaitOne((int)wait)) return;
                 using var cpu = new CpuSampler();
-                cpu.Next();
                 using var mem = new MemorySampler();
-                using var pdh = new PdhHost();
-                pdh.Collect();
-                double cpuBaseMhz = ReadCpuBaseMhz();
+                PdhHost pdh = null;
+                PerfComponents lastComponents = PerfComponents.None;
+                double? cpuBaseMhz = null;
                 var cpuTemp = new CpuTempSampler();
                 AdlHost adl = null;
                 NvmlHost nvml = null;
@@ -152,30 +179,51 @@ namespace DesktopBar.Services
                 {
                     while (!token.IsCancellationRequested)
                     {
+                        var components = _components;
+                        bool readCpu = (components & PerfComponents.Cpu) != 0;
+                        bool readGpu = (components & PerfComponents.Gpu) != 0;
+                        if (pdh == null || (lastComponents & ~PerfComponents.Memory) != (components & ~PerfComponents.Memory))
+                        {
+                            pdh?.Dispose();
+                            pdh = new PdhHost(components);
+                        }
+                        if (readCpu && (lastComponents & PerfComponents.Cpu) == 0)
+                        {
+                            cpu.Reset();
+                            cpu.Next();
+                            cpuBaseMhz ??= ReadCpuBaseMhz();
+                        }
+                        lastComponents = components;
                         var sample = new PerfSample
                         {
-                            CpuPercent = cpu.Next(),
+                            Components = components,
+                            CpuPercent = readCpu ? cpu.Next() : -1,
                             NetUpBps = -1,
                             NetDownBps = -1
                         };
-                        (sample.MemTotalBytes, sample.MemUsedBytes) = mem.Next();
+                        if ((components & PerfComponents.Memory) != 0)
+                        {
+                            (sample.MemTotalBytes, sample.MemUsedBytes) = mem.Next();
+                            sample.MemSpeedMts = WmiReader.ReadMemSpeedMts();
+                        }
                         pdh.Collect();
                         if (pdh.NetAvailable)
                             (sample.NetUpBps, sample.NetDownBps) = pdh.ReadNetTotals();
 
-                        if (pdh.CpuPerfAvailable && cpuBaseMhz > 0)
+                        if (pdh.CpuPerfAvailable && cpuBaseMhz is > 0)
                         {
                             double perf = pdh.ReadCpuPerf();
-                            if (perf >= 0) sample.CpuFreqMhz = cpuBaseMhz * perf / 100.0;
+                            if (perf >= 0) sample.CpuFreqMhz = cpuBaseMhz.Value * perf / 100.0;
                         }
                         // CPU 温度链(优先级从高到低):PawnIO 原生 Tctl(本进程直连或高权限从属进程
                         // 经共享内存发布)> AMD PMLog TEMP_CPU > ACPI 热区 WMI > AMD PMLog SoC。
-                        double pawnTctl = PawnIoTctl.ReadCpuTempC();
-                        if (pawnTctl < 0) pawnTctl = TemperatureSlave.ReadTctl();
-                        double wmiTemp = pawnTctl >= 0 ? -1 : cpuTemp.Next();
-                        sample.MemSpeedMts = WmiReader.ReadMemSpeedMts();
+                        double pawnTctl = readCpu ? PawnIoTctl.ReadCpuTempC() : -1;
+                        if (readCpu && pawnTctl < 0) pawnTctl = TemperatureSlave.ReadTctl();
+                        double wmiTemp = readCpu && pawnTctl < 0 ? cpuTemp.Next() : -1;
 
-                        sample.Gpus = AdaptersSnapshot();
+                        bool readAdapters = readGpu || readCpu && pawnTctl < 0;
+                        var adapters = readAdapters ? AdaptersSnapshot() : null;
+                        sample.Gpus = readGpu ? adapters : new List<GpuAdapterInfo>();
                         if (sample.Gpus.Count > 0 && pdh.GpuAvailable)
                         {
                             var sums = pdh.ReadGpuSums();
@@ -187,24 +235,24 @@ namespace DesktopBar.Services
 
                         // GPU 温度/频率遥测:按厂商惰性初始化对应提供方,失败静默降级(面板显示 --)。
                         // 初始化失败后 60 秒内不重试:每秒 LoadLibrary/ADL_Create 的重试既泄漏句柄又空转。
-                        if (sample.Gpus.Exists(g => g.VendorId == 0x1002)
+                        if (!readAdapters && adl != null) { adl.Dispose(); adl = null; }
+                        if (!readGpu && nvml != null) { nvml.Dispose(); nvml = null; }
+                        if (adapters?.Exists(g => g.VendorId == 0x1002) == true
                             && adl == null && Environment.TickCount64 >= adlRetryNotBefore)
                         {
                             adl = AdlHost.TryCreate();
                             if (adl == null) adlRetryNotBefore = Environment.TickCount64 + 60000;
                         }
-                        if (sample.Gpus.Exists(g => g.VendorId == 0x10DE)
+                        if (readGpu && sample.Gpus.Exists(g => g.VendorId == 0x10DE)
                             && nvml == null && Environment.TickCount64 >= nvmlRetryNotBefore)
                         {
                             nvml = NvmlHost.TryCreate();
                             if (nvml == null) nvmlRetryNotBefore = Environment.TickCount64 + 60000;
                         }
-                        (double amdCpuTemp, double amdSocTemp) = adl != null ? adl.Poll(sample) : (-1, -1);
+                        (double amdCpuTemp, double amdSocTemp) = adl != null ? adl.Poll(adapters) : (-1, -1);
                         nvml?.Poll(sample.Gpus);
-                        if (pawnTctl >= 0) sample.CpuTempC = pawnTctl;
-                        else if (amdCpuTemp >= 0) sample.CpuTempC = amdCpuTemp;
-                        else if (wmiTemp >= 0) sample.CpuTempC = wmiTemp;
-                        else if (amdSocTemp >= 0) sample.CpuTempC = amdSocTemp;
+                        if (readCpu) sample.CpuTempC = pawnTctl >= 0 ? pawnTctl : amdCpuTemp >= 0 ? amdCpuTemp
+                            : wmiTemp >= 0 ? wmiTemp : amdSocTemp;
 
                         bool keepSampling;
                         lock (_gate)
@@ -229,6 +277,7 @@ namespace DesktopBar.Services
                     // 放 finally:异常重启线程的路径同样要释放 ADL/NVML,否则句柄随重启累积。
                     adl?.Dispose();
                     nvml?.Dispose();
+                    pdh?.Dispose();
                 }
             }
             catch (Exception ex)
@@ -297,13 +346,15 @@ namespace DesktopBar.Services
             private ulong _idle, _kernel, _user;
             private bool _primed;
 
+            public void Reset() => _primed = false;
+
             public double Next()
             {
                 if (!PerfNative.GetSystemTimes(out var idle, out var kernel, out var user)) return -1;
                 ulong i = PerfNative.FileTimeValue(idle);
                 ulong k = PerfNative.FileTimeValue(kernel);
                 ulong u = PerfNative.FileTimeValue(user);
-                if (!_primed)
+                if (!_primed || i < _idle || k < _kernel || u < _user)
                 {
                     _idle = i; _kernel = k; _user = u;
                     _primed = true;
@@ -313,7 +364,7 @@ namespace DesktopBar.Services
                 _idle = i; _kernel = k; _user = u;
                 ulong total = dk + du; // kernel 时间已含 idle,不再重复计入
                 if (total == 0) return -1;
-                return Math.Clamp(100.0 * (dk + du - di) / total, 0, 100);
+                return di >= total ? 0 : 100.0 * (total - di) / total;
             }
 
             public void Dispose() { }
@@ -344,19 +395,21 @@ namespace DesktopBar.Services
             public bool NetAvailable => _netRecv != IntPtr.Zero && _netSent != IntPtr.Zero;
             public bool CpuPerfAvailable => _cpuPerf != IntPtr.Zero;
 
-            public PdhHost()
+            public PdhHost(PerfComponents components)
             {
                 try
                 {
+                    if ((components & ~PerfComponents.Memory) == PerfComponents.None) return;
                     if (PerfNative.PdhOpenQueryW(null, IntPtr.Zero, out _query) != 0) return;
-                    if (PerfNative.PdhAddEnglishCounterW(_query, @"\GPU Engine(*)\Utilization Percentage", IntPtr.Zero, out _gpuUtil) != 0)
-                        _gpuUtil = IntPtr.Zero;
-                    if (PerfNative.PdhAddEnglishCounterW(_query, @"\Network Interface(*)\Bytes Received/sec", IntPtr.Zero, out _netRecv) != 0)
-                        _netRecv = IntPtr.Zero;
-                    if (PerfNative.PdhAddEnglishCounterW(_query, @"\Network Interface(*)\Bytes Sent/sec", IntPtr.Zero, out _netSent) != 0)
-                        _netSent = IntPtr.Zero;
-                    if (PerfNative.PdhAddEnglishCounterW(_query, @"\Processor Information(_Total)\% Processor Performance", IntPtr.Zero, out _cpuPerf) != 0)
-                        _cpuPerf = IntPtr.Zero;
+                    if ((components & PerfComponents.Gpu) != 0)
+                        _gpuUtil = Add(@"\GPU Engine(*)\Utilization Percentage");
+                    if ((components & PerfComponents.Network) != 0)
+                    {
+                        _netRecv = Add(@"\Network Interface(*)\Bytes Received/sec");
+                        _netSent = Add(@"\Network Interface(*)\Bytes Sent/sec");
+                    }
+                    if ((components & PerfComponents.Cpu) != 0)
+                        _cpuPerf = Add(@"\Processor Information(_Total)\% Processor Performance");
                     if (_query == IntPtr.Zero) return;
                     // 速率类计数器需要两次采集才有有效数据。
                     PerfNative.PdhCollectQueryData(_query);
@@ -369,6 +422,9 @@ namespace DesktopBar.Services
                     _gpuUtil = _netRecv = _netSent = _cpuPerf = IntPtr.Zero;
                 }
             }
+
+            private IntPtr Add(string path) => PerfNative.PdhAddEnglishCounterW(_query, path, IntPtr.Zero, out var counter) == 0
+                ? counter : IntPtr.Zero;
 
             public void Collect()
             {
@@ -761,12 +817,12 @@ namespace DesktopBar.Services
             /// cpuTempC = 核显/CPU 侧适配器上的 TEMPERATURE_CPU(32,APU 真 CPU 温度),
             /// socTempC = TEMPERATURE_SOC(29,桌面 AM5 上是 CPU 封装内 IO-die 传感器,读数偏低属正常)。
             /// 最终采用哪一级由调用方按优先级链决定。查询失败返回 -1。</summary>
-            public (double cpuTempC, double socTempC) Poll(PerfSample sample)
+            public (double cpuTempC, double socTempC) Poll(List<GpuAdapterInfo> adapters)
             {
                 if (_context == IntPtr.Zero) return (-1, -1);
                 double cpuTempBest = -1;      // TEMPERATURE_CPU
                 double socTempBest = -1;      // TEMPERATURE_SOC(仅 CPU 侧适配器)
-                foreach (var gpu in sample.Gpus)
+                foreach (var gpu in adapters)
                 {
                     if (gpu.VendorId != 0x1002 || !_adapterIndexByDeviceId.TryGetValue(gpu.DeviceId, out int idx))
                         continue;

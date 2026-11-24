@@ -1056,7 +1056,7 @@ namespace DesktopBar.UI
             _panelLayoutPrepared = true;
             UpdateNetworkWatch();
             if (_networkAdapter != null) SetRow("连接", _networkAdapter);
-            var latest = PerfService.Instance.Latest;
+            var latest = PerfService.Instance.LatestForConfiguration;
             if (latest != null) Apply(latest);
             UpdateSampleSubscription();
         }
@@ -1074,7 +1074,7 @@ namespace DesktopBar.UI
             {
                 _panelPreload = null;
                 if (!CanPreload || Open || HasVisiblePanel) return;
-                var sample = PerfService.Instance.Latest;
+                var sample = PerfService.Instance.LatestForConfiguration;
                 if (sample != null) Apply(sample, preload: true);
                 PreparePanelLayout();
                 _panelLayoutPrepared = true;
@@ -1259,7 +1259,7 @@ namespace DesktopBar.UI
                 _trendChoice.Content = MetricName(_trendMetric) + " · 最近 60 秒";
                 _panelSample = null;
             }
-            if (PerfService.Instance.Latest is PerfSample sample) Apply(sample, preload: true);
+            if (PerfService.Instance.LatestForConfiguration is PerfSample sample) Apply(sample, preload: true);
         }
 
         internal static IEnumerable<PerfMetric> EnabledMetrics()
@@ -1333,7 +1333,7 @@ namespace DesktopBar.UI
                 if (active)
                 {
                     service.AddRef();
-                    var latest = service.Latest;
+                    var latest = service.LatestForConfiguration;
                     if (latest != null) Apply(latest);
                 }
                 else service.ReleaseRef();
@@ -1352,7 +1352,7 @@ namespace DesktopBar.UI
             SetActive(active);
         }
 
-        private void OnSample(PerfSample sample)
+        private void OnSample(PerfSample _)
         {
             if (_disposed) return;
             try
@@ -1360,7 +1360,7 @@ namespace DesktopBar.UI
                 Dispatcher.BeginInvoke(new Action(() =>
                 {
                     if (_disposed) return;
-                    if (_active) Apply(PerfService.Instance.Latest ?? sample);
+                    if (_active && PerfService.Instance.LatestForConfiguration is { } current) Apply(current);
                     QueuePanelPreload();
                 }));
             }
