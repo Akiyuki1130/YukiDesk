@@ -24,6 +24,7 @@ namespace DesktopBar.Services
         private const uint ClsctxAll = 0x17;
         private const int ShareModeShared = 0;
         private const int StreamFlagsLoopback = 0x00020000;
+        private const int StreamFlagsEventCallback = 0x00040000;
         private const uint BufferFlagSilent = 0x2;
 
         private static SpectrumService _instance;
@@ -31,6 +32,7 @@ namespace DesktopBar.Services
 
         private static readonly float[] CosTable = BuildTwiddle(true);
         private static readonly float[] SinTable = BuildTwiddle(false);
+        private static readonly float[] SilentBands = new float[BarCount];
 
         private readonly object _gate = new object();
         private readonly float[] _hist = new float[FftSize];
@@ -40,7 +42,7 @@ namespace DesktopBar.Services
         private float[] _re = new float[FftSize], _im = new float[FftSize];
         private float[] _window;
         private int[] _edges;
-        private int _histPos, _histCount, _pending, _lastRate;
+        private int _histPos, _histCount, _silentSamples, _pending, _lastRate;
         private int _decim = 1, _decimCount;
         private float _decimAccum;
         private int _effectiveRate = 48000;
@@ -52,16 +54,15 @@ namespace DesktopBar.Services
         private Thread _thread;
         private CancellationTokenSource _runCancellation;
         private int _users;
-        private long _lastDataTick;
         private long _lastBandsTick;
 
-        private volatile float[] _bands = new float[BarCount];
+        private volatile float[] _bands = SilentBands;
 
         /// <summary>当前频段能量(0~1)。数组整体只读替换,读取方拿引用直接遍历即可。</summary>
         public float[] Bands => _bands;
 
         /// <summary>最近一次已发布频段的时间(Environment.TickCount64),用于判断显示是否停滞。</summary>
-        public long LastDataTick => _lastBandsTick;
+        public long LastDataTick => Volatile.Read(ref _lastBandsTick);
 
         private SpectrumService() { }
 
@@ -181,11 +182,11 @@ namespace DesktopBar.Services
             Array.Clear(_smooth, 0, _smooth.Length);
             _histPos = 0;
             _histCount = 0;
+            _silentSamples = 0;
             _pending = 0;
             _agc = 0;
-            _bands = new float[BarCount];
-            _lastDataTick = 0;
-            _lastBandsTick = 0;
+            _bands = SilentBands;
+            Volatile.Write(ref _lastBandsTick, 0);
         }
 
         /// <summary>FFT 链路自检:注入 0.5 幅度 440Hz 正弦,验证频段聚合与 AGC 输出。</summary>
@@ -212,6 +213,7 @@ namespace DesktopBar.Services
             IAudioClient client = null;
             IAudioCaptureClient capture = null;
             IntPtr format = IntPtr.Zero;
+            using var audioReady = new AutoResetEvent(false);
             try
             {
                 Check(enumerator.GetDefaultAudioEndpoint(EDataFlow.Render, ERole.Multimedia, out device), "查找默认播放设备");
@@ -232,22 +234,37 @@ namespace DesktopBar.Services
                 // 设备/格式重连后不能混入旧端点的采样历史。
                 Array.Clear(_hist, 0, _hist.Length);
                 Array.Clear(_smooth, 0, _smooth.Length);
-                _histPos = _histCount = _pending = 0;
+                _histPos = _histCount = _silentSamples = _pending = 0;
                 _agc = 0;
-                _bands = new float[BarCount];
-                _lastBandsTick = 0;
+                _bands = SilentBands;
+                Volatile.Write(ref _lastBandsTick, 0);
                 _lastRate = 0; // 让 ComputeBands 按新采样率重建窗表
-                App.Log("频谱: 环回采集 " + rate + "Hz " + channels + "声道 " + (isFloat ? "float32" : "pcm16")
-                    + (_decim > 1 ? " 抽取1/" + _decim + "→" + _effectiveRate + "Hz" : ""));
 
-                Check(client.Initialize(ShareModeShared, StreamFlagsLoopback, 2000000, 0, format, IntPtr.Zero), "初始化环回采集");
+                int eventStatus = client.Initialize(ShareModeShared, StreamFlagsLoopback | StreamFlagsEventCallback,
+                    2000000, 0, format, IntPtr.Zero);
+                if (eventStatus >= 0)
+                    eventStatus = client.SetEventHandle(audioReady.SafeWaitHandle.DangerousGetHandle());
+                bool eventDriven = eventStatus >= 0;
+                if (!eventDriven)
+                {
+                    // 已初始化的客户端不能切换模式，重新连接再走旧的轮询路径。
+                    ReleaseCom(client);
+                    client = null;
+                    Check(device.Activate(ref clientIid, ClsctxAll, IntPtr.Zero, out client), "重新连接播放设备");
+                    Check(client.Initialize(ShareModeShared, StreamFlagsLoopback, 2000000, 0, format, IntPtr.Zero), "初始化环回采集");
+                }
                 var captureIid = CaptureClientIid;
                 Check(client.GetService(ref captureIid, out capture), "获取环回采集接口");
                 Check(client.Start(), "启动环回采集");
+                App.Log("频谱: 环回采集 " + rate + "Hz " + channels + "声道 " + (isFloat ? "float32" : "pcm16")
+                    + (eventDriven ? "（事件驱动）" : "（轮询）")
+                    + (_decim > 1 ? " 抽取1/" + _decim + "→" + _effectiveRate + "Hz" : ""));
 
-                long lastPoll = 0;
+                var waits = new WaitHandle[] { token.WaitHandle, audioReady };
+                bool waitTimedOut = false;
                 long lastPacket = Environment.TickCount64;
                 long lastDecay = lastPacket;
+                long lastPoll = lastPacket;
                 while (!token.IsCancellationRequested)
                 {
                     long now = Environment.TickCount64;
@@ -266,8 +283,21 @@ namespace DesktopBar.Services
                             DecayAll();
                             lastDecay = now;
                         }
-                        token.WaitHandle.WaitOne(15);
+                        int delay = now - lastPacket > 300 && _bands != SilentBands ? 33 : 200;
+                        if (eventDriven) waitTimedOut = WaitHandle.WaitAny(waits, delay) == WaitHandle.WaitTimeout;
+                        else waits[0].WaitOne(15);
                         continue;
+                    }
+
+                    // 少数端点收到数据却不发信号，继续按原来的速率轮询。
+                    if (waitTimedOut)
+                    {
+                        waitTimedOut = false;
+                        if (!audioReady.WaitOne(0))
+                        {
+                            eventDriven = false;
+                            App.Log("频谱: 播放端点没有发送采集事件，切换到轮询");
+                        }
                     }
 
                     uint frames = 0;
@@ -276,7 +306,6 @@ namespace DesktopBar.Services
                     {
                         Check(capture.GetBuffer(out IntPtr data, out frames, out uint flags, out _, out _), "读取音频数据");
                         bufferAcquired = true;
-                        _lastDataTick = now;
                         lastPacket = now;
                         if (frames > 0)
                         {
@@ -389,6 +418,7 @@ namespace DesktopBar.Services
             _hist[_histPos] = value;
             _histPos = (_histPos + 1) & (FftSize - 1);
             if (_histCount < FftSize) _histCount++;
+            _silentSamples = value == 0f ? Math.Min(FftSize, _silentSamples + 1) : 0;
             // 按样本数累积;此前误按包数计数导致 FFT 约 5 秒才跑一次。
             if (++_pending >= Hop && _histCount == FftSize)
             {
@@ -399,6 +429,13 @@ namespace DesktopBar.Services
 
         private void ComputeBands(int rate)
         {
+            // 部分端点在安静时仍会送来全零包，窗口完全归零后直接衰减能量。
+            if (_silentSamples == FftSize)
+            {
+                _agc *= 0.995f;
+                DecayAll(0.78f);
+                return;
+            }
             if (_window == null || _lastRate != rate) BuildTables(rate);
             // 按时间序取出最近 FftSize 个样本并加汉宁窗。
             for (int k = 0; k < FftSize; k++)
@@ -442,19 +479,29 @@ namespace DesktopBar.Services
                 next[b] = _smooth[b];
             }
             _bands = next;
-            _lastBandsTick = Environment.TickCount64;
+            Volatile.Write(ref _lastBandsTick, Environment.TickCount64);
         }
 
-        private void DecayAll()
+        private void DecayAll(float factor = 0.72f)
         {
-            var next = new float[BarCount];
+            if (_bands == SilentBands) return;
+            bool visible = false;
             for (int b = 0; b < BarCount; b++)
             {
-                _smooth[b] *= 0.72f;
-                next[b] = _smooth[b];
+                _smooth[b] *= factor;
+                if (_smooth[b] > 0.001f) visible = true;
             }
+            if (!visible)
+            {
+                Array.Clear(_smooth);
+                _bands = SilentBands;
+                Volatile.Write(ref _lastBandsTick, Environment.TickCount64);
+                return;
+            }
+            var next = new float[BarCount];
+            _smooth.CopyTo(next, 0);
             _bands = next;
-            _lastBandsTick = Environment.TickCount64;
+            Volatile.Write(ref _lastBandsTick, Environment.TickCount64);
         }
 
         private void BuildTables(int rate)
