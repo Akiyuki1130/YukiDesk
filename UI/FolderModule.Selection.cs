@@ -87,7 +87,8 @@ namespace DesktopBar.UI
                 _listView.ScrollIntoView(first);
                 Dispatcher.BeginInvoke(DispatcherPriority.Loaded, new Action(() =>
                 {
-                    if (Open && _listView.IsHitTestVisible
+                    if (Open && _listView.IsHitTestVisible && _displayedRevision == _viewRevision
+                        && ReferenceEquals(_displayedFiles, _files)
                         && _listView.ItemContainerGenerator.ContainerFromItem(first) is ListBoxItem row)
                         Ui.VisualDescendants<Border>(row).FirstOrDefault(tile => tile.Focusable)?.Focus();
                 }));

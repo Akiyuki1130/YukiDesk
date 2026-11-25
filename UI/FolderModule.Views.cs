@@ -28,7 +28,7 @@ namespace DesktopBar.UI
         private Image _previewImage;
         private TextBlock _previewLabel;
         private Button _previewPrevious, _previewNext;
-        private int _viewRevision, _preparingRevision, _displayedRevision = -1, _previewRevision;
+        private int _viewRevision, _preparingRevision, _displayedRevision = -1, _previewRevision, _filterKeyVersion;
         private int _previewIndex;
         private CancellationTokenSource _previewRead;
         private int _visibleLimit = 144;
@@ -85,29 +85,11 @@ namespace DesktopBar.UI
             System.Windows.Automation.AutomationProperties.SetName(_filter, "筛选文件名");
             _filter.PreviewMouseLeftButtonDown += (_, _) => EnterPanelKeyboardMode(_filter);
             _filter.TextChanged += (_, _) => OnTextFilterChanged();
-            _filter.PreviewKeyDown += async (_, e) =>
+            _filter.PreviewKeyDown += (_, e) =>
             {
-                if (e.Key == Key.Enter && !e.Handled)
-                {
-                    if (_textFilterDelay?.IsEnabled == true)
-                    {
-                        _textFilterDelay.Stop();
-                        e.Handled = true;
-                        int revision = _viewRevision;
-                        await ShowFilesAsync();
-                        if (revision != _viewRevision || !_filter.IsKeyboardFocusWithin) return;
-                    }
-                    if (Open && _displayedRevision == _viewRevision && _matchedFiles.FirstOrDefault() is FileSystemInfo first)
-                    {
-                        OpenInside(first);
-                        e.Handled = true;
-                    }
-                }
-                else if (e.Key == Key.Down && _matchedFiles.Length > 0)
-                {
-                    FocusFirstMatch();
-                    e.Handled = true;
-                }
+                if (e.Handled || e.Key is not (Key.Enter or Key.Down) || Keyboard.Modifiers != ModifierKeys.None) return;
+                e.Handled = true;
+                if (!e.IsRepeat) _ = UseFirstFilterMatchAsync(e.Key);
             };
             tools.Children.Add(_filter);
             browser.Children.Add(tools);
@@ -161,7 +143,7 @@ namespace DesktopBar.UI
             root.Children.Add(_preview);
             PanelWindow.PreviewKeyDown += (_, e) =>
             {
-                if (HandleSelectionKey(e)) return;
+                if (HandleFlyoutKey(e) || HandleSelectionKey(e)) return;
                 var key = e.Key == Key.System ? e.SystemKey : e.Key;
                 bool previewing = _preview.Visibility == Visibility.Visible;
                 if (e.Key == Key.Escape || previewing && e.Key == Key.Space)
@@ -289,6 +271,19 @@ namespace DesktopBar.UI
             _textFilterDelay?.Stop();
             _viewRevision++;
             _ = ShowFilesAsync();
+        }
+
+        private async Task UseFirstFilterMatchAsync(Key key)
+        {
+            _textFilterDelay?.Stop();
+            int keyVersion = ++_filterKeyVersion;
+            int revision = _viewRevision;
+            await ShowFilesAsync();
+            if (keyVersion != _filterKeyVersion || revision != _viewRevision || _displayedRevision != revision
+                || !ReferenceEquals(_displayedFiles, _files) || !Open || !_filter.IsKeyboardFocusWithin
+                || _matchedFiles.FirstOrDefault() is not FileSystemInfo first) return;
+            if (key == Key.Enter) OpenInside(first);
+            else FocusFirstMatch();
         }
 
         private void OnTextFilterChanged()

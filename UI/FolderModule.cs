@@ -35,6 +35,7 @@ namespace DesktopBar.UI
         private FolderTile[] _tiles = Array.Empty<FolderTile>();
         private FileSystemInfo[] _matchedFiles = Array.Empty<FileSystemInfo>();
         private CancellationTokenSource _filterRequest;
+        private Task _viewTask = Task.CompletedTask;
         private int _loadVersion;
         private CancellationTokenSource _folderRead;
         private bool _readAgain;
@@ -120,6 +121,7 @@ namespace DesktopBar.UI
         protected override void OnPanelHidden()
         {
             _textFilterDelay?.Stop();
+            _filterKeyVersion++;
             _filterRequest?.Cancel();
             ClearSelection();
             CancelPreview();
@@ -304,17 +306,21 @@ namespace DesktopBar.UI
             }
         }
 
-        private async Task ShowFilesAsync()
+        private Task ShowFilesAsync()
         {
             var files = _files;
             int revision = _viewRevision;
+            if (files == null || _textFilterDelay?.IsEnabled == true || _disposed || !Open || FileDropInteractionActive
+                || (ReferenceEquals(_displayedFiles, files) && _displayedRevision == revision)) return Task.CompletedTask;
+            if (ReferenceEquals(_preparingFiles, files) && _preparingRevision == revision
+                && _filterRequest is { IsCancellationRequested: false }) return _viewTask;
+            return _viewTask = BuildFolderViewAsync(files, revision);
+        }
+
+        private async Task BuildFolderViewAsync(FileSystemInfo[] files, int revision)
+        {
             bool CanApply() => !_disposed && Open && !FileDropInteractionActive
                 && ReferenceEquals(_files, files) && revision == _viewRevision;
-            if (files == null || _textFilterDelay?.IsEnabled == true || !CanApply()
-                || (ReferenceEquals(_displayedFiles, files) && _displayedRevision == revision)
-                || (ReferenceEquals(_preparingFiles, files) && _preparingRevision == revision
-                    && _filterRequest is { IsCancellationRequested: false })) return;
-
             _preparingFiles = files;
             _preparingRevision = revision;
             _filterRequest?.Cancel();
@@ -434,6 +440,13 @@ namespace DesktopBar.UI
             tile.PreviewKeyDown += (_, e) =>
             {
                 if (!tile.IsHitTestVisible) return;
+                var key = e.Key == Key.System ? e.SystemKey : e.Key;
+                if (key == Key.Apps || key == Key.F10 && Keyboard.Modifiers == ModifierKeys.Shift)
+                {
+                    if (!e.IsRepeat) ShowItemMenu(item, displayName, tile);
+                    e.Handled = true;
+                    return;
+                }
                 if (e.Key == Key.Space && !isDir) { PreviewFile(item); e.Handled = true; }
                 if (e.Key == Key.Enter) { OpenInside(item); e.Handled = true; }
             };
@@ -455,29 +468,39 @@ namespace DesktopBar.UI
             tile.MouseRightButtonUp += (_, e) =>
             {
                 e.Handled = true;
-                if (_selection.Contains(item.FullName) && _selection.Count > 1)
-                {
-                    TrackFlyout(FlyoutMenu.Show(SelectionActions(), $"已选 {_selection.Count} 项"));
-                    return;
-                }
-                var items = new System.Collections.Generic.List<FlyoutItem>
-                {
-                    new FlyoutItem("打开", () => DesktopActions.Open(item.FullName)),
-                    new FlyoutItem(IsPinned(item.Name) ? "取消置顶" : "置顶", () => TogglePin(item.Name)),
-                    new FlyoutItem("固定到常用项", () => DesktopActions.Add(item.FullName)),
-                    ItemVerb("复制", item.FullName, "copy"),
-                    ItemVerb("剪切", item.FullName, "cut"),
-                    PasteItem(isDir ? item.FullName : CurrentDirectory),
-                    RenameItem(item.FullName),
-                    ItemVerb("删除", item.FullName, "delete", danger: true),
-                    new FlyoutItem("在资源管理器中定位", () => ShellOpen.RevealItem(item.FullName))
-                };
-                if (!isDir) items.Insert(1, new FlyoutItem("快速预览", () => PreviewFile(item)));
-                TrackFlyout(FlyoutMenu.Show(items, displayName));
+                ShowItemMenu(item, displayName);
             };
             if (isDir)
                 WireFileDrop(tile, item.FullName, RunFileOperation);
             return tile;
+        }
+
+        private void ShowItemMenu(FileSystemInfo item, string name, FrameworkElement keyboardAnchor = null)
+        {
+            if (_selection.Contains(item.FullName) && _selection.Count > 1)
+            {
+                OpenMenu(SelectionActions(), $"已选 {_selection.Count} 项");
+                return;
+            }
+            bool isDir = item is DirectoryInfo;
+            var items = new List<FlyoutItem>
+            {
+                new FlyoutItem("打开", () => DesktopActions.Open(item.FullName)),
+                new FlyoutItem(IsPinned(item.Name) ? "取消置顶" : "置顶", () => TogglePin(item.Name)),
+                new FlyoutItem("固定到常用项", () => DesktopActions.Add(item.FullName)),
+                ItemVerb("复制", item.FullName, "copy"),
+                ItemVerb("剪切", item.FullName, "cut"),
+                PasteItem(isDir ? item.FullName : CurrentDirectory),
+                RenameItem(item.FullName),
+                ItemVerb("删除", item.FullName, "delete", danger: true),
+                new FlyoutItem("在资源管理器中定位", () => ShellOpen.RevealItem(item.FullName))
+            };
+            if (!isDir) items.Insert(1, new FlyoutItem("快速预览", () => PreviewFile(item)));
+            OpenMenu(items, name);
+
+            void OpenMenu(IReadOnlyList<FlyoutItem> actions, string caption)
+                => TrackFlyout(keyboardAnchor == null ? FlyoutMenu.Show(actions, caption)
+                    : FlyoutMenu.ShowKeyboard(actions, caption, keyboardAnchor));
         }
 
         private void ShowFolderMenu(bool fromPanel = false)

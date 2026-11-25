@@ -286,6 +286,8 @@ namespace DesktopBar.UI
 
         private Popup _openMenu;
 
+        protected bool HandleFlyoutKey(KeyEventArgs args) => FlyoutMenu.HandleKey(_openMenu, args);
+
         protected IntPtr FileOperationOwner => new System.Windows.Interop.WindowInteropHelper(
             PanelWindow.IsVisible ? PanelWindow : Window.GetWindow(this) ?? PanelWindow).Handle;
 
