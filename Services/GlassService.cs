@@ -1766,10 +1766,11 @@ namespace DesktopBar.Services
                         continue;
                     }
                     bool samplesScreen = !spec.UseWindowBackdrop && !spec.WallpaperOnly;
-                    if (samplesScreen && Environment.TickCount64 < ScreenHoldUntil())
+                    long affinityDelay = samplesScreen ? ScreenHoldUntil() - Environment.TickCount64 : 0;
+                    if (affinityDelay > 0)
                     {
                         _loopPhase = 2;
-                        Thread.Sleep(100);
+                        _wake.WaitOne((int)Math.Min(100, affinityDelay));
                         continue;
                     }
                     // 取证抓图进行中:WDA 已被临时恢复(顶栏此刻可被捕获),
@@ -1777,7 +1778,7 @@ namespace DesktopBar.Services
                     if (_shotPause)
                     {
                         _loopPhase = 3;
-                        Thread.Sleep(50);
+                        _wake.WaitOne(50);
                         continue;
                     }
                     int wallpaper = Volatile.Read(ref _wallpaperGeneration);
@@ -2049,12 +2050,24 @@ namespace DesktopBar.Services
                         _wake.WaitOne(50);
                         continue;
                     }
-                    long tDiff = System.Diagnostics.Stopwatch.GetTimestamp();
-                    double diff = hasBaseline ? MeanAbsDiff(halfBase, backdrop, hw, hh, 16) : 1e9;
-                    Interlocked.Add(ref StatDiffTicks, System.Diagnostics.Stopwatch.GetTimestamp() - tDiff);
+                    long tDiff = Stopwatch.GetTimestamp();
+                    double diff = double.PositiveInfinity;
+                    bool publish = slideCompleted || _alwaysPub || !hasBaseline;
+                    if (!publish)
+                    {
+                        if (spec.UseWindowBackdrop)
+                        {
+                            // 逐窗口合成只需要知道像素是否变化，无需再做一次差分采样。
+                            publish = !backdrop.AsSpan().SequenceEqual(halfBase);
+                        }
+                        else
+                        {
+                            diff = MeanAbsDiff(halfBase, backdrop, hw, hh, 16);
+                            publish = diff >= DiffThreshold;
+                        }
+                    }
+                    Interlocked.Add(ref StatDiffTicks, Stopwatch.GetTimestamp() - tDiff);
                     long nowTick = Environment.TickCount64;
-                    bool windowRegionChanged = spec.UseWindowBackdrop && !backdrop.AsSpan().SequenceEqual(halfBase);
-                    bool publish = slideCompleted || _alwaysPub || diff >= DiffThreshold || windowRegionChanged;
                     // 小幅漂移(例如慢速滚动、小面积动画)不必按满帧率发布:每次发布都要整条窗口重呈。
                     // 但 100ms 的闸门(10fps)在液态玻璃下能看出卡顿,收到 50ms(20fps)——
                     // 折中:CPU 只多一半,肉眼基本连续。
