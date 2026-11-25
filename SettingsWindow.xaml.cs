@@ -364,11 +364,19 @@ namespace DesktopBar
             Grid.SetColumn(control, 1);
             g.Children.Add(l);
             g.Children.Add(control);
+            double originalMinWidth = control.MinWidth;
+            double originalMaxWidth = control.MaxWidth;
             if (control is not ToggleButton)
                 g.SizeChanged += (_, args) =>
                 {
                     if (!args.WidthChanged) return;
                     bool compact = args.NewSize.Width < 352;
+                    if (control is ComboBox)
+                    {
+                        double available = Math.Max(0, args.NewSize.Width - (compact ? 0 : labelWidth));
+                        control.MinWidth = Math.Min(originalMinWidth, available);
+                        control.MaxWidth = Math.Min(originalMaxWidth, available);
+                    }
                     if (compact == (Grid.GetRow(control) == 1)) return;
                     if (compact && g.RowDefinitions.Count == 0)
                     {
