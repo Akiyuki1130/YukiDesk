@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
@@ -78,7 +79,7 @@ namespace DesktopBar.UI
             if (_displayedRevision != _viewRevision) EaseInResults(_listView);
         }
 
-        private void FocusFirstMatch()
+        private async Task FocusFirstMatchAsync()
         {
             if (Preferences.ListView && _listView.Items.Count > 0)
             {
@@ -87,23 +88,24 @@ namespace DesktopBar.UI
                 int revision = _viewRevision;
                 int keyVersion = _filterKeyVersion;
                 _listView.ScrollIntoView(first);
-                Dispatcher.BeginInvoke(DispatcherPriority.Loaded, new Action(() => FocusRow(allowRetry: true)));
+                await Dispatcher.Yield(DispatcherPriority.Loaded);
+                if (!CanFocusRow() || FocusRow()) return;
 
-                void FocusRow(bool allowRetry)
+                // A virtualized item can still be waiting for its row to be realized after replacing ItemsSource.
+                _listView.UpdateLayout();
+                await Dispatcher.Yield(DispatcherPriority.ContextIdle);
+                if (CanFocusRow()) FocusRow();
+
+                bool CanFocusRow() => Open && _filter.IsKeyboardFocusWithin && _listView.IsHitTestVisible
+                    && revision == _viewRevision && keyVersion == _filterKeyVersion
+                    && ReferenceEquals(_displayedFiles, _files)
+                    && _listView.Items.Count > 0 && ReferenceEquals(_listView.Items[0], first);
+
+                bool FocusRow()
                 {
-                    if (!Open || !_filter.IsKeyboardFocusWithin || !_listView.IsHitTestVisible
-                        || revision != _viewRevision || keyVersion != _filterKeyVersion
-                        || !ReferenceEquals(_displayedFiles, _files)) return;
-                    if (_listView.Items.Count > 0 && ReferenceEquals(_listView.Items[0], first)
-                        && _listView.ItemContainerGenerator.ContainerFromItem(first) is ListBoxItem row)
-                    {
-                        var tile = Ui.VisualDescendants<Border>(row).FirstOrDefault(item => item.Focusable);
-                        if (tile?.Focus() == true) return;
-                    }
-                    if (!allowRetry) return;
-                    // A virtualized item can still be waiting for its row to be realized after replacing ItemsSource.
-                    _listView.UpdateLayout();
-                    Dispatcher.BeginInvoke(DispatcherPriority.ContextIdle, new Action(() => FocusRow(allowRetry: false)));
+                    if (_listView.ItemContainerGenerator.ContainerFromItem(first) is not ListBoxItem row) return false;
+                    var tile = Ui.VisualDescendants<Border>(row).FirstOrDefault(item => item.Focusable);
+                    return tile?.Focus() == true;
                 }
             }
             else if (_gridScroll.IsHitTestVisible && _tiles.FirstOrDefault() is FolderTile tile) tile.View.Focus();

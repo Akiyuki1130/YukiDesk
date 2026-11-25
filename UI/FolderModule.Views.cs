@@ -278,12 +278,26 @@ namespace DesktopBar.UI
             _textFilterDelay?.Stop();
             int keyVersion = ++_filterKeyVersion;
             int revision = _viewRevision;
-            await ShowFilesAsync();
-            if (keyVersion != _filterKeyVersion || revision != _viewRevision || _displayedRevision != revision
-                || !ReferenceEquals(_displayedFiles, _files) || !Open || !_filter.IsKeyboardFocusWithin
-                || _matchedFiles.FirstOrDefault() is not FileSystemInfo first) return;
-            if (key == Key.Enter) OpenInside(first);
-            else FocusFirstMatch();
+            while (IsCurrent())
+            {
+                var files = _files;
+                await ShowFilesAsync();
+                if (!IsCurrent()) return;
+                // A catalog refresh can replace the snapshot and cancel the build we just joined.
+                if (!ReferenceEquals(files, _files)) continue;
+                if (_displayedRevision != revision || !ReferenceEquals(_displayedFiles, files)
+                    || _matchedFiles.FirstOrDefault() is not FileSystemInfo first) return;
+                if (key == Key.Enter) OpenInside(first);
+                else
+                {
+                    await FocusFirstMatchAsync();
+                    if (!ReferenceEquals(files, _files)) continue;
+                }
+                return;
+            }
+
+            bool IsCurrent() => keyVersion == _filterKeyVersion && revision == _viewRevision
+                && Open && _filter.IsKeyboardFocusWithin;
         }
 
         private void OnTextFilterChanged()
