@@ -527,8 +527,12 @@ namespace DesktopBar
             AppearanceHost.Children.Add(theme);
 
             var barCard = Card("顶栏背景", "默认完全透明，不拦截桌面点击。", out var barBody);
-            barBody.Children.Add(Row("颜色", NewColorEditor(S.BarBgColor, h => { S.BarBgColor = h; Save(); })));
-            barBody.Children.Add(Row("不透明度", NumberSlider(0, 100, S.BarBgOpacity * 100, "%", v => { S.BarBgOpacity = Math.Round(v) / 100; Save(); })));
+            barBody.Children.Add(Row("颜色", NewColorEditor(S.BarBgColor, h => { S.BarBgColor = h; SaveBarBackground(); })));
+            barBody.Children.Add(Row("不透明度", NumberSlider(0, 100, S.BarBgOpacity * 100, "%", v =>
+            {
+                S.BarBgOpacity = Math.Round(v) / 100;
+                SaveBarBackground();
+            })));
             AppearanceHost.Children.Add(barCard);
             BuildMaterialCard();
         }
@@ -538,6 +542,12 @@ namespace DesktopBar
         private bool _glassAdvanced;
         private StackPanel _manualColorRows;
         private FrameworkElement _solidColorRow, _solidOpacityRow;
+
+        private static void SaveBarBackground()
+        {
+            App.Save();
+            App.Bar?.RefreshBarBackground();
+        }
 
         private void UpdateDesktopColorControls()
         {
@@ -570,8 +580,9 @@ namespace DesktopBar
             }, mode =>
             {
                 S.PillMaterial = mode;
-                Save();
-                GlassService.ApplyLive();
+                App.Save();
+                if (App.Bar is { } bar) bar.RefreshBarMaterial();
+                else GlassService.ApplyLive();
                 Dispatcher.BeginInvoke(new Action(BuildMaterialCard), DispatcherPriority.Background);
             })));
 
@@ -779,8 +790,8 @@ namespace DesktopBar
                 IsChecked = !S.TimeOnRight,
                 Style = (Style)FindResource("SettingsChoice")
             };
-            r1.Checked += (s, e) => { S.TimeOnRight = true; Save(); };
-            r2.Checked += (s, e) => { S.TimeOnRight = false; Save(); };
+            r1.Checked += (s, e) => { S.TimeOnRight = true; App.Save(); App.Bar?.RefreshBarLayout(); };
+            r2.Checked += (s, e) => { S.TimeOnRight = false; App.Save(); App.Bar?.RefreshBarLayout(); };
             var posPanel = new StackPanel { Orientation = Orientation.Horizontal };
             posPanel.Children.Add(r1);
             posPanel.Children.Add(r2);

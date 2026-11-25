@@ -247,6 +247,7 @@ namespace DesktopBar
         private void BuildLayout()
         {
             if (_closing) return;
+            if (Content is Grid previousRoot) previousRoot.LayoutUpdated -= OnBarLayoutUpdated;
             int layoutVersion = ++_layoutVersion;
             _glassPills.Clear();
             _pendingGlassPills.Clear();
@@ -269,15 +270,13 @@ namespace DesktopBar
 
             // 顶栏背景条:默认完全透明(null → 不拦截点击)。玻璃/液态玻璃档强制透明——
             // 玻璃染色层已承担压暗职责,再叠背景条会双重压暗。
-            var barBg = new Border
+            _barBackground = new Border
             {
                 Height = 46 * Ui.Scale,
-                VerticalAlignment = VerticalAlignment.Top,
-                Background = ((App.ActiveSettings.PillMaterial == 3 || App.ActiveSettings.PillMaterial == 4) || App.ActiveSettings.BarBgOpacity <= 0.005)
-                    ? null
-                    : Ui.Brush(App.ActiveSettings.BarBgColor, App.ActiveSettings.BarBgOpacity)
+                VerticalAlignment = VerticalAlignment.Top
             };
-            root.Children.Add(barBg);
+            RefreshBarBackground();
+            root.Children.Add(_barBackground);
 
             BuildBarModules(root);
             ApplyModuleVisibility();
@@ -287,7 +286,7 @@ namespace DesktopBar
             {
                 // 胶囊并集裁剪随布局变化重算(模块显隐/文件夹增删/时钟重排都走这里)。
                 // UpdateGlassClip 内部做 Rect 集合比较防抖,LayoutUpdated 高频触发也只做 O(n) 比较。
-                root.LayoutUpdated += (s2, e2) => UpdateGlassClip();
+                root.LayoutUpdated += OnBarLayoutUpdated;
             }
             Dispatcher.BeginInvoke(DispatcherPriority.Loaded, new Action(() =>
             {

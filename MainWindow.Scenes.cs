@@ -94,13 +94,14 @@ namespace DesktopBar
             bool captureChanged = previous.ShowInScreenCapture != current.ShowInScreenCapture
                 || previous.WallpaperOnlyCapture != current.WallpaperOnlyCapture;
             if (captureChanged || importedAppearance) GlassService.ApplyCaptureVisibility();
-            if (importedAppearance || _barLayout == null || previous.PillMaterial != current.PillMaterial)
+            if (importedAppearance || _barLayout == null)
             {
                 ApplySettings();
                 return;
             }
 
-            if (previous.GlassStyle != current.GlassStyle || previous.GlassMaxFps != current.GlassMaxFps
+            if (previous.PillMaterial != current.PillMaterial) RefreshBarMaterial();
+            else if (previous.GlassStyle != current.GlassStyle || previous.GlassMaxFps != current.GlassMaxFps
                 || previous.FreezePanelGlass != current.FreezePanelGlass) GlassService.ApplyLive();
             if (!ConfiguredPlacements(previous).SequenceEqual(ConfiguredPlacements(current))) RefreshBarLayout();
             if (previous.ShowFavorites != current.ShowFavorites) RefreshFavorites();

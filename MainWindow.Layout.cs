@@ -18,6 +18,7 @@ namespace DesktopBar
         private readonly List<BarLayoutPanel.Entry> _favoriteEntries = new();
         private BarLayoutPanel _barLayout;
         private FrameworkElement _barGlassHost;
+        private Border _barBackground;
         internal bool IsOnSecondaryScreen { get; private set; }
 
         internal void PlaceRevealOn(System.Windows.Forms.Screen screen)
@@ -99,6 +100,33 @@ namespace DesktopBar
         private void UpdateLayoutEntries() => _barLayout?.SetEntries(_staticEntries.Concat(_folderEntries).Concat(_favoriteEntries));
 
         internal void RefreshBarLayout() => _barLayout?.RefreshPlacements();
+
+        internal void RefreshBarBackground()
+        {
+            if (_closing || _barBackground == null) return;
+            var settings = App.ActiveSettings;
+            _barBackground.Background = settings.PillMaterial is 3 or 4 || settings.BarBgOpacity <= 0.005
+                ? null : Ui.Brush(settings.BarBgColor, settings.BarBgOpacity);
+        }
+
+        internal void RefreshBarMaterial()
+        {
+            if (_closing || Content is not Grid root || _barBackground == null) return;
+            ClosePanels();
+            root.LayoutUpdated -= OnBarLayoutUpdated;
+            _barGlassHost = GlassService.EnsureHost();
+            if (_barGlassHost != null)
+            {
+                _barGlassHost.Visibility = IsOnSecondaryScreen ? Visibility.Hidden : Visibility.Visible;
+                root.Children.Insert(0, _barGlassHost);
+                root.LayoutUpdated += OnBarLayoutUpdated;
+            }
+            RefreshBarBackground();
+            foreach (var module in _modules) module.RefreshThemeForScreen();
+            GlassService.ApplyLive();
+        }
+
+        private void OnBarLayoutUpdated(object sender, EventArgs args) => UpdateGlassClip();
 
         internal void RefreshClockDisplay() => _modules.OfType<ClockModule>().FirstOrDefault()?.RefreshPreferences();
 
