@@ -1742,6 +1742,19 @@ namespace DesktopBar.Services
             previous?.Dispose();
         }
 
+        private static void ReleaseDisabledBarSurface()
+        {
+            if (_enabled || _stopped) return;
+            _host = null;
+            _image = null;
+            _tint = null;
+            _wb = _wbSharp = null;
+            _bodyReady = false;
+            _liquid = null;
+            _liquidBrush = _sharpBrush = null;
+            _liquidAttempted = false;
+        }
+
         private static bool SameCaptureSpec(GlassSpec a, GlassSpec b)
         {
             return a != null && b != null && a.Width == b.Width && a.Height == b.Height
@@ -1781,6 +1794,8 @@ namespace DesktopBar.Services
             bool covered = false;
             int previousBackdropGeneration = _barBackdropGeneration;
             long nextCoverageCheck = 0;
+            const int DisabledReleaseDelayMs = 3500;
+            long disabledReleaseAt = 0;
             try
             {
                 while (!_stopThread)
@@ -1792,9 +1807,40 @@ namespace DesktopBar.Services
                         _loopPhase = 1;
                         hasBaseline = false;
                         deferredFrame = false;
-                        _wake.WaitOne(400);
+                        if (!_enabled && disabledReleaseAt >= 0)
+                        {
+                            long now = Environment.TickCount64;
+                            if (disabledReleaseAt == 0) disabledReleaseAt = now + DisabledReleaseDelayMs;
+                            if (now >= disabledReleaseAt)
+                            {
+                                // 保留短时间内的热切换。持续使用纯色后，卸下原生采样和渲染纹理。
+                                disabledReleaseAt = -1;
+                                NativeMethods.DestroyStripCapture(ref screenDc, ref memoryDc, ref dib);
+                                bits = IntPtr.Zero;
+                                capW = capH = hw = hh = 0;
+                                full = halfRaw = halfBase = workB = fadeFrom = fadeTo = null;
+                                renderedSlide = unreadableSlide = null;
+                                previousSpec = null;
+                                hasDxgiPixels = false;
+                                lock (Gate)
+                                {
+                                    Array.Clear(_rotate);
+                                    Array.Clear(_rotateSharp);
+                                    _latest = _latestSharp = null;
+                                    _latestSpec = null;
+                                }
+                                var dispatcher = Application.Current?.Dispatcher;
+                                if (dispatcher is { HasShutdownStarted: false })
+                                    dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(ReleaseDisabledBarSurface));
+                                ResetDxgi(true);
+                            }
+                        }
+                        if (_enabled) disabledReleaseAt = 0;
+                        if (disabledReleaseAt < 0) _wake.WaitOne();
+                        else _wake.WaitOne(400);
                         continue;
                     }
+                    disabledReleaseAt = 0;
                     bool samplesScreen = !spec.UseWindowBackdrop && !spec.WallpaperOnly;
                     long affinityDelay = samplesScreen ? ScreenHoldUntil() - Environment.TickCount64 : 0;
                     if (affinityDelay > 0)
