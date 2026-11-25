@@ -72,30 +72,30 @@ namespace DesktopBar.UI
                 double dy = y + 0.5 - centerY;
                 double qy = Math.Abs(dy) - straightY;
                 double outerY = Math.Max(qy, 0);
+                int row = y * width;
+                uint vertical = 0x800000u | EncodeSign(dy) << 8;
                 for (int x = left; x < right; x++)
                 {
                     double dx = x + 0.5 - centerX;
                     double qx = Math.Abs(dx) - straightX;
                     double outerX = Math.Max(qx, 0);
-                    double outside = Math.Sqrt(outerX * outerX + outerY * outerY);
+                    bool corner = outerX > 0 && outerY > 0;
+                    // 直边的距离和法线只有一个方向。圆角才需要平方根与归一化。
+                    double outside = corner ? Math.Sqrt(outerX * outerX + outerY * outerY) : outerX + outerY;
                     float distance = (float)(outside + Math.Min(Math.Max(qx, qy), 0) - radius);
-                    int i = y * width + x;
+                    int i = row + x;
                     if (distance >= _distances[i] || distance >= edgeWidth) continue;
                     _distances[i] = distance;
 
-                    double nx = 0, ny = 0;
-                    if (outside > 0)
-                    {
-                        nx = Math.Sign(dx) * outerX / outside;
-                        ny = Math.Sign(dy) * outerY / outside;
-                    }
-                    else if (qx > qy) nx = Math.Sign(dx);
-                    else ny = Math.Sign(dy);
-
-                    _pixels[i] = 0xff000000u | (Encode(nx) << 16) | (Encode(ny) << 8) | Encode(distance / edgeWidth);
+                    uint normal = corner
+                        ? Encode(Math.Sign(dx) * outerX / outside) << 16 | Encode(Math.Sign(dy) * outerY / outside) << 8
+                        : qx > qy ? EncodeSign(dx) << 16 | 0x8000u : vertical;
+                    _pixels[i] = 0xff000000u | normal | Encode(distance / edgeWidth);
                 }
             }
         }
+
+        private static uint EncodeSign(double value) => value < 0 ? 0u : value > 0 ? 255u : 128u;
 
         private static uint Encode(double value) => (uint)Math.Round((Math.Clamp(value, -1, 1) * 0.5 + 0.5) * 255);
     }
