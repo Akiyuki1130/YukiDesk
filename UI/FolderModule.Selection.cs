@@ -84,14 +84,27 @@ namespace DesktopBar.UI
             {
                 if (!_listView.IsHitTestVisible) return;
                 var first = _listView.Items[0];
+                int revision = _viewRevision;
+                int keyVersion = _filterKeyVersion;
                 _listView.ScrollIntoView(first);
-                Dispatcher.BeginInvoke(DispatcherPriority.Loaded, new Action(() =>
+                Dispatcher.BeginInvoke(DispatcherPriority.Loaded, new Action(() => FocusRow(allowRetry: true)));
+
+                void FocusRow(bool allowRetry)
                 {
-                    if (Open && _listView.IsHitTestVisible && _displayedRevision == _viewRevision
-                        && ReferenceEquals(_displayedFiles, _files)
+                    if (!Open || !_filter.IsKeyboardFocusWithin || !_listView.IsHitTestVisible
+                        || revision != _viewRevision || keyVersion != _filterKeyVersion
+                        || !ReferenceEquals(_displayedFiles, _files)) return;
+                    if (_listView.Items.Count > 0 && ReferenceEquals(_listView.Items[0], first)
                         && _listView.ItemContainerGenerator.ContainerFromItem(first) is ListBoxItem row)
-                        Ui.VisualDescendants<Border>(row).FirstOrDefault(tile => tile.Focusable)?.Focus();
-                }));
+                    {
+                        var tile = Ui.VisualDescendants<Border>(row).FirstOrDefault(item => item.Focusable);
+                        if (tile?.Focus() == true) return;
+                    }
+                    if (!allowRetry) return;
+                    // A virtualized item can still be waiting for its row to be realized after replacing ItemsSource.
+                    _listView.UpdateLayout();
+                    Dispatcher.BeginInvoke(DispatcherPriority.ContextIdle, new Action(() => FocusRow(allowRetry: false)));
+                }
             }
             else if (_gridScroll.IsHitTestVisible && _tiles.FirstOrDefault() is FolderTile tile) tile.View.Focus();
         }
