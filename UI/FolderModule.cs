@@ -108,7 +108,7 @@ namespace DesktopBar.UI
             _readAgain = false;
             _folderRead?.Cancel();
             _debounce.Stop();
-            _watcher?.Dispose();
+            MiniFolderCatalog.RetireWatcher(_watcher);
             _watcher = null;
         }
 
@@ -156,13 +156,13 @@ namespace DesktopBar.UI
                 }, read.Token);
                 if (_disposed || version != _loadVersion)
                 {
-                    watcher?.Dispose();
+                    MiniFolderCatalog.RetireWatcher(watcher);
                     return;
                 }
                 _watcher ??= watcher;
                 if (files == null && _watcher != null)
                 {
-                    _watcher.Dispose();
+                    MiniFolderCatalog.RetireWatcher(_watcher);
                     _watcher = null;
                 }
                 if (!unchanged)
@@ -218,7 +218,7 @@ namespace DesktopBar.UI
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or InvalidOperationException)
                 {
-                    watcher?.Dispose();
+                    MiniFolderCatalog.RetireWatcher(watcher);
                     watcher = null;
                 }
             }
@@ -241,17 +241,17 @@ namespace DesktopBar.UI
             }
             catch (OperationCanceledException)
             {
-                watcher?.Dispose();
+                MiniFolderCatalog.RetireWatcher(watcher);
                 throw;
             }
             catch (DirectoryNotFoundException)
             {
-                watcher?.Dispose();
+                MiniFolderCatalog.RetireWatcher(watcher);
                 return (null, null);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or InvalidOperationException)
             {
-                watcher?.Dispose();
+                MiniFolderCatalog.RetireWatcher(watcher);
                 App.Log("读取小文件夹失败: " + ex.Message);
                 return (null, null);
             }

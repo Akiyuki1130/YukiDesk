@@ -133,7 +133,7 @@ namespace DesktopBar
                 _appSceneTimer?.Stop();
                 App.SceneSettings = null;
                 _folderRefresh.Stop();
-                _folderRootWatcher?.Dispose();
+                MiniFolderCatalog.RetireWatcher(_folderRootWatcher);
                 _reveal.Dispose();
                 Microsoft.Win32.SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;
                 Microsoft.Win32.SystemEvents.SessionSwitch -= OnSessionSwitch;
@@ -352,7 +352,7 @@ namespace DesktopBar
             if (string.Equals(_folderRoot, S.StorageRoot, StringComparison.OrdinalIgnoreCase)) return;
             _folderRoot = S.StorageRoot;
             _folderRefresh.Stop();
-            _folderRootWatcher?.Dispose();
+            MiniFolderCatalog.RetireWatcher(_folderRootWatcher);
             _folderRootWatcher = null;
             _ = RefreshFolderCatalogAsync();
         }
@@ -365,13 +365,13 @@ namespace DesktopBar
             var (names, watcher) = await Task.Run(() => ReadFolderCatalog(root, needsWatcher));
             if (_closing || version != _folderScanVersion || !string.Equals(root, S.StorageRoot, StringComparison.OrdinalIgnoreCase))
             {
-                watcher?.Dispose();
+                MiniFolderCatalog.RetireWatcher(watcher);
                 return;
             }
             _folderRootWatcher ??= watcher;
             if (names == null)
             {
-                _folderRootWatcher?.Dispose();
+                MiniFolderCatalog.RetireWatcher(_folderRootWatcher);
                 _folderRootWatcher = null;
                 ScheduleFolderRefresh(TimeSpan.FromSeconds(3));
                 return;
@@ -395,12 +395,12 @@ namespace DesktopBar
                     watcher.Created += CatalogChanged;
                     watcher.Deleted += CatalogChanged;
                     watcher.Renamed += CatalogChanged;
-                    watcher.Error += (_, _) => CatalogChanged(watcher, null);
+                    watcher.Error += (source, _) => CatalogChanged(source, null);
                     watcher.EnableRaisingEvents = true;
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or InvalidOperationException)
                 {
-                    watcher?.Dispose();
+                    MiniFolderCatalog.RetireWatcher(watcher);
                     watcher = null;
                 }
             }
@@ -410,7 +410,7 @@ namespace DesktopBar
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
             {
-                watcher?.Dispose();
+                MiniFolderCatalog.RetireWatcher(watcher);
                 return (null, null);
             }
         }
@@ -423,7 +423,7 @@ namespace DesktopBar
                 if (_closing || !string.Equals(_folderRoot, watcher.Path, StringComparison.OrdinalIgnoreCase)) return;
                 if (args == null && ReferenceEquals(watcher, _folderRootWatcher))
                 {
-                    _folderRootWatcher.Dispose();
+                    MiniFolderCatalog.RetireWatcher(_folderRootWatcher);
                     _folderRootWatcher = null;
                 }
                 ScheduleFolderRefresh(TimeSpan.FromMilliseconds(300));

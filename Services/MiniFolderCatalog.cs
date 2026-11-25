@@ -2,11 +2,27 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Threading.Tasks;
 
 namespace DesktopBar.Services
 {
     internal static class MiniFolderCatalog
     {
+        internal static void RetireWatcher(FileSystemWatcher watcher)
+        {
+            if (watcher == null) return;
+            watcher.Dispose();
+            _ = FinishRetirementAsync(watcher);
+        }
+
+        private static async Task FinishRetirementAsync(FileSystemWatcher watcher)
+        {
+            // The directory handle is disposed above. Keep the watcher reachable while .NET 8's
+            // overlapped completion uses its weak reference to release the pinned buffer.
+            await Task.Delay(1000).ConfigureAwait(false);
+            GC.KeepAlive(watcher);
+        }
+
         internal static string GetFolderPath(string root, string name)
         {
             if (!SettingsService.IsValidFolderName(name)) return null;
