@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.Linq;
 using System.Security.Cryptography;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
@@ -30,6 +31,7 @@ namespace DesktopBar.Services
         internal TimeSpan SeekFrom { get; }
         internal TimeSpan SeekTo { get; }
         internal double PlaybackRate { get; }
+        internal long ObservedAt { get; init; } = Environment.TickCount64;
 
         public MediaInfo(long generation, bool hasSession, string sessionKey, string trackKey,
             string thumbnailKey, string title, string artist, BitmapSource cover, bool playing,
@@ -70,6 +72,9 @@ namespace DesktopBar.Services
         private bool _started;
         private bool _disposed;
         private bool _progressDemand;
+        private bool _readingPlayback;
+        private GlobalSystemMediaTransportControlsSession _nextPlayback;
+        private CancellationTokenSource _metadataRequest;
         private bool _seeking;
         private SeekRequest _queuedSeek;
         private string _sessionKey = "";
@@ -264,6 +269,8 @@ namespace DesktopBar.Services
         {
             if (_disposed || ReferenceEquals(_session, session)) return;
             UnhookSession();
+            _metadataRequest?.Cancel();
+            _nextPlayback = null;
             _session = session;
             _sessionGeneration++;
             _refreshGeneration++;
@@ -279,7 +286,10 @@ namespace DesktopBar.Services
 
             _mediaPropertiesChanged = (sender, args) => Post(() => BeginRefresh(session));
             _playbackInfoChanged = (sender, args) => Post(() => Push(session));
-            _timelinePropertiesChanged = (sender, args) => Post(() => Push(session));
+            _timelinePropertiesChanged = (sender, args) => Post(() =>
+            {
+                if (_progressDemand) Push(session);
+            });
             session.MediaPropertiesChanged += _mediaPropertiesChanged;
             session.PlaybackInfoChanged += _playbackInfoChanged;
             session.TimelinePropertiesChanged += _timelinePropertiesChanged;
@@ -303,38 +313,52 @@ namespace DesktopBar.Services
             if (_disposed || !ReferenceEquals(_session, session)) return;
             long sessionGeneration = _sessionGeneration;
             long refreshGeneration = ++_refreshGeneration;
-            _ = RefreshPropsAsync(session, sessionGeneration, refreshGeneration);
+            _metadataRequest?.Cancel();
+            var request = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+            _metadataRequest = request;
+            _ = RefreshPropsAsync(session, sessionGeneration, refreshGeneration, request);
         }
 
         private async Task RefreshPropsAsync(GlobalSystemMediaTransportControlsSession session,
-            long sessionGeneration, long refreshGeneration)
+            long sessionGeneration, long refreshGeneration, CancellationTokenSource request)
         {
             try
             {
-                var props = await session.TryGetMediaPropertiesAsync();
-                if (!IsCurrent(session, sessionGeneration, refreshGeneration)) return;
+                var cancellation = request.Token;
+                var props = await Task.Run(() => session.TryGetMediaPropertiesAsync().AsTask(cancellation), cancellation);
+                if (!IsCurrent(session, sessionGeneration, refreshGeneration) || cancellation.IsCancellationRequested) return;
                 string title = props?.Title ?? "";
                 string artist = props?.Artist ?? "";
-                string sessionKey = session.SourceAppUserModelId ?? "";
+                string sessionKey = _sessionKey;
                 string trackKey = BuildTrackKey(sessionKey, props);
+                var playback = await Task.Run(() => ReadPlayback(session), cancellation);
+                if (!IsCurrent(session, sessionGeneration, refreshGeneration) || cancellation.IsCancellationRequested) return;
 
                 var previous = _current;
                 bool sameTrack = string.Equals(previous.TrackKey, trackKey, StringComparison.Ordinal);
-                Publish(ReadPlayback(session, sessionKey, trackKey, sameTrack ? previous.ThumbnailKey : "", title,
-                    artist, sameTrack ? previous.Cover : null));
+                if (sameTrack && previous.ObservedAt > playback.ObservedAt) playback = Playback.From(previous);
+                string thumbnailKey = sameTrack ? previous.ThumbnailKey : "";
+                BitmapSource image = sameTrack ? previous.Cover : null;
+                Publish(WithPlayback(playback, sessionKey, trackKey, thumbnailKey, title, artist, image));
 
-                var cover = await LoadCoverAsync(props?.Thumbnail);
-                if (!IsCurrent(session, sessionGeneration, refreshGeneration)) return;
-                if (sameTrack && cover.Key == "error" && previous.Cover != null)
-                    cover = new CoverResult(previous.Cover, previous.ThumbnailKey);
+                var thumbnail = props?.Thumbnail;
+                var cover = await Task.Run(() => LoadCoverAsync(thumbnail, thumbnailKey, image, cancellation), cancellation);
+                if (!IsCurrent(session, sessionGeneration, refreshGeneration) || cancellation.IsCancellationRequested
+                    || cover.Key == thumbnailKey || cover.Key == "error" && image != null) return;
 
-                // 封面读取期间时间线可能推进；发布封面前再次读取，避免旧快照回退进度。
-                Publish(ReadPlayback(session, sessionKey, trackKey, cover.Key, title, artist, cover.Image));
+                // 保留封面读取期间发布的最新播放时间，不再为封面请求一次系统时间线。
+                Publish(WithPlayback(Playback.From(_current), sessionKey, trackKey, cover.Key, title, artist, cover.Image));
             }
+            catch (OperationCanceledException) when (request.IsCancellationRequested) { }
             catch (Exception ex)
             {
                 if (IsCurrent(session, sessionGeneration, refreshGeneration))
                     App.Log("读取媒体信息: " + ex.Message);
+            }
+            finally
+            {
+                if (ReferenceEquals(_metadataRequest, request)) _metadataRequest = null;
+                request.Dispose();
             }
         }
 
@@ -354,20 +378,32 @@ namespace DesktopBar.Services
                 props?.TrackNumber.ToString() ?? "");
         }
 
-        private MediaInfo ReadPlayback(GlobalSystemMediaTransportControlsSession session, string sessionKey, string trackKey,
-            string thumbnailKey, string title, string artist, BitmapSource cover)
+        private readonly record struct Playback(TimeSpan Start, TimeSpan Duration, TimeSpan Position,
+            TimeSpan SeekFrom, TimeSpan SeekTo, bool Playing, bool SeekSupported, double Rate, long ObservedAt)
+        {
+            internal static Playback From(MediaInfo info) => new(info.Start, info.Duration, info.Position, info.SeekFrom,
+                info.SeekTo, info.Playing, info.SeekSupported, info.PlaybackRate, info.ObservedAt);
+        }
+
+        private static Playback ReadPlayback(GlobalSystemMediaTransportControlsSession session)
         {
             var timeline = session.GetTimelineProperties();
             var playback = session.GetPlaybackInfo();
             bool playing = playback?.PlaybackStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing;
             double rate = playback?.PlaybackRate ?? 1;
+            long observedAt = Environment.TickCount64;
             var absolute = ProjectPosition(timeline.Position, timeline.EndTime, timeline.LastUpdatedTime, DateTimeOffset.UtcNow, playing, rate);
             var (start, duration, position, seekFrom, seekTo) = RelativeTimeline(timeline.StartTime, timeline.EndTime, absolute,
                 timeline.MinSeekTime, timeline.MaxSeekTime);
             bool seekSupported = playback?.Controls?.IsPlaybackPositionEnabled == true && seekTo > seekFrom;
-            return new MediaInfo(NextPublishedGeneration(), true, sessionKey, trackKey, thumbnailKey, title, artist, cover,
-                playing, position, duration, seekSupported, start, seekFrom, seekTo, rate);
+            return new Playback(start, duration, position, seekFrom, seekTo, playing, seekSupported, rate, observedAt);
         }
+
+        private MediaInfo WithPlayback(Playback playback, string sessionKey, string trackKey,
+            string thumbnailKey, string title, string artist, BitmapSource cover)
+            => new MediaInfo(NextPublishedGeneration(), true, sessionKey, trackKey, thumbnailKey, title, artist, cover,
+                playback.Playing, playback.Position, playback.Duration, playback.SeekSupported, playback.Start,
+                playback.SeekFrom, playback.SeekTo, playback.Rate) { ObservedAt = playback.ObservedAt };
 
         internal static (TimeSpan Start, TimeSpan Duration, TimeSpan Position, TimeSpan SeekFrom, TimeSpan SeekTo) RelativeTimeline(
             TimeSpan start, TimeSpan end, TimeSpan current, TimeSpan minSeek, TimeSpan maxSeek)
@@ -391,24 +427,42 @@ namespace DesktopBar.Services
 
         private static long _lastPushFailLogTick = -60000;
 
-        private void Push(GlobalSystemMediaTransportControlsSession session)
+        private bool IsActive(GlobalSystemMediaTransportControlsSession session)
+            => !_disposed && session != null && ReferenceEquals(_session, session) && _current.HasSession;
+
+        private async void Push(GlobalSystemMediaTransportControlsSession session)
         {
-            if (_disposed || session == null || !ReferenceEquals(_session, session) || !_current.HasSession) return;
+            if (!IsActive(session)) return;
+            _nextPlayback = session;
+            if (_readingPlayback) return;
+            _readingPlayback = true;
             try
             {
-                Publish(ReadPlayback(session, _current.SessionKey, _current.TrackKey, _current.ThumbnailKey,
-                    _current.Title, _current.Artist, _current.Cover));
-            }
-            catch (Exception ex)
-            {
-                // 会话失效时进度停更;至少留一条节流日志,不然"进度卡死"无线索可查。
-                long now = Environment.TickCount64;
-                if (now - _lastPushFailLogTick > 30000)
+                while (_nextPlayback is { } target)
                 {
-                    _lastPushFailLogTick = now;
-                    App.Log("SMTC 进度刷新失败: " + ex.Message);
+                    _nextPlayback = null;
+                    if (!IsActive(target)) continue;
+                    string trackKey = _current.TrackKey;
+                    try
+                    {
+                        var playback = await Task.Run(() => ReadPlayback(target));
+                        var current = _current;
+                        if (!IsActive(target) || current.TrackKey != trackKey || playback.ObservedAt < current.ObservedAt) continue;
+                        Publish(WithPlayback(playback, current.SessionKey, trackKey, current.ThumbnailKey,
+                            current.Title, current.Artist, current.Cover));
+                    }
+                    catch (Exception ex)
+                    {
+                        long now = Environment.TickCount64;
+                        if (IsActive(target) && now - _lastPushFailLogTick > 30000)
+                        {
+                            _lastPushFailLogTick = now;
+                            App.Log("SMTC 进度刷新失败: " + ex.Message);
+                        }
+                    }
                 }
             }
+            finally { _readingPlayback = false; }
         }
 
         private void PublishEmpty(bool hasSession) => Publish(new MediaInfo(NextPublishedGeneration(), hasSession,
@@ -430,30 +484,35 @@ namespace DesktopBar.Services
             public CoverResult(BitmapSource image, string key) { Image = image; Key = key; }
         }
 
-        private static async Task<CoverResult> LoadCoverAsync(IRandomAccessStreamReference reference)
+        private static async Task<CoverResult> LoadCoverAsync(IRandomAccessStreamReference reference, string previousKey,
+            BitmapSource previousImage, CancellationToken cancellation)
         {
             if (reference == null) return new CoverResult(null, "none");
             try
             {
-                using var stream = await reference.OpenReadAsync();
+                using var stream = await reference.OpenReadAsync().AsTask(cancellation);
                 if (stream.Size == 0) return new CoverResult(null, "empty");
                 if (stream.Size > MaxCoverBytes) return new CoverResult(null, "oversized:" + stream.Size);
                 uint size = (uint)stream.Size;
                 var bytes = new byte[size];
                 using var reader = new DataReader(stream);
-                await reader.LoadAsync(size).AsTask();
+                if (await reader.LoadAsync(size).AsTask(cancellation) != size) return new CoverResult(null, "error");
                 reader.ReadBytes(bytes);
-                // SHA-256 与 WPF 图像解码都可能昂贵；冻结后的 BitmapSource 可安全回到 UI 使用。
-                return await Task.Run(() => DecodeCover(bytes));
+                // SHA-256 与 WPF 图像解码都在工作线程执行；冻结后的 BitmapSource 可安全回到 UI 使用。
+                return DecodeCover(bytes, previousKey, previousImage, cancellation);
             }
+            catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { throw; }
             catch { return new CoverResult(null, "error"); }
         }
 
-        private static CoverResult DecodeCover(byte[] bytes)
+        private static CoverResult DecodeCover(byte[] bytes, string previousKey, BitmapSource previousImage,
+            CancellationToken cancellation)
         {
+            string key = "sha256:" + Convert.ToHexString(SHA256.HashData(bytes));
+            cancellation.ThrowIfCancellationRequested();
+            if (key == previousKey && previousImage != null) return new CoverResult(previousImage, key);
             try
             {
-                string key = "sha256:" + Convert.ToHexString(SHA256.HashData(bytes));
                 var image = new BitmapImage();
                 using var memory = new MemoryStream(bytes, writable: false);
                 image.BeginInit();
@@ -471,6 +530,8 @@ namespace DesktopBar.Services
         {
             if (_disposed) return;
             _disposed = true;
+            _metadataRequest?.Cancel();
+            _nextPlayback = null;
             _queuedSeek?.Completion.TrySetResult(false);
             _queuedSeek = null;
             _retryTimer?.Stop();

@@ -18,7 +18,7 @@ namespace DesktopBar.UI
         private TextBlock _elapsed, _duration;
         private DispatcherTimer _timelineTimer;
         private MediaInfo _timelineInfo, _scrubbing;
-        private long _timelineReceivedAt, _seekUntil;
+        private long _seekUntil;
         private int _seekVersion;
         private double _scrubStartedAt, _seekTarget;
         private bool _applyingProgress;
@@ -100,7 +100,6 @@ namespace DesktopBar.UI
                 _seekVersion++;
             }
             _timelineInfo = info;
-            _timelineReceivedAt = Environment.TickCount64;
             bool hasDuration = info.HasSession && info.TrackKey.Length != 0 && info.Duration > TimeSpan.Zero;
             if (_timelineSection.Expanded != hasDuration) _timelineSection.SetExpanded(hasDuration, animate: Open);
             if (hasDuration)
@@ -123,7 +122,7 @@ namespace DesktopBar.UI
             long now = Environment.TickCount64;
             double duration = info.Duration.TotalSeconds;
             double position = info.Position.TotalSeconds;
-            if (info.Playing) position += Math.Max(0, now - _timelineReceivedAt) / 1000.0 * info.PlaybackRate;
+            if (info.Playing) position += Math.Max(0, now - info.ObservedAt) / 1000.0 * info.PlaybackRate;
             if (_seekUntil != 0)
             {
                 if (now >= _seekUntil || Math.Abs(info.Position.TotalSeconds - _seekTarget) < .8)
