@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.ComTypes;
@@ -11,7 +12,8 @@ namespace DesktopBar.Interop
     internal static class ShellFiles
     {
         internal const string RecycleBin = "shell:::{645FF040-5081-101B-9F08-00AA002F954E}";
-        internal sealed record RecycledItem(string Name, byte[] Id, bool IsFolder, string OriginalFolder, string DeletedAt);
+        internal sealed record RecycledItem(string Name, byte[] Id, bool IsFolder, string OriginalFolder, DateTime? DeletedAtUtc);
+        internal readonly record struct RecycleTotals(long Count, long Bytes);
         private static readonly PropertyKey OriginalFolderKey = FindProperty("System.Recycle.DeletedFrom");
         private static readonly PropertyKey DeletedAtKey = FindProperty("System.Recycle.DateDeleted");
 
@@ -313,8 +315,17 @@ namespace DesktopBar.Interop
             }
         }
 
-        internal static List<RecycledItem> ReadRecycleBin()
+        internal static RecycleTotals? ReadRecycleTotals()
         {
+            if (!Environment.Is64BitProcess) return null;
+            var totals = new RecycleInfo { Size = (uint)Marshal.SizeOf<RecycleInfo>() };
+            return SHQueryRecycleBinW(null, ref totals) == 0 && totals.Count >= 0 && totals.Bytes >= 0
+                ? new RecycleTotals(totals.Count, totals.Bytes) : null;
+        }
+
+        internal static List<RecycledItem> ReadRecycleBin(CancellationToken cancellation = default)
+        {
+            cancellation.ThrowIfCancellationRequested();
             var items = new List<RecycledItem>();
             WithPath(RecycleBin, root =>
             {
@@ -328,6 +339,7 @@ namespace DesktopBar.Interop
                     {
                         while (true)
                         {
+                            cancellation.ThrowIfCancellationRequested();
                             int result = enumerator.Next(1, out var child, out _);
                             Check(result);
                             if (result != 0) break;
@@ -372,29 +384,59 @@ namespace DesktopBar.Interop
         private static PropertyKey FindProperty(string name)
             => PSGetPropertyKeyFromName(name, out var key) >= 0 ? key : default;
 
-        private static (string OriginalFolder, string DeletedAt) ReadRecycleProperties(IntPtr id)
+        private static (string OriginalFolder, DateTime? DeletedAtUtc) ReadRecycleProperties(IntPtr id)
         {
             var iid = typeof(IPropertyStore).GUID;
             if (SHGetPropertyStoreFromIDList(id, 0, ref iid, out var pointer) < 0) return default;
             var store = TakeInterface<IPropertyStore>(pointer);
-            try { return (ReadProperty(store, OriginalFolderKey), ReadProperty(store, DeletedAtKey)); }
+            try
+            {
+                string originalFolder = ReadProperty(store, OriginalFolderKey);
+                var key = DeletedAtKey;
+                if (key.Format == Guid.Empty || store.GetValue(ref key, out var value) < 0)
+                    return (originalFolder, null);
+                try { return (originalFolder, ReadDeletedAt(value)); }
+                finally { PropVariantClear(ref value); }
+            }
             finally { Marshal.ReleaseComObject(store); }
+        }
+
+        private static DateTime? ReadDeletedAt(PropertyValue value)
+        {
+            const ushort FileTime = 64;
+            if (value.Type == FileTime)
+            {
+                try { return value.Timestamp > 0 ? DateTime.FromFileTimeUtc(value.Timestamp) : null; }
+                catch (ArgumentOutOfRangeException) { return null; }
+            }
+            string text = ReadPropertyText(ref value);
+            return DateTimeOffset.TryParse(text, CultureInfo.CurrentCulture, DateTimeStyles.AssumeLocal, out var date)
+                ? date.UtcDateTime : null;
         }
 
         private static string ReadProperty(IPropertyStore store, PropertyKey key)
         {
             if (key.Format == Guid.Empty || store.GetValue(ref key, out var value) < 0) return null;
-            try
-            {
-                const ushort FileTime = 64;
-                if (value.Type == FileTime && value.Timestamp > 0)
-                    return DateTime.FromFileTime(value.Timestamp).ToString("g");
-                if (PropVariantToStringAlloc(ref value, out var text) < 0) return null;
-                try { return Marshal.PtrToStringUni(text); }
-                finally { Marshal.FreeCoTaskMem(text); }
-            }
+            try { return ReadPropertyText(ref value); }
             finally { PropVariantClear(ref value); }
         }
+
+        private static string ReadPropertyText(ref PropertyValue value)
+        {
+            if (PropVariantToStringAlloc(ref value, out var text) < 0) return null;
+            try { return Marshal.PtrToStringUni(text); }
+            finally { Marshal.FreeCoTaskMem(text); }
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct RecycleInfo
+        {
+            internal uint Size;
+            internal long Bytes, Count;
+        }
+
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+        private static extern int SHQueryRecycleBinW(string root, ref RecycleInfo totals);
 
         private static void WithPath(string path, Action<IntPtr> action)
         {

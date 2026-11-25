@@ -22,12 +22,16 @@ namespace DesktopBar.UI
         private List<ShellFiles.RecycledItem> _snapshot = new();
         private List<ShellFiles.RecycledItem> _readItems;
         private CancellationTokenSource _viewRequest;
+        private CancellationTokenSource _readRequest;
+        private ShellFiles.RecycleTotals? _recycleTotals;
+        private long _lastFullRead;
         private readonly HashSet<string> _selection = new(StringComparer.Ordinal);
         private readonly TextBox _filter;
         private readonly Button _restoreSelected, _selectMode, _dateFilter;
         private bool _selecting, _recentOnly;
         private bool _refreshing;
         private bool _refreshRequested;
+        private bool _forceRefreshRequested;
         private int _binOperations;
         private bool _disposed;
 
@@ -143,7 +147,7 @@ namespace DesktopBar.UI
         {
             _ = FilterItemsAsync();
             _refreshTimer.Start();
-            Refresh();
+            Refresh(force: true);
         }
 
         protected override void OnPanelHidden()
@@ -151,6 +155,8 @@ namespace DesktopBar.UI
             _refreshTimer.Stop();
             _filterTimer.Stop();
             _viewRequest?.Cancel();
+            _readRequest?.Cancel();
+            _refreshRequested = _forceRefreshRequested = false;
             _selection.Clear();
             _selecting = false;
             UpdateSelection();
@@ -171,11 +177,11 @@ namespace DesktopBar.UI
             finally
             {
                 _binOperations--;
-                if (Open) Refresh();
+                if (Open) Refresh(force: true);
             }
         }
 
-        protected override void OnFileDropSettled() => Refresh();
+        protected override void OnFileDropSettled() => Refresh(force: true);
 
         private bool FileTransferActive => FileDropInteractionActive || _binOperations > 0;
 
@@ -187,36 +193,57 @@ namespace DesktopBar.UI
             return false;
         }
 
-        private async void Refresh()
+        private async void Refresh(bool force = false)
         {
-            if (!CanApplySnapshot()) return;
+            if (!CanApplySnapshot())
+            {
+                if (Open && !_disposed) _forceRefreshRequested |= force;
+                return;
+            }
             if (_refreshing)
             {
                 _refreshRequested = true;
+                _forceRefreshRequested |= force;
                 return;
             }
-            _refreshRequested = false;
+            force |= _forceRefreshRequested || _readItems == null || Environment.TickCount64 - _lastFullRead >= 12000;
+            _refreshRequested = _forceRefreshRequested = false;
             _refreshing = true;
+            using var read = new CancellationTokenSource();
+            _readRequest = read;
+            var previous = _recycleTotals;
             try
             {
-                var completion = new TaskCompletionSource<List<ShellFiles.RecycledItem>>(TaskCreationOptions.RunContinuationsAsynchronously);
+                var completion = new TaskCompletionSource<(ShellFiles.RecycleTotals? Totals, List<ShellFiles.RecycledItem> Items)>(
+                    TaskCreationOptions.RunContinuationsAsynchronously);
                 var thread = new Thread(() =>
                 {
-                    try { completion.SetResult(ShellFiles.ReadRecycleBin()); }
+                    try
+                    {
+                        read.Token.ThrowIfCancellationRequested();
+                        var totals = ShellFiles.ReadRecycleTotals();
+                        var items = force || totals == null || totals != previous ? ShellFiles.ReadRecycleBin(read.Token) : null;
+                        completion.SetResult((totals, items));
+                    }
+                    catch (OperationCanceledException) when (read.IsCancellationRequested) { completion.SetCanceled(read.Token); }
                     catch (Exception ex) { completion.SetException(ex); }
                 }) { IsBackground = true, Name = "YukiDesk Recycle Bin" };
                 thread.SetApartmentState(ApartmentState.STA);
                 thread.Start();
-                var entries = await completion.Task;
-                if (!CanApplySnapshot()) return;
+                var (totals, entries) = await completion.Task;
+                if (read.IsCancellationRequested || !CanApplySnapshot() || entries == null) return;
+                _recycleTotals = totals;
+                _lastFullRead = Environment.TickCount64;
                 _readItems = entries;
                 _ = FilterItemsAsync();
             }
+            catch (OperationCanceledException) when (read.IsCancellationRequested) { }
             catch (Exception ex)
             {
-                App.Log("Windows 回收站读取失败: " + ex.Message);
-                if (CanApplySnapshot())
+                if (!read.IsCancellationRequested && CanApplySnapshot())
                 {
+                    _recycleTotals = null;
+                    App.Log("Windows 回收站读取失败: " + ex.Message);
                     _status.Text = "无法读取回收站";
                     _status.Visibility = Visibility.Visible;
                 }
@@ -224,7 +251,8 @@ namespace DesktopBar.UI
             finally
             {
                 _refreshing = false;
-                if (_refreshRequested) Refresh();
+                _readRequest = null;
+                if (_refreshRequested) Refresh(_forceRefreshRequested);
             }
         }
 
@@ -267,7 +295,7 @@ namespace DesktopBar.UI
         private static List<ShellFiles.RecycledItem> FilterItems(List<ShellFiles.RecycledItem> items, string search,
             bool recent, bool newest, CancellationToken cancellation)
         {
-            DateTime cutoff = recent ? DateTime.Now.AddDays(-7) : DateTime.MinValue;
+            DateTime cutoff = recent ? DateTime.UtcNow.AddDays(-7) : DateTime.MinValue;
             var words = search.Split((char[])null, StringSplitOptions.RemoveEmptyEntries)
                 .Select(word => (Text: word, Initials: PinyinInitials.ParseTerm(word))).ToArray();
             var matches = new List<(ShellFiles.RecycledItem Item, DateTime Deleted)>();
@@ -277,7 +305,7 @@ namespace DesktopBar.UI
                 if (!words.All(word => item.Name.Contains(word.Text, StringComparison.CurrentCultureIgnoreCase)
                     || item.OriginalFolder?.Contains(word.Text, StringComparison.CurrentCultureIgnoreCase) == true
                     || PinyinInitials.Matches(item.Name, word.Initials))) continue;
-                DateTime date = (recent || newest) && DateTime.TryParse(item.DeletedAt, out DateTime deleted) ? deleted : DateTime.MinValue;
+                DateTime date = item.DeletedAtUtc ?? DateTime.MinValue;
                 if (date >= cutoff) matches.Add((item, date));
             }
             return matches.OrderByDescending(match => newest ? match.Deleted : DateTime.MinValue)
@@ -286,7 +314,7 @@ namespace DesktopBar.UI
 
         private static bool SameItems(List<ShellFiles.RecycledItem> current, List<ShellFiles.RecycledItem> previous) =>
             current.Count == previous.Count && current.Zip(previous).All(pair => pair.First.Name == pair.Second.Name
-                && pair.First.OriginalFolder == pair.Second.OriginalFolder && pair.First.DeletedAt == pair.Second.DeletedAt
+                && pair.First.OriginalFolder == pair.Second.OriginalFolder && pair.First.DeletedAtUtc == pair.Second.DeletedAtUtc
                 && pair.First.IsFolder == pair.Second.IsFolder && pair.First.Id.AsSpan().SequenceEqual(pair.Second.Id));
 
         private void PresentRecycleItems(List<ShellFiles.RecycledItem> entries)
@@ -341,7 +369,7 @@ namespace DesktopBar.UI
             {
                 CornerRadius = new CornerRadius(8 * scale), Background = Brushes.Transparent,
                 Cursor = System.Windows.Input.Cursors.Hand,
-                ToolTip = string.Join(Environment.NewLine, new[] { item.Name, item.OriginalFolder, item.DeletedAt }
+                ToolTip = string.Join(Environment.NewLine, new[] { item.Name, item.OriginalFolder, item.DeletedAtUtc?.ToLocalTime().ToString("G") }
                     .Where(value => !string.IsNullOrEmpty(value))),
                 Child = body
             };
@@ -407,6 +435,7 @@ namespace DesktopBar.UI
             _refreshTimer.Stop();
             _filterTimer.Stop();
             _viewRequest?.Cancel();
+            _readRequest?.Cancel();
             base.Dispose();
         }
     }
