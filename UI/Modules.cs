@@ -937,6 +937,7 @@ namespace DesktopBar.UI
 
         private sealed class SpectrumSurface : FrameworkElement
         {
+            private readonly DrawingVisual _drawing = new();
             private readonly float[] _values;
             private readonly double _barWidth;
             private readonly double _gap;
@@ -945,7 +946,7 @@ namespace DesktopBar.UI
             private readonly double _radius;
             internal static readonly DependencyProperty InkProperty = DependencyProperty.Register(
                 "Ink", typeof(Brush), typeof(SpectrumSurface),
-                new FrameworkPropertyMetadata(Brushes.White, FrameworkPropertyMetadataOptions.AffectsRender));
+                new FrameworkPropertyMetadata(Brushes.White, (sender, _) => ((SpectrumSurface)sender).DrawBands()));
 
             public SpectrumSurface(
                 int count,
@@ -965,7 +966,14 @@ namespace DesktopBar.UI
                 Height = maxHeight;
                 HorizontalAlignment = HorizontalAlignment.Center;
                 VerticalAlignment = VerticalAlignment.Center;
+                AddVisualChild(_drawing);
+                DrawBands();
             }
+
+            protected override int VisualChildrenCount => 1;
+
+            protected override Visual GetVisualChild(int index)
+                => index == 0 ? _drawing : throw new ArgumentOutOfRangeException(nameof(index));
 
             public void SetValues(float[] values)
             {
@@ -976,12 +984,13 @@ namespace DesktopBar.UI
                     _values[i] = values[i];
                     changed = true;
                 }
-                if (changed) InvalidateVisual();
+                if (changed) DrawBands();
             }
 
-            protected override void OnRender(DrawingContext drawingContext)
+            // 柱形变化只改绘图内容，避免频谱的每一拍触发整条顶栏布局。
+            private void DrawBands()
             {
-                base.OnRender(drawingContext);
+                using var drawingContext = _drawing.RenderOpen();
                 var brush = (Brush)GetValue(InkProperty);
                 for (int i = 0; i < _values.Length; i++)
                 {
