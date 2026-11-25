@@ -129,6 +129,7 @@ namespace DesktopBar.Services
         {
             _missingBackdropSince = null;
             _composedWallpaper = null;
+            _composed = null;
             if (_anchor == IntPtr.Zero) return;
             lock (Gate)
             {

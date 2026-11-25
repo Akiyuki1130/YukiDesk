@@ -792,6 +792,12 @@ namespace DesktopBar.Services
             public Int32Rect Region;
             public byte[] Body, Sharp;
             public long Sequence, CaptureTick;
+
+            public void ReleasePixels()
+            {
+                Request = null;
+                Body = Sharp = null;
+            }
         }
 
         // 只有捕获线程访问 GDI 句柄、原始像素和差分基线。
@@ -905,6 +911,15 @@ namespace DesktopBar.Services
 
             public void ResetBaseline() => _previousRequest = null;
 
+            public void ReleaseBuffers()
+            {
+                DestroyScreenCapture();
+                _bits = IntPtr.Zero;
+                _full = _previousFull = _raw = _previous = _blurScratch = _wallpaperPixels = null;
+                _previousRequest = null;
+                _previousWallpaper = null;
+            }
+
             private void DestroyScreenCapture() => NativeMethods.DestroyStripCapture(ref _screenDc, ref _memoryDc, ref _dib);
 
             public void Dispose()
@@ -926,6 +941,8 @@ namespace DesktopBar.Services
         private static volatile int _loopPhase;
         private static volatile PanelRequest _panelRequest;
         private static volatile bool _panelCapturePaused;
+        private const int PanelBufferRetentionMs = 3000;
+        private static long _panelClosedAt;
         private static PanelRequest _panelDisplayedRequest;
         private static Int32Rect _panelDisplayedRegion;
         private static Rect _panelVisibleRect, _panelInkRect;
@@ -1066,6 +1083,7 @@ namespace DesktopBar.Services
         internal static void StopLivePanel(Border panel)
         {
             if (panel != null && !ReferenceEquals(_panelTarget, panel)) return;
+            if (_panelRequest != null) Volatile.Write(ref _panelClosedAt, Environment.TickCount64);
             _panelRequest = null;
             _panelCapturePaused = false;
             _panelReady = null;
@@ -1137,9 +1155,34 @@ namespace DesktopBar.Services
             while (!_panelThreadStop)
             {
                 var request = _panelRequest;
-                if (request == null || _shotPause || _panelCapturePaused)
+                if (request == null)
                 {
-                    if (request == null) capture.SuspendWindows();
+                    capture.SuspendWindows();
+                    if (regionRequest == null)
+                    {
+                        _panelWake.WaitOne();
+                        continue;
+                    }
+                    long remaining = PanelBufferRetentionMs - (Environment.TickCount64 - Volatile.Read(ref _panelClosedAt));
+                    if (remaining > 0)
+                    {
+                        _panelWake.WaitOne((int)remaining);
+                        continue;
+                    }
+                    lock (Gate)
+                    {
+                        if (_panelRequest != null) continue;
+                        _panelPending = null;
+                    }
+                    // 短时间重开仍复用帧。收起一段时间后释放大块像素和 GDI 位图。
+                    capture.ReleaseBuffers();
+                    first.ReleasePixels();
+                    second.ReleasePixels();
+                    regionRequest = frozenRequest = null;
+                    continue;
+                }
+                if (_shotPause || _panelCapturePaused)
+                {
                     _panelWake.WaitOne();
                     continue;
                 }
