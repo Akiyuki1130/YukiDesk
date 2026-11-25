@@ -62,6 +62,8 @@ namespace DesktopBar.UI
         private readonly Border _panelChrome;
         private readonly Grid _panelSurface;
         private readonly RectangleGeometry _panelClip = new();
+        private DispatcherTimer _firstFrameTimer;
+        private Action _firstFrameFallback;
         private double _panelMotionInset;
         private double _fallbackOpacity, _fallbackAlpha;
         private bool _blendingBackdrop;
@@ -679,6 +681,7 @@ namespace DesktopBar.UI
             void Reveal()
             {
                 if (revealed || openVersion != _panelGeneration || !Open || _closing) return;
+                CancelPanelFallback();
                 revealed = true;
                 if (Environment.GetEnvironmentVariable("YUKI_PANEL_SHOWLOG") == "1")
                 {
@@ -715,7 +718,7 @@ namespace DesktopBar.UI
                 });
                 UpdatePanelFrame();
                 if (FileDropInteractionActive) GlassService.SetPanelCapturePaused(Panel, true);
-                if (!revealed) RevealOnTimeout();
+                if (!revealed) SchedulePanelFallback(ShowPanelFallback);
             }
             else
             {
@@ -723,10 +726,8 @@ namespace DesktopBar.UI
                 Reveal();
             }
 
-            async void RevealOnTimeout()
+            void ShowPanelFallback()
             {
-                // 首帧就绪会直接开始动画。只在采样持续不可用时显示备用材质。
-                await System.Threading.Tasks.Task.Delay(750);
                 if (revealed || openVersion != _panelGeneration || !Open || _closing) return;
                 var fallback = Ui.Brush("#222228", 0.75);
                 _panelBackdropFade.Fill = fallback;
@@ -738,6 +739,32 @@ namespace DesktopBar.UI
                 SetGlassInk(Panel, 0, panel: true);
                 Reveal();
             }
+        }
+
+        private void SchedulePanelFallback(Action fallback)
+        {
+            if (_firstFrameTimer == null)
+            {
+                _firstFrameTimer = new DispatcherTimer(DispatcherPriority.Normal, Dispatcher)
+                {
+                    Interval = TimeSpan.FromMilliseconds(750)
+                };
+                _firstFrameTimer.Tick += (_, _) =>
+                {
+                    var showFallback = _firstFrameFallback;
+                    CancelPanelFallback();
+                    showFallback?.Invoke();
+                };
+            }
+            // 首帧就绪或面板关闭时撤销定时器，避免频繁开合时留下旧唤醒。
+            _firstFrameFallback = fallback;
+            _firstFrameTimer.Start();
+        }
+
+        private void CancelPanelFallback()
+        {
+            _firstFrameTimer?.Stop();
+            _firstFrameFallback = null;
         }
 
         private void ClearPanelBackdropFade()
@@ -943,6 +970,7 @@ namespace DesktopBar.UI
         private void HidePanelImmediate()
         {
             _panelGeneration++;
+            CancelPanelFallback();
             bool wasOpen = Open || _closing || PanelWindow.Visibility == Visibility.Visible;
             _closeTimer.Stop();
             Open = false;
