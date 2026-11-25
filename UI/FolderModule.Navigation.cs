@@ -67,14 +67,14 @@ namespace DesktopBar.UI
 
         private bool NavigateUp()
         {
-            if (_insideDirectory == null || !_listView.IsHitTestVisible) return false;
+            if (_insideDirectory == null) return false;
             NavigateTo(Path.GetDirectoryName(_insideDirectory));
             return true;
         }
 
         private void ShowAncestorMenu()
         {
-            if (_insideDirectory == null || !_listView.IsHitTestVisible) return;
+            if (_insideDirectory == null) return;
             var ancestors = new System.Collections.Generic.List<FlyoutItem>();
             var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(_directory));
             for (string path = Path.GetDirectoryName(_insideDirectory); path != null; path = Path.GetDirectoryName(path))
@@ -101,10 +101,7 @@ namespace DesktopBar.UI
             string relative = Path.GetRelativePath(_directory, path);
             if (Path.IsPathRooted(relative) || relative == ".." || relative.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal)) return;
             _insideDirectory = relative == "." ? null : path;
-            _watcher?.Dispose();
-            _watcher = null;
-            _debounce.Stop();
-            System.Threading.Interlocked.Exchange(ref _reloadQueued, 0);
+            InvalidateCatalog();
             _filterRequest?.Cancel();
             _files = null;
             _matchedFiles = Array.Empty<FileSystemInfo>();
@@ -114,6 +111,7 @@ namespace DesktopBar.UI
             _listView.IsHitTestVisible = _gridScroll.IsHitTestVisible = false;
             _folderStatus.Text = "正在读取…";
             _folderStatus.ToolTip = null;
+            UpdateFolderLocation();
             _filter.Clear();
             ClearSelection();
             CancelPreview();

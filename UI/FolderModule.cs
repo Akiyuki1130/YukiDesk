@@ -26,15 +26,17 @@ namespace DesktopBar.UI
         private readonly WrapPanel _wrap = new WrapPanel();
         private readonly DispatcherTimer _debounce;
         private const int ReloadDelayMs = 300;
-        private long _lastFolderChange;
-        private int _reloadQueued;
+        private const int MaxReloadDelayMs = 1200;
+        private readonly object _reloadGate = new();
+        private long _firstFolderChange, _lastFolderChange;
+        private bool _reloadQueued;
         private FileSystemWatcher _watcher;
         private FileSystemInfo[] _files, _displayedFiles, _preparingFiles;
         private FolderTile[] _tiles = Array.Empty<FolderTile>();
         private FileSystemInfo[] _matchedFiles = Array.Empty<FileSystemInfo>();
         private CancellationTokenSource _filterRequest;
-        private int _loadVersion, _readingVersion = -1;
-        private string _readingDirectory;
+        private int _loadVersion;
+        private CancellationTokenSource _folderRead;
         private bool _readAgain;
         private volatile bool _catalogDemand;
         private volatile bool _disposed;
@@ -76,17 +78,8 @@ namespace DesktopBar.UI
             foreach (var target in new FrameworkElement[] { Pill, PanelWindow })
                 WireFileDrop(target, _directory, RunFileOperation);
 
-            _debounce = new DispatcherTimer(DispatcherPriority.Background, Dispatcher)
-            {
-                Interval = TimeSpan.FromMilliseconds(ReloadDelayMs)
-            };
-            _debounce.Tick += (_, _) =>
-            {
-                if (Environment.TickCount64 - Interlocked.Read(ref _lastFolderChange) < ReloadDelayMs) return;
-                _debounce.Stop();
-                Interlocked.Exchange(ref _reloadQueued, 0);
-                _ = LoadFilesAsync(contentsChanged: true);
-            };
+            _debounce = new DispatcherTimer(DispatcherPriority.Background, Dispatcher);
+            _debounce.Tick += (_, _) => ProcessCatalogChanges(_loadVersion);
             SetCatalogDemand(App.ActiveSettings.ShowFolders);
         }
 
@@ -101,14 +94,21 @@ namespace DesktopBar.UI
             if (_disposed || active == _catalogDemand) return;
             _catalogDemand = active;
             if (active) _ = LoadFilesAsync();
-            else
+            else InvalidateCatalog();
+        }
+
+        private void InvalidateCatalog()
+        {
+            lock (_reloadGate)
             {
                 _loadVersion++;
-                _debounce.Stop();
-                Interlocked.Exchange(ref _reloadQueued, 0);
-                _watcher?.Dispose();
-                _watcher = null;
+                _reloadQueued = false;
             }
+            _readAgain = false;
+            _folderRead?.Cancel();
+            _debounce.Stop();
+            _watcher?.Dispose();
+            _watcher = null;
         }
 
         protected override bool KeepPanelOpenOnPointerExit => _panelPinned;
@@ -131,16 +131,15 @@ namespace DesktopBar.UI
         private async Task LoadFilesAsync(bool contentsChanged = false)
         {
             if (_directory == null || _disposed || !_catalogDemand) return;
-            string path = CurrentDirectory;
-            if (_readingVersion == _loadVersion && string.Equals(_readingDirectory, path, StringComparison.OrdinalIgnoreCase))
+            if (_folderRead != null)
             {
-                _readAgain |= contentsChanged;
+                _readAgain |= contentsChanged || _folderRead.IsCancellationRequested;
                 return;
             }
-            int version = ++_loadVersion;
-            _readingVersion = version;
-            _readingDirectory = path;
-            _readAgain = false;
+            string path = CurrentDirectory;
+            int version = _loadVersion;
+            using var read = new CancellationTokenSource();
+            _folderRead = read;
             bool watch = _watcher == null;
             var previous = _files;
             bool wasAvailable = _available;
@@ -148,11 +147,11 @@ namespace DesktopBar.UI
             {
                 var (files, watcher, unchanged) = await Task.Run(() =>
                 {
-                    var snapshot = ReadFolder(path, watch);
+                    var snapshot = ReadFolder(path, watch, version, read.Token);
                     bool same = previous != null && (snapshot.Files == null
                         ? !wasAvailable : wasAvailable && SameFolderContents(previous, snapshot.Files));
                     return (snapshot.Files, snapshot.Watcher, same);
-                });
+                }, read.Token);
                 if (_disposed || version != _loadVersion)
                 {
                     watcher?.Dispose();
@@ -169,18 +168,15 @@ namespace DesktopBar.UI
                     UpdateFolderSnapshot(files);
                     for (int i = 0; i < Math.Min(PrefetchLimit, _files.Length); i++) IconCache.LoadAsync(_files[i]);
                 }
-                if (Open) await ShowFilesAsync();
+                if (Open) _ = ShowFilesAsync();
             }
+            catch (OperationCanceledException) when (read.IsCancellationRequested) { }
             finally
             {
-                if (_readingVersion == version)
-                {
-                    _readingVersion = -1;
-                    _readingDirectory = null;
-                    bool readAgain = _readAgain;
-                    _readAgain = false;
-                    if (readAgain && !_disposed) _ = LoadFilesAsync();
-                }
+                _folderRead = null;
+                bool readAgain = _readAgain;
+                _readAgain = false;
+                if (readAgain) _ = LoadFilesAsync();
             }
         }
 
@@ -198,8 +194,9 @@ namespace DesktopBar.UI
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return false; }
         }
 
-        private (FileSystemInfo[] Files, FileSystemWatcher Watcher) ReadFolder(string path, bool watch)
+        private (FileSystemInfo[] Files, FileSystemWatcher Watcher) ReadFolder(string path, bool watch, int version, CancellationToken cancellation)
         {
+            cancellation.ThrowIfCancellationRequested();
             FileSystemWatcher watcher = null;
             if (watch)
             {
@@ -210,11 +207,11 @@ namespace DesktopBar.UI
                         NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.LastWrite
                             | NotifyFilters.Attributes | NotifyFilters.Size
                     };
-                    watcher.Created += (_, _) => ScheduleReload();
-                    watcher.Changed += (_, _) => ScheduleReload();
-                    watcher.Deleted += (_, _) => ScheduleReload();
-                    watcher.Renamed += (_, _) => ScheduleReload();
-                    watcher.Error += (source, error) => OnWatcherError((FileSystemWatcher)source, error.GetException());
+                    watcher.Created += (_, _) => ScheduleReload(version);
+                    watcher.Changed += (_, _) => ScheduleReload(version);
+                    watcher.Deleted += (_, _) => ScheduleReload(version);
+                    watcher.Renamed += (_, _) => ScheduleReload(version);
+                    watcher.Error += (source, error) => OnWatcherError((FileSystemWatcher)source, error.GetException(), version);
                     watcher.EnableRaisingEvents = true;
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or InvalidOperationException)
@@ -225,11 +222,25 @@ namespace DesktopBar.UI
             }
             try
             {
-                var files = new DirectoryInfo(path).GetFileSystemInfos()
+                return (ReadEntries()
                     .OrderBy(item => item is DirectoryInfo ? 0 : 1)
                     .ThenBy(item => item.Name, Ui.FileNameOrder)
-                    .ToArray();
-                return (files, watcher);
+                    .ToArray(), watcher);
+
+                IEnumerable<FileSystemInfo> ReadEntries()
+                {
+                    cancellation.ThrowIfCancellationRequested();
+                    foreach (var entry in new DirectoryInfo(path).EnumerateFileSystemInfos())
+                    {
+                        cancellation.ThrowIfCancellationRequested();
+                        yield return entry;
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                watcher?.Dispose();
+                throw;
             }
             catch (DirectoryNotFoundException)
             {
@@ -244,33 +255,53 @@ namespace DesktopBar.UI
             }
         }
 
-        private void OnWatcherError(FileSystemWatcher watcher, Exception error)
+        private void OnWatcherError(FileSystemWatcher watcher, Exception error, int version)
         {
             if (error is InternalBufferOverflowException)
             {
-                ScheduleReload();
+                ScheduleReload(version);
                 return;
             }
             if (_disposed || !_catalogDemand || Dispatcher.HasShutdownStarted) return;
             Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() =>
             {
-                if (_disposed || !_catalogDemand || (_watcher != null && !ReferenceEquals(_watcher, watcher))) return;
-                watcher.Dispose();
-                _watcher = null;
-                _loadVersion++;
-                ScheduleReload();
+                if (_disposed || !_catalogDemand || version != _loadVersion
+                    || (_watcher != null && !ReferenceEquals(_watcher, watcher))) return;
+                InvalidateCatalog();
+                ScheduleReload(_loadVersion);
             }));
         }
 
-        private void ScheduleReload()
+        private void ScheduleReload(int version)
         {
-            if (_disposed || !_catalogDemand || Dispatcher.HasShutdownStarted) return;
-            Interlocked.Exchange(ref _lastFolderChange, Environment.TickCount64);
-            if (Interlocked.Exchange(ref _reloadQueued, 1) != 0) return;
-            Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() =>
+            lock (_reloadGate)
             {
-                if (!_disposed && _catalogDemand) _debounce.Start();
-            }));
+                if (_disposed || !_catalogDemand || version != _loadVersion || Dispatcher.HasShutdownStarted) return;
+                _lastFolderChange = Environment.TickCount64;
+                if (_reloadQueued) return;
+                _firstFolderChange = _lastFolderChange;
+                _reloadQueued = true;
+            }
+            Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() => ProcessCatalogChanges(version)));
+        }
+
+        private void ProcessCatalogChanges(int version)
+        {
+            long remaining;
+            lock (_reloadGate)
+            {
+                if (version != _loadVersion || !_reloadQueued) return;
+                remaining = Math.Min(_firstFolderChange + MaxReloadDelayMs, _lastFolderChange + ReloadDelayMs)
+                    - Environment.TickCount64;
+                if (remaining <= 0) _reloadQueued = false;
+            }
+            _debounce.Stop();
+            if (remaining <= 0) _ = LoadFilesAsync(contentsChanged: true);
+            else
+            {
+                _debounce.Interval = TimeSpan.FromMilliseconds(remaining);
+                _debounce.Start();
+            }
         }
 
         private async Task ShowFilesAsync()
@@ -497,8 +528,7 @@ namespace DesktopBar.UI
             _disposed = true;
             _filterRequest?.Cancel();
             _textFilterDelay?.Stop();
-            _debounce.Stop();
-            _watcher?.Dispose();
+            InvalidateCatalog();
             base.Dispose();
         }
     }
