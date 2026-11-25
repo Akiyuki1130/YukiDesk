@@ -31,10 +31,12 @@ namespace DesktopBar.UI
         }
 
         private const int CacheCapacity = 512;
+        private const long CachePixelBudget = 12 * 1024 * 1024;
         private const int PrefetchCapacity = 96;
         private static readonly object Gate = new object();
-        private static readonly Dictionary<string, (BitmapSource Image, LinkedListNode<string> Key)> Cache = new();
+        private static readonly Dictionary<string, (BitmapSource Image, LinkedListNode<string> Key, long Bytes)> Cache = new();
         private static readonly LinkedList<string> CachedKeys = new();
+        private static long _cachedBytes;
         private static readonly Dictionary<string, BitmapSource> Fallbacks = new();
         private static readonly Dictionary<string, LinkedListNode<IconRequest>> Pending = new();
         private static readonly RequestQueue PrefetchQueue = new();
@@ -73,13 +75,17 @@ namespace DesktopBar.UI
             int pixels = IconPixelSize();
             string key = (isDirectory ? "dir:" : "file:") + item.FullName + "|" + pixels + "|" + modified
                 + (placeholder ? "|offline" : "");
+            if (target?.GetValue(RequestKeyProperty) is string previous && previous != key) DetachTarget(target, null);
             BitmapSource icon;
             lock (Gate)
             {
                 if (Cache.TryGetValue(key, out var cached))
                 {
-                    CachedKeys.Remove(cached.Key);
-                    CachedKeys.AddLast(cached.Key);
+                    if (cached.Key != CachedKeys.Last)
+                    {
+                        CachedKeys.Remove(cached.Key);
+                        CachedKeys.AddLast(cached.Key);
+                    }
                     icon = cached.Image;
                 }
                 else
@@ -97,7 +103,6 @@ namespace DesktopBar.UI
                     }
                     if (target != null)
                     {
-                        if (target.GetValue(RequestKeyProperty) is string previous && previous != key) DetachTarget(target, null);
                         var targets = node.Value.Targets ??= new List<WeakReference<Image>>();
                         targets.RemoveAll(reference => !reference.TryGetTarget(out _));
                         if (!targets.Exists(reference => reference.TryGetTarget(out var image) && ReferenceEquals(image, target)))
@@ -124,7 +129,11 @@ namespace DesktopBar.UI
                     return;
                 }
             }
-            if (target != null) target.Source = icon;
+            if (target != null)
+            {
+                DetachTarget(target, null);
+                target.Source = icon;
+            }
         }
 
         private static void DetachTarget(object sender, RoutedEventArgs args)
@@ -174,15 +183,7 @@ namespace DesktopBar.UI
                 lock (Gate)
                 {
                     Pending.Remove(request.Key);
-                    if (icon != null)
-                    {
-                        if (Cache.Count >= CacheCapacity)
-                        {
-                            Cache.Remove(CachedKeys.First.Value);
-                            CachedKeys.RemoveFirst();
-                        }
-                        Cache.Add(request.Key, (icon, CachedKeys.AddLast(request.Key)));
-                    }
+                    if (icon != null) StoreIcon(request.Key, icon);
                     targets = request.Targets;
                 }
                 if (targets == null || icon == null) continue;
@@ -191,9 +192,31 @@ namespace DesktopBar.UI
                 dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() =>
                 {
                     foreach (var reference in targets)
-                        if (reference.TryGetTarget(out var image) && image.IsLoaded) image.Source = icon;
+                    {
+                        if (!reference.TryGetTarget(out var image) || !image.IsLoaded
+                            || image.GetValue(RequestKeyProperty) is not string key || key != request.Key) continue;
+                        image.Unloaded -= DetachTarget;
+                        image.ClearValue(RequestKeyProperty);
+                        image.Source = icon;
+                    }
                 }));
             }
+        }
+
+        private static void StoreIcon(string key, BitmapSource icon)
+        {
+            // WPF 显示纹理至少需要 32 位，按实际像素大小控制高缩放时的缓存。
+            long bytes = (long)icon.PixelWidth * icon.PixelHeight * Math.Max(4, (icon.Format.BitsPerPixel + 7) / 8);
+            if (bytes > CachePixelBudget) return;
+            while (Cache.Count >= CacheCapacity || _cachedBytes + bytes > CachePixelBudget)
+            {
+                string oldest = CachedKeys.First.Value;
+                _cachedBytes -= Cache[oldest].Bytes;
+                Cache.Remove(oldest);
+                CachedKeys.RemoveFirst();
+            }
+            Cache.Add(key, (icon, CachedKeys.AddLast(key), bytes));
+            _cachedBytes += bytes;
         }
 
         private static BitmapSource TypeIcon(bool isDir, string ext)
