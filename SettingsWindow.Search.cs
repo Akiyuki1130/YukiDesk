@@ -48,7 +48,7 @@ namespace DesktopBar
 
         private void Search_TextChanged(object sender, TextChangedEventArgs e)
         {
-            if (SettingsSearchResults == null || PagesGrid == null) return;
+            if (!_pagesReady) return;
             string query = SettingsSearchBox.Text.Trim();
             bool searching = query.Length != 0;
             SearchPlaceholder.Visibility = SettingsSearchBox.Text.Length == 0 ? Visibility.Visible : Visibility.Collapsed;
@@ -69,6 +69,7 @@ namespace DesktopBar
             foreach (var view in PagesGrid.Children.OfType<ScrollViewer>())
             {
                 if (view.Tag is not string page || view.Content is not FrameworkElement root) continue;
+                EnsurePageBuilt(page);
                 string pageName = PageName(page);
                 bool hasAnchor = false;
                 foreach (var (element, section) in SearchAnchors(root, null))

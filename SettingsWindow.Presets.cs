@@ -260,12 +260,10 @@ namespace DesktopBar
             RemoveDesktopObservers();
             ApplyWindowTheme();
             SettingsThemeHost.Content = BuildThemeModePicker();
-            BuildAppearancePage();
-            BuildTimePage();
-            BuildFoldersPage();
-            BuildModulesPage();
-            BuildGeneralPage();
-            BuildAboutPage();
+            var visited = _builtPages.ToArray();
+            _builtPages.Clear();
+            foreach (string page in visited) EnsurePageBuilt(page);
+            if (SettingsSearchBox.Text.Length > 0) Search_TextChanged(SettingsSearchBox, null);
             if (view != null)
                 Dispatcher.BeginInvoke(DispatcherPriority.Loaded, new Action(() => view.ScrollToVerticalOffset(offset)));
         }

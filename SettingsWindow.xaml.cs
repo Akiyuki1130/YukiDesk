@@ -26,26 +26,26 @@ namespace DesktopBar
         private AppSettings S => App.Settings;
         private ListBox _folderList;
         private bool _updatingTheme;
+        private bool _pagesReady;
         private string _currentPage;
         private bool? _appliedLightTheme;
+        private readonly HashSet<string> _builtPages = new(StringComparer.Ordinal);
         private readonly HashSet<Action> _pendingSliderCommits = new();
 
-        public SettingsWindow()
+        public SettingsWindow() : this(null) { }
+
+        internal SettingsWindow(string initialPage)
         {
             InitializeComponent();
             // 先应用主题再创建动态控件，避免控件捕获初始化阶段的低对比度画刷。
             ApplyWindowTheme();
             TitleIconHost.Content = Ui.SnowflakeGlyph(18, "SettingsSubTextBrush");
             SettingsThemeHost.Content = BuildThemeModePicker();
-            BuildAppearancePage();
-            BuildTimePage();
-            BuildFoldersPage();
             var folderBar = App.Bar;
             if (folderBar != null) folderBar.FolderCatalogChanged += RefreshFolderList;
-            BuildModulesPage();
-            BuildGeneralPage();
-            BuildAboutPage();
-            ShowPage("Appearance");
+            _pagesReady = true;
+            NavigateTo(initialPage ?? "Appearance");
+            if (_currentPage == null) ShowPage("Appearance");
             ThemeService.Changed += OnThemeChanged;
             UpdateService.StatusChanged += RefreshUpdateStatus;
             Microsoft.Win32.SystemEvents.UserPreferenceChanged += OnSystemThemeChanged;
@@ -92,11 +92,12 @@ namespace DesktopBar
 
         private void ShowPage(string tag)
         {
-            if (PagesGrid == null || string.IsNullOrEmpty(tag) || _currentPage == tag) return;
+            if (!_pagesReady || string.IsNullOrEmpty(tag) || _currentPage == tag) return;
             var pages = PagesGrid.Children.OfType<FrameworkElement>();
             var next = pages.FirstOrDefault(page => string.Equals((string)page.Tag, tag, StringComparison.Ordinal));
             if (next == null) return;
 
+            EnsurePageBuilt(tag);
             bool animate = _currentPage != null && SystemParameters.ClientAreaAnimation;
             _currentPage = tag;
             PageTitle.Text = PageName(tag);
@@ -112,6 +113,22 @@ namespace DesktopBar
             if (animate)
                 next.BeginAnimation(OpacityProperty, new DoubleAnimation(0.64, 1,
                     TimeSpan.FromMilliseconds(130)) { FillBehavior = FillBehavior.Stop });
+        }
+
+        private void EnsurePageBuilt(string page)
+        {
+            if (_builtPages.Contains(page)) return;
+            switch (page)
+            {
+                case "Appearance": BuildAppearancePage(); break;
+                case "Time": BuildTimePage(); break;
+                case "Folders": BuildFoldersPage(); break;
+                case "Modules": BuildModulesPage(); break;
+                case "General": BuildGeneralPage(); break;
+                case "About": BuildAboutPage(); break;
+                default: return;
+            }
+            _builtPages.Add(page);
         }
 
         internal void NavigateTo(string page)
@@ -906,6 +923,7 @@ namespace DesktopBar
 
         private void RefreshFolderList()
         {
+            if (_folderList == null) return;
             // 行视图:名称 + 内联"打开"按钮。
             _rows = S.Folders.Select(n => new FolderRow(n)).ToList();
             _folderList.ItemsSource = _rows;
@@ -1740,6 +1758,7 @@ namespace DesktopBar
 
         private void RefreshUpdateStatus()
         {
+            if (_checkButton == null) return;
             bool cancelable = UpdateService.CanCancelDownload;
             _checkButton.Content = cancelable ? "取消下载" : "检查更新";
             _checkButton.IsEnabled = cancelable || !UpdateService.Busy;

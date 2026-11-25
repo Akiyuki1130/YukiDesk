@@ -621,12 +621,15 @@ namespace DesktopBar
             }
             catch { }
         }
-        public static void ShowSettings()
+        public static void ShowSettings() => ShowSettings(null);
+
+        private static void ShowSettings(string page)
         {
             Bar?.EndAppSceneForSettings();
             Bar?.ClosePanels();
             if (_settingsWin != null)
             {
+                if (page != null) _settingsWin.NavigateTo(page);
                 _settingsWin.WindowState = WindowState.Normal;
                 // 呼出已有设置窗口时强制弹到所有窗口之上，避免被别的软件压住找不到。
                 _settingsWin.Topmost = true;
@@ -634,9 +637,10 @@ namespace DesktopBar
                 _settingsWin.Topmost = false;
                 return;
             }
-            var w = new SettingsWindow();
+            var location = page == null ? _lastSettingsLocation : (Page: page, Offset: 0d);
+            var w = new SettingsWindow(location.Page);
             _settingsWin = w;
-            w.RestoreLocation(_lastSettingsLocation);
+            w.RestoreLocation(location);
             w.Closing += (s, e) => _lastSettingsLocation = w.LocationInSettings;
             w.Closed += (s, e) => _settingsWin = null;
             // 首帧前整窗透明,避免"直接闪出来"。
@@ -649,11 +653,7 @@ namespace DesktopBar
             PlayOpenAnimation(w);
         }
 
-        internal static void ShowSettingsPage(string page)
-        {
-            ShowSettings();
-            _settingsWin?.NavigateTo(page);
-        }
+        internal static void ShowSettingsPage(string page) => ShowSettings(page);
 
         internal static void NotifyTimerDone() => (Current as App)?._tray?.ShowBalloonTip(
             4500, "YukiDesk 倒计时", "设定时间已到。", Forms.ToolTipIcon.Info);
