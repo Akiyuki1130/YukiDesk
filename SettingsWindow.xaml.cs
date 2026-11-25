@@ -1746,6 +1746,14 @@ namespace DesktopBar
             var collaborator = GitHubProfileButton("协助者", "OneCat2015");
             collaborator.Margin = new Thickness(5, 0, 0, 0);
             contributors.Children.Add(collaborator);
+            contributors.SizeChanged += (_, args) =>
+            {
+                if (!args.WidthChanged) return;
+                bool stacked = args.NewSize.Width < 380;
+                contributors.Columns = stacked ? 1 : 2;
+                developer.Margin = stacked ? new Thickness(0, 0, 0, 8) : new Thickness(0, 0, 5, 0);
+                collaborator.Margin = stacked ? new Thickness(0) : new Thickness(5, 0, 0, 0);
+            };
             ab.Children.Add(contributors);
             AboutHost.Children.Add(about);
 
@@ -1758,7 +1766,7 @@ namespace DesktopBar
                 if (UpdateService.CanCancelDownload) UpdateService.CancelDownload();
                 else await UpdateService.RunCheckAsync(autoDownload: S.AutoUpdate);
             };
-            ub.Children.Add(Row("手动检查更新", _checkButton));
+            ub.Children.Add(Row("手动更新", _checkButton, "检查更新 安装已下载版本"));
             _updateStatus = new TextBlock
             {
                 FontSize = 12.5,
@@ -1768,8 +1776,7 @@ namespace DesktopBar
             _updateStatus.SetResourceReference(TextElement.ForegroundProperty, "SettingsSubTextBrush");
             RefreshUpdateStatus();
             ub.Children.Add(_updateStatus);
-            ub.Children.Add(MakeHint("「自动下载更新」需要开启「自动检查更新」;下载完成后会先询问,确认后才安装。" +
-                                     "安装新版本时会退出 YukiDesk 并启动安装程序,设置与小文件夹不会丢失。", 14));
+            ub.Children.Add(MakeHint("开启自动检查后才能自动下载。下载完成后，可在本次运行期间回到此处安装。", 14));
             AboutHost.Children.Add(upd);
             AboutHost.Children.Add(BuildDiagnosticsCard());
         }
@@ -1833,7 +1840,8 @@ namespace DesktopBar
         {
             if (_checkButton == null) return;
             bool cancelable = UpdateService.CanCancelDownload;
-            _checkButton.Content = cancelable ? "取消下载" : "检查更新";
+            _checkButton.Content = cancelable ? "取消下载"
+                : UpdateService.CanInstallDownloaded ? "安装已下载版本" : "检查更新";
             _checkButton.IsEnabled = cancelable || !UpdateService.Busy;
             _updateStatus.Text = UpdateService.Status;
             _updateStatus.Visibility = _updateStatus.Text.Length == 0 ? Visibility.Collapsed : Visibility.Visible;

@@ -67,11 +67,14 @@ namespace DesktopBar.Services
         private static int _busy;
         private static int _autoCheckRunning;
         private static CancellationTokenSource _downloadCancellation;
+        private sealed record ReadyUpdate(string Version, string Path, string Digest);
+        private static ReadyUpdate _readyUpdate;
 
         /// <summary>是否正在进行检查/下载。</summary>
         public static bool Busy => Volatile.Read(ref _busy) != 0;
         internal static string Status { get; private set; } = "";
         internal static bool CanCancelDownload => _downloadCancellation is { IsCancellationRequested: false };
+        internal static bool CanInstallDownloaded => _readyUpdate != null;
         internal static event Action StatusChanged;
 
         internal static void CancelDownload()
@@ -313,25 +316,34 @@ namespace DesktopBar.Services
         }
 
         /// <summary>Release 提供 SHA256SUMS-<版本>.txt 时比对下载包哈希;缺失时仅记录并放行(旧 Release 兼容)。</summary>
-        private static async Task VerifyChecksumAsync(string installerPath, UpdateInfo info)
+        private static async Task<string> VerifyChecksumAsync(string installerPath, UpdateInfo info)
         {
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            string expected = null;
             if (string.IsNullOrEmpty(info.ChecksumUrl))
             {
-                App.Log("更新: Release 未提供 SHA256SUMS,跳过完整性校验");
-                return;
+                App.Log("更新: Release 未提供 SHA256SUMS,记录本地下载哈希");
             }
-            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
-            string text = await Http.GetStringAsync(info.ChecksumUrl, cts.Token).ConfigureAwait(false);
-            string expected = ParseChecksum(text, info.FileName);
-            if (expected == null)
-                throw new InvalidOperationException("校验清单缺少安装包的有效 SHA-256 条目: " + info.FileName);
-            await using var fs = new FileStream(installerPath, FileMode.Open, FileAccess.Read, FileShare.Read,
-                64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
-            var digest = await System.Security.Cryptography.SHA256.HashDataAsync(fs, cts.Token).ConfigureAwait(false);
-            string actual = Convert.ToHexString(digest).ToLowerInvariant();
-            if (!string.Equals(actual, expected, StringComparison.OrdinalIgnoreCase))
+            else
+            {
+                string text = await Http.GetStringAsync(info.ChecksumUrl, cts.Token).ConfigureAwait(false);
+                expected = ParseChecksum(text, info.FileName);
+                if (expected == null)
+                    throw new InvalidOperationException("校验清单缺少安装包的有效 SHA-256 条目: " + info.FileName);
+            }
+            string actual = await ReadInstallerDigestAsync(installerPath, cts.Token).ConfigureAwait(false);
+            if (expected != null && !string.Equals(actual, expected, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("SHA-256 不匹配(期望 " + expected + ",实际 " + actual + ")");
-            App.Log("更新: 安装包 SHA-256 校验通过");
+            if (expected != null) App.Log("更新: 安装包 SHA-256 校验通过");
+            return actual;
+        }
+
+        private static async Task<string> ReadInstallerDigestAsync(string path, CancellationToken cancellation)
+        {
+            await using var input = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read,
+                64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
+            var digest = await System.Security.Cryptography.SHA256.HashDataAsync(input, cancellation).ConfigureAwait(false);
+            return Convert.ToHexString(digest).ToLowerInvariant();
         }
 
         /// <summary>解析 sha256sum 格式("<哈希>  <文件名>")的清单,返回目标文件的哈希。</summary>
@@ -386,6 +398,15 @@ namespace DesktopBar.Services
             if (Interlocked.Exchange(ref _busy, 1) != 0) return;
             try
             {
+                if (_readyUpdate is { } downloaded)
+                {
+                    if (preChecked == null)
+                    {
+                        await ConfirmInstallAsync(downloaded);
+                        return;
+                    }
+                    if (preChecked.Version == downloaded.Version) return;
+                }
                 UpdateInfo info = preChecked;
                 if (info == null)
                 {
@@ -401,54 +422,78 @@ namespace DesktopBar.Services
                 if (!autoDownload)
                 {
                     if (!ConfirmDialog.Show("YukiDesk 更新",
-                        "发现新版本 v" + info.Version + "(当前 v" + CurrentVersionLabel + ")。\n\n是否立即下载并安装?", "下载并安装"))
+                        "发现新版本 v" + info.Version + "（当前 v" + CurrentVersionLabel + "）。\n\n是否下载更新？下载完成后可选择安装时间。", "下载安装包"))
                     {
                         PublishStatus("已取消。");
                         return;
                     }
                 }
 
-                string path = await DownloadUpdateAsync(info);
-                if (path == null) return;
-
-                // 完整性校验:Release 附带 SHA256SUMS 时比对安装包哈希,不符即删。
-                try
-                {
-                    PublishStatus("正在校验安装包…");
-                    await VerifyChecksumAsync(path, info);
-                    await VerifySignatureAsync(path);
-                }
-                catch (Exception ex)
-                {
-                    DeleteDownloadedInstaller(path);
-                    PublishStatus("安装包校验失败: " + ex.Message);
-                    ConfirmDialog.Notice("更新已取消", "下载的安装包未通过完整性校验,已删除。\n" + ex.Message);
-                    return;
-                }
-
-                PublishStatus("下载完成，可以安装。");
+                var ready = await PrepareDownloadedUpdateAsync(info);
+                if (ready == null) return;
                 WindowsUpdateNotifications.Downloaded(info.Version);
-                // 安装会退出应用,默认键/焦点必须在"取消"侧,回车不能直接触发安装。
-                if (!ConfirmDialog.Show("YukiDesk 更新",
-                    "新版本 v" + info.Version + " 已下载完成。\n\n立即安装吗?安装时会先退出 YukiDesk。", "立即安装",
-                    okIsDefault: false))
-                {
-                    DeleteDownloadedInstaller(path);
-                    PublishStatus("已取消安装。");
-                    return;
-                }
-                PublishStatus("正在启动安装程序…");
-                if (!await InstallAndRestartAsync(path))
-                {
-                    DeleteDownloadedInstaller(path);
-                    PublishStatus("安装未启动。");
-                    ConfirmDialog.Notice("更新未完成", "安装程序未能启动或已取消，YukiDesk 将继续运行。");
-                }
+                await ConfirmInstallAsync(ready);
             }
             finally
             {
                 Volatile.Write(ref _busy, 0);
                 StatusChanged?.Invoke();
+            }
+        }
+
+        private static async Task<ReadyUpdate> PrepareDownloadedUpdateAsync(UpdateInfo info)
+        {
+            string path = await DownloadUpdateAsync(info);
+            if (path == null) return null;
+            string digest;
+            try
+            {
+                PublishStatus("正在校验安装包…");
+                digest = await Task.Run(() => VerifyChecksumAsync(path, info));
+                await VerifySignatureAsync(path);
+            }
+            catch (Exception ex)
+            {
+                DeleteDownloadedInstaller(path);
+                PublishStatus("安装包校验失败: " + ex.Message);
+                ConfirmDialog.Notice("更新已取消", "下载的安装包未通过完整性校验，已删除。\n" + ex.Message);
+                return null;
+            }
+            if (_readyUpdate is { } previous) DeleteDownloadedInstaller(previous.Path);
+            return _readyUpdate = new ReadyUpdate(info.Version, path, digest);
+        }
+
+        private static async Task ConfirmInstallAsync(ReadyUpdate ready)
+        {
+            PublishStatus("v" + ready.Version + " 已下载，可以安装。");
+            if (!ConfirmDialog.Show("YukiDesk 更新",
+                "v" + ready.Version + " 已下载完成。安装时 YukiDesk 会先退出。",
+                "立即安装", "稍后安装", okIsDefault: false))
+            {
+                PublishStatus("v" + ready.Version + " 已下载，等待安装。");
+                return;
+            }
+            PublishStatus("正在验证已下载的安装包…");
+            try
+            {
+                using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+                var actual = await Task.Run(() => ReadInstallerDigestAsync(ready.Path, timeout.Token));
+                if (actual != ready.Digest) throw new InvalidDataException("安装包内容在下载后发生了变化。");
+            }
+            catch (Exception ex)
+            {
+                _readyUpdate = null;
+                DeleteDownloadedInstaller(ready.Path);
+                PublishStatus("安装包已失效，请重新检查更新。");
+                App.Log("更新: 安装前完整性检查失败 " + ex.Message);
+                return;
+            }
+            PublishStatus("正在启动安装程序…");
+            if (await InstallAndRestartAsync(ready.Path)) _readyUpdate = null;
+            else
+            {
+                PublishStatus("安装未启动，可再次尝试。");
+                ConfirmDialog.Notice("更新未完成", "安装程序未能启动或已取消，YukiDesk 将继续运行。");
             }
         }
 
@@ -501,7 +546,7 @@ namespace DesktopBar.Services
                         try
                         {
                             var info = await CheckLatestAsync(CancellationToken.None);
-                            if (info != null)
+                            if (info != null && ReferenceEquals(_autoTimer, timer))
                             {
                                 App.Log("更新: 发现新版本 v" + info.Version);
                                 if (App.Settings.AutoUpdate)
@@ -533,6 +578,12 @@ namespace DesktopBar.Services
             var timer = _autoTimer;
             _autoTimer = null;
             timer?.Stop();
+            _downloadCancellation?.Cancel();
+            if (_readyUpdate is { } ready)
+            {
+                _readyUpdate = null;
+                DeleteDownloadedInstaller(ready.Path);
+            }
         }
     }
 }

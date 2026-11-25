@@ -16,6 +16,9 @@ namespace DesktopBar.UI
         public static bool Show(string title, string message, string confirmText = "确定", bool okIsDefault = true)
             => ShowInternal(title, message, confirmText, "取消", true, false, okIsDefault);
 
+        internal static bool Show(string title, string message, string confirmText, string cancelText, bool okIsDefault)
+            => ShowInternal(title, message, confirmText, cancelText, true, false, okIsDefault);
+
         /// <summary>不可逆或高风险操作确认；默认键盘动作保持在取消侧。</summary>
         public static bool ShowDanger(string title, string message, string confirmText = "确定")
             => ShowInternal(title, message, confirmText, "取消", true, true);
