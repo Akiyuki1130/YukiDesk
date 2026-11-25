@@ -24,6 +24,8 @@ namespace DesktopBar
         {
             public FrameworkElement Target => Anchor?.TryGetTarget(out var target) == true ? target : null;
         }
+        private sealed record SearchEntry(SearchHit Hit, string Searchable, string Combined);
+        private readonly Dictionary<string, SearchEntry[]> _searchEntries = new(StringComparer.Ordinal);
 
         private static readonly Dictionary<string, string> PageKeywords = new(StringComparer.Ordinal)
         {
@@ -72,20 +74,27 @@ namespace DesktopBar
                 EnsurePageBuilt(page);
                 string pageName = PageName(page);
                 bool hasAnchor = false;
-                foreach (var (element, section) in SearchAnchors(root, null))
+                if (!_searchEntries.TryGetValue(page, out var entries))
                 {
-                    string label = (string)element.GetValue(SearchLabelProperty);
-                    string name = string.IsNullOrEmpty(section) || section == label ? pageName : pageName + " · " + section;
-                    string searchable = label + " " + (string)element.GetValue(SearchAliasesProperty);
-                    string combined = searchable + " " + name;
-                    if (!terms.All(term => combined.Contains(term.Word, StringComparison.OrdinalIgnoreCase)
-                        || PinyinInitials.Matches(label, term.Initials))) continue;
-                    if (!terms.Any(term => searchable.Contains(term.Word, StringComparison.OrdinalIgnoreCase)
-                        || PinyinInitials.Matches(label, term.Initials))) continue;
+                    entries = SearchAnchors(root, null).Select(anchor =>
+                    {
+                        var (element, section) = anchor;
+                        string label = (string)element.GetValue(SearchLabelProperty);
+                        string context = string.IsNullOrEmpty(section) || section == label ? pageName : pageName + " · " + section;
+                        string searchable = label + " " + (string)element.GetValue(SearchAliasesProperty);
+                        return new SearchEntry(new SearchHit(page, label, context, new WeakReference<FrameworkElement>(element)),
+                            searchable, searchable + " " + context);
+                    }).ToArray();
+                    _searchEntries[page] = entries;
+                }
+                foreach (var entry in entries)
+                {
+                    if (!MatchesSearch(entry, terms) || !IsSearchAnchorAvailable(entry.Hit.Target, root)) continue;
+                    string label = entry.Hit.Label;
                     int score = label.Equals(query, StringComparison.OrdinalIgnoreCase) ? 100
                         : label.StartsWith(query, StringComparison.OrdinalIgnoreCase) ? 70
                         : label.Contains(query, StringComparison.OrdinalIgnoreCase) ? 60 : 45;
-                    candidates.Add((new SearchHit(page, label, name, new WeakReference<FrameworkElement>(element)), score));
+                    candidates.Add((entry.Hit, score));
                     hasAnchor = true;
                 }
                 if (!hasAnchor && PageKeywords.TryGetValue(page, out var keywords) && terms.All(
@@ -98,13 +107,34 @@ namespace DesktopBar
                 .DistinctBy(hit => (hit.Page, hit.Context, hit.Label)).Take(35).ToArray();
         }
 
+        private static bool MatchesSearch(SearchEntry entry, (string Word, uint[] Initials)[] terms)
+        {
+            bool matchesLabel = false;
+            foreach (var term in terms)
+            {
+                if (entry.Searchable.Contains(term.Word, StringComparison.OrdinalIgnoreCase)
+                    || PinyinInitials.Matches(entry.Hit.Label, term.Initials)) matchesLabel = true;
+                else if (!entry.Combined.Contains(term.Word, StringComparison.OrdinalIgnoreCase)) return false;
+            }
+            return matchesLabel;
+        }
+
+        private static bool IsSearchAnchorAvailable(FrameworkElement target, FrameworkElement root)
+        {
+            // 页面本身可能未选中。只看控件到页面内容根节点之间的显示条件。
+            for (DependencyObject node = target; node is FrameworkElement element; node = LogicalTreeHelper.GetParent(node))
+            {
+                if (element.Visibility != Visibility.Visible) return false;
+                if (ReferenceEquals(element, root)) return true;
+            }
+            return false;
+        }
+
         private static IEnumerable<(FrameworkElement Element, string Section)> SearchAnchors(FrameworkElement node, string section)
         {
-            if (node.Visibility != Visibility.Visible) yield break;
             section = node.GetValue(SearchSectionProperty) as string ?? section;
             if (node.GetValue(SearchLabelProperty) is string) yield return (node, section);
-            // A collapsed Expander still owns its content logically. Opening a result
-            // makes it visible without adding entries for controls hidden by the current mode.
+            // 折叠的 Expander 仍拥有逻辑子树。搜索结果打开时再展开它。
             foreach (var child in LogicalTreeHelper.GetChildren(node).OfType<FrameworkElement>())
                 foreach (var anchor in SearchAnchors(child, section)) yield return anchor;
         }

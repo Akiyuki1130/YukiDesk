@@ -263,6 +263,7 @@ namespace DesktopBar
             var visited = _builtPages.ToArray();
             _builtPages.Clear();
             foreach (string page in visited) EnsurePageBuilt(page);
+            _searchEntries.Clear();
             if (SettingsSearchBox.Text.Length > 0) Search_TextChanged(SettingsSearchBox, null);
             UpdatePageActivity();
             if (view != null)

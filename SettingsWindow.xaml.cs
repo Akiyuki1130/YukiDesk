@@ -512,6 +512,7 @@ namespace DesktopBar
 
         private void BuildMaterialCard()
         {
+            _searchEntries.Remove("Appearance");
             if (_materialCard != null) AppearanceHost.Children.Remove(_materialCard);
             if (_glassPreview?.Parent is Panel previousPreviewHost)
                 previousPreviewHost.Children.Remove(_glassPreview);
