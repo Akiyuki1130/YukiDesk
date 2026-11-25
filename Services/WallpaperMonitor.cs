@@ -132,23 +132,24 @@ namespace DesktopBar.Services
                 bool Map(double sx, double sy, out double wx, out double wy) =>
                     MicaService.MapWallpaper(state.Style, state.Style == 0, state.OriginX, state.OriginY,
                         cw, ch, ww, wh, sx, sy, out wx, out wy);
-                // 两轴映射独立，每列只算一次横坐标，每行只算一次纵坐标。
-                var xPositions = new int[width];
-                for (int column = 0; column < width; column++)
-                    xPositions[column] = Map(offsetX + column * 2 + 0.5, ch * .5, out var wx, out _) ? (int)wx : -1;
-                var locked = TryLock(wallpaper, ww, wh);
+                // 两轴映射独立；锁定实际采样到的源图区域，避免转换整张高分辨率壁纸。
+                var (xPositions, left, right) = MapAxis(width, offsetX, horizontal: true);
+                var (yPositions, top, bottom) = MapAxis(height, offsetY, horizontal: false);
+                if (right < left || bottom < top) return pixels;
+                var source = Rectangle.FromLTRB(left, top, right + 1, bottom + 1);
+                var locked = TryLock(wallpaper, source);
                 try
                 {
-                    var rowBytes = locked == null ? null : new byte[ww * 4];
+                    var rowBytes = locked == null ? null : new byte[source.Width * 4];
                     var rowPixels = MemoryMarshal.Cast<byte, uint>(rowBytes.AsSpan());
                     int copiedAt = -1;
                     for (int row = 0; row < height; row++)
                     {
-                        if (!Map(cw * .5, offsetY + row * 2 + 0.5, out _, out var wy)) continue;
-                        int sy = (int)wy;
+                        int sy = yPositions[row];
+                        if (sy < 0) continue;
                         if (locked != null && sy != copiedAt)
                         {
-                            Marshal.Copy(locked.Scan0 + sy * locked.Stride, rowBytes, 0, rowBytes.Length);
+                            Marshal.Copy(locked.Scan0 + (sy - source.Y) * locked.Stride, rowBytes, 0, rowBytes.Length);
                             copiedAt = sy;
                         }
                         int dest = row * width;
@@ -156,7 +157,7 @@ namespace DesktopBar.Services
                         {
                             int sx = xPositions[column];
                             if (sx < 0) continue;
-                            uint pixel = locked == null ? unchecked((uint)wallpaper.GetPixel(sx, sy).ToArgb()) : rowPixels[sx];
+                            uint pixel = locked == null ? unchecked((uint)wallpaper.GetPixel(sx, sy).ToArgb()) : rowPixels[sx - source.X];
                             int alpha = (int)(pixel >> 24);
                             if (alpha == 255) output[dest + column] = pixel;
                             else if (alpha != 0)
@@ -172,6 +173,26 @@ namespace DesktopBar.Services
                 }
                 finally { if (locked != null) wallpaper.UnlockBits(locked); }
                 return pixels;
+
+                (int[] Positions, int Min, int Max) MapAxis(int count, int offset, bool horizontal)
+                {
+                    var positions = new int[count];
+                    int min = int.MaxValue, max = -1;
+                    for (int index = 0; index < count; index++)
+                    {
+                        double point = offset + index * 2 + 0.5;
+                        if (!Map(horizontal ? point : cw * .5, horizontal ? ch * .5 : point, out var wx, out var wy))
+                        {
+                            positions[index] = -1;
+                            continue;
+                        }
+                        int mapped = (int)(horizontal ? wx : wy);
+                        positions[index] = mapped;
+                        min = Math.Min(min, mapped);
+                        max = Math.Max(max, mapped);
+                    }
+                    return (positions, min, max);
+                }
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ExternalException or ArgumentException)
             {
@@ -179,9 +200,9 @@ namespace DesktopBar.Services
             }
         }
 
-        private static BitmapData TryLock(Bitmap wallpaper, int width, int height)
+        private static BitmapData TryLock(Bitmap wallpaper, Rectangle bounds)
         {
-            try { return wallpaper.LockBits(new Rectangle(0, 0, width, height), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb); }
+            try { return wallpaper.LockBits(bounds, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb); }
             catch (Exception ex) when (ex is ExternalException or ArgumentException) { return null; }
         }
 

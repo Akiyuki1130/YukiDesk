@@ -811,8 +811,9 @@ namespace DesktopBar.Services
             private Int32Rect _previousRegion;
             private WallpaperMonitor.Snapshot _previousWallpaper;
             private Int32Rect _wallpaperRegion;
+            private Int32Rect _wallpaperSheetRegion;
             private readonly WindowBackdrop _backdrop = new();
-            private byte[] _wallpaperPixels;
+            private byte[] _wallpaperPixels, _wallpaperSheet;
             private int _windowBackdropSession;
 
             public PanelRead Read(PanelRequest request, Int32Rect region)
@@ -821,14 +822,7 @@ namespace DesktopBar.Services
                 {
                     var wallpaper = ThemeService.CurrentWallpaper;
                     if (wallpaper == null) return PanelRead.Failed;
-                    if (wallpaper != _previousWallpaper || _wallpaperPixels == null || region != _wallpaperRegion)
-                    {
-                        _wallpaperPixels = WallpaperMonitor.ReadWallpaperRegion(
-                            wallpaper, region.X, region.Y, region.Width / 2, region.Height / 2);
-                        _wallpaperRegion = region;
-                        _previousWallpaper = wallpaper;
-                    }
-                    if (_wallpaperPixels == null) return PanelRead.Failed;
+                    if (!ReadWallpaper(wallpaper, region, out bool wallpaperChanged)) return PanelRead.Failed;
                     var pixels = _wallpaperPixels;
                     if (request.Options.UseWindowBackdrop)
                     {
@@ -837,7 +831,7 @@ namespace DesktopBar.Services
                             _windowBackdropSession = request.Session;
                             _backdrop.InvalidateLayers();
                         }
-                        pixels = _backdrop.Composite(request.Window, region, _wallpaperPixels);
+                        pixels = _backdrop.Composite(request.Window, region, _wallpaperPixels, wallpaperChanging: wallpaperChanged);
                         if (_backdrop.ShouldWaitForWindowFrame(!ReferenceEquals(pixels, _wallpaperPixels), Environment.TickCount64))
                             return PanelRead.Failed;
                     }
@@ -879,6 +873,42 @@ namespace DesktopBar.Services
                 return needsFrame || !_raw.AsSpan().SequenceEqual(_previous) ? PanelRead.Changed : PanelRead.Unchanged;
             }
 
+            private bool ReadWallpaper(WallpaperMonitor.Snapshot wallpaper, Int32Rect region, out bool changed)
+            {
+                bool sameWallpaper = wallpaper == _previousWallpaper;
+                changed = !sameWallpaper || _wallpaperPixels == null || region != _wallpaperRegion;
+                if (!changed) return true;
+
+                int right = region.X + region.Width;
+                int bottom = region.Y + region.Height;
+                var sheet = _wallpaperSheetRegion;
+                if (!sameWallpaper || _wallpaperSheet == null || region.X < sheet.X || region.Y < sheet.Y
+                    || right > sheet.X + sheet.Width || bottom > sheet.Y + sheet.Height)
+                {
+                    // 展开动画和内容变化可在已有的壁纸区域中取样，避免反复解码同一张图。
+                    const int padding = 32;
+                    int x = Math.Max(0, region.X - padding);
+                    int y = Math.Max(0, region.Y - padding);
+                    int endX = Math.Max(right, Math.Min(NativeMethods.ScreenWidth() & ~3, right + padding));
+                    int endY = Math.Max(bottom, Math.Min(NativeMethods.ScreenHeight() & ~3, bottom + padding));
+                    sheet = new Int32Rect(x, y, endX - x, endY - y);
+                    _wallpaperSheet = WallpaperMonitor.ReadWallpaperRegion(
+                        wallpaper, sheet.X, sheet.Y, sheet.Width / 2, sheet.Height / 2);
+                    if (_wallpaperSheet == null) return false;
+                    _wallpaperSheetRegion = sheet;
+                }
+
+                int stride = region.Width * 2;
+                int sheetStride = sheet.Width * 2;
+                int start = (region.Y - sheet.Y) / 2 * sheetStride + (region.X - sheet.X) * 2;
+                Resize(ref _wallpaperPixels, stride * (region.Height / 2));
+                for (int row = 0; row < region.Height / 2; row++)
+                    _wallpaperSheet.AsSpan(start + row * sheetStride, stride).CopyTo(_wallpaperPixels.AsSpan(row * stride, stride));
+                _previousWallpaper = wallpaper;
+                _wallpaperRegion = region;
+                return true;
+            }
+
             public void Fill(PanelFrame frame, PanelRequest request, Int32Rect region)
             {
                 Resize(ref frame.Body, _blurScratch.Length);
@@ -915,7 +945,7 @@ namespace DesktopBar.Services
             {
                 DestroyScreenCapture();
                 _bits = IntPtr.Zero;
-                _full = _previousFull = _raw = _previous = _blurScratch = _wallpaperPixels = null;
+                _full = _previousFull = _raw = _previous = _blurScratch = _wallpaperPixels = _wallpaperSheet = null;
                 _previousRequest = null;
                 _previousWallpaper = null;
             }
