@@ -545,6 +545,7 @@ namespace DesktopBar.UI
         private long _requestedVolume, _requestedMute;
         private int _outputUiQueued;
         private AudioMixer _mixerWorker;
+        private AudioMixer _retiringMixer;
         private int _mixerRequest;
         private bool _syncing;
         private bool _muted;
@@ -709,7 +710,8 @@ namespace DesktopBar.UI
         private async void UpdateMixer()
         {
             int request = ++_mixerRequest;
-            _mixerWorker ??= new AudioMixer();
+            if (_mixerWorker == null || _mixerWorker.WhenStopped.IsCompleted) _mixerWorker = new AudioMixer();
+            var worker = _mixerWorker;
             if (_mixer.Content is StackPanel content)
             {
                 foreach (UIElement child in content.Children)
@@ -717,25 +719,43 @@ namespace DesktopBar.UI
             }
             AudioMixer.Snapshot snapshot = null;
             string emptyText = "暂无音频应用";
+            bool timedOut = false;
             try
             {
-                snapshot = await _mixerWorker.ReadAsync().WaitAsync(MixerReadTimeout);
+                snapshot = await worker.ReadAsync().WaitAsync(MixerReadTimeout);
                 if (snapshot == null) emptyText = "当前设备无法读取应用音量";
             }
-            catch (TimeoutException) { emptyText = "读取超时，请刷新应用重试"; }
+            catch (TimeoutException)
+            {
+                emptyText = "读取超时，请刷新应用重试";
+                timedOut = true;
+            }
             if (_disposed || !_mixer.Expanded || request != _mixerRequest) return;
+            if (timedOut && ReferenceEquals(_mixerWorker, worker) && _retiringMixer?.WhenStopped.IsCompleted != false)
+            {
+                // 让下一次重试连接新的 Core Audio 会话，同时至多保留一个仍在退出的工作线程。
+                _retiringMixer = worker;
+                _mixerWorker = null;
+                worker.Dispose();
+            }
             SetMixerContent(snapshot, emptyText);
         }
 
         private void SetMixerContent(AudioMixer.Snapshot snapshot, string emptyText)
         {
+            double offset = _mixer.Content is StackPanel previous && previous.Children.Count > 1
+                && previous.Children[1] is ScrollViewer scroller ? scroller.VerticalOffset : 0;
             var content = new StackPanel { Margin = new Thickness(0, 8 * Ui.Scale, 0, 0) };
             var refresh = PanelControls.GlassButton("刷新应用", UpdateMixer, compact: true);
             refresh.HorizontalAlignment = HorizontalAlignment.Right;
             refresh.Margin = new Thickness(0, 0, 0, 6 * Ui.Scale);
             content.Children.Add(refresh);
             if (snapshot?.Entries.Length > 0)
-                content.Children.Add(BuildMixerEntries(snapshot));
+            {
+                var entries = BuildMixerEntries(snapshot);
+                content.Children.Add(entries);
+                if (offset > 0) entries.ScrollToVerticalOffset(offset);
+            }
             else
                 content.Children.Add(PanelControls.Text(emptyText));
             _mixer.Content = content;
@@ -743,6 +763,7 @@ namespace DesktopBar.UI
 
         private ScrollViewer BuildMixerEntries(AudioMixer.Snapshot snapshot)
         {
+            var worker = _mixerWorker;
             var entries = new StackPanel();
             foreach (var item in snapshot.Entries)
             {
@@ -752,7 +773,7 @@ namespace DesktopBar.UI
                 mute = PanelControls.GlassButton("", () =>
                 {
                     muted = !muted;
-                    _mixerWorker?.SetMute(snapshot.Revision, item.Index, muted);
+                    worker?.SetMute(snapshot.Revision, item.Index, muted);
                     ShowMuteState();
                 }, compact: true);
                 mute.MinWidth = 74 * Ui.Scale;
@@ -779,7 +800,7 @@ namespace DesktopBar.UI
                 var value = PanelControls.Text(item.Volume.ToString("P0"));
                 slider.ValueChanged += (_, args) =>
                 {
-                    _mixerWorker?.SetVolume(snapshot.Revision, item.Index, (float)args.NewValue);
+                    worker?.SetVolume(snapshot.Revision, item.Index, (float)args.NewValue);
                     value.Text = args.NewValue.ToString("P0");
                 };
                 entries.Children.Add(Ui.SliderWithValue(slider, value, 50 * Ui.Scale, panel: true));

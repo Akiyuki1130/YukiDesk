@@ -16,10 +16,14 @@ namespace DesktopBar.Services
 
         private readonly object _gate = new();
         private readonly Dictionary<(int Revision, int Index), Change> _writes = new();
+        private readonly TaskCompletionSource _stopped = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private Refresh _refresh;
+        private TaskCompletionSource<Snapshot> _activeRead;
         private int _revision;
         private long _writeAt;
         private bool _disposed;
+
+        internal Task WhenStopped => _stopped.Task;
 
         internal AudioMixer()
         {
@@ -70,7 +74,7 @@ namespace DesktopBar.Services
 
         private void Run()
         {
-            using var volume = new VolumeService();
+            var volume = new VolumeService();
             VolumeService.ApplicationVolume[] sessions = null;
             int revision = 0;
             try
@@ -93,6 +97,7 @@ namespace DesktopBar.Services
                         }
                         refresh = _refresh;
                         _refresh = null;
+                        _activeRead = refresh?.Completion;
                         writes = _writes.ToArray();
                         _writes.Clear();
                         if (_disposed && writes.Length == 0) return;
@@ -118,10 +123,35 @@ namespace DesktopBar.Services
                     var snapshot = sessions == null ? null : new Snapshot(revision,
                         sessions.Select((item, index) => new Entry(index, item.Name, item.Volume, item.Muted)).ToArray());
                     lock (_gate)
+                    {
                         refresh.Completion.TrySetResult(!_disposed && _revision == revision ? snapshot : null);
+                        _activeRead = null;
+                    }
                 }
             }
-            finally { ReleaseSessions(sessions); }
+            catch (Exception ex)
+            {
+                App.Log("应用混音工作线程结束: " + ex.Message);
+            }
+            finally
+            {
+                try
+                {
+                    try { ReleaseSessions(sessions); }
+                    finally { volume.Dispose(); }
+                }
+                catch (Exception ex) { App.Log("释放应用音量失败: " + ex.Message); }
+                lock (_gate)
+                {
+                    _disposed = true;
+                    _activeRead?.TrySetResult(null);
+                    _activeRead = null;
+                    _refresh?.Completion?.TrySetResult(null);
+                    _refresh = null;
+                    _writes.Clear();
+                }
+                _stopped.TrySetResult();
+            }
         }
 
         private static void ReleaseSessions(VolumeService.ApplicationVolume[] sessions)
@@ -135,6 +165,7 @@ namespace DesktopBar.Services
             lock (_gate)
             {
                 _disposed = true;
+                _activeRead?.TrySetResult(null);
                 _refresh?.Completion?.TrySetResult(null);
                 _refresh = null;
                 Monitor.Pulse(_gate);
