@@ -47,8 +47,10 @@ namespace DesktopBar
             NavigateTo(initialPage ?? "Appearance");
             if (_currentPage == null) ShowPage("Appearance");
             ThemeService.Changed += OnThemeChanged;
-            UpdateService.StatusChanged += RefreshUpdateStatus;
+            UpdateService.StatusChanged += OnUpdateStatusChanged;
             Microsoft.Win32.SystemEvents.UserPreferenceChanged += OnSystemThemeChanged;
+            IsVisibleChanged += (_, _) => UpdatePageActivity();
+            StateChanged += (_, _) => UpdatePageActivity();
             Closing += (s, e) => CommitPendingSliders();
             Closed += (s, e) =>
             {
@@ -56,10 +58,11 @@ namespace DesktopBar
                 RemoveDesktopObservers();
                 EndRevealShortcutCapture();
                 ThemeService.Changed -= OnThemeChanged;
-                UpdateService.StatusChanged -= RefreshUpdateStatus;
+                UpdateService.StatusChanged -= OnUpdateStatusChanged;
                 Microsoft.Win32.SystemEvents.UserPreferenceChanged -= OnSystemThemeChanged;
                 _tempStatusTimer?.Stop();
                 _tempStatusTimer = null;
+                _gpuLoadVersion++;
             };
         }
 
@@ -113,6 +116,7 @@ namespace DesktopBar
             if (animate)
                 next.BeginAnimation(OpacityProperty, new DoubleAnimation(0.64, 1,
                     TimeSpan.FromMilliseconds(130)) { FillBehavior = FillBehavior.Stop });
+            UpdatePageActivity();
         }
 
         private void EnsurePageBuilt(string page)
@@ -1070,6 +1074,8 @@ namespace DesktopBar
         private void BuildModulesPage()
         {
             ModulesHost.Children.Clear();
+            _gpuLoadVersion++;
+            _gpuOptionsPending = _gpuOptionsLoaded = false;
             void SaveVisibility()
             {
                 App.Save();
@@ -1165,8 +1171,6 @@ namespace DesktopBar
                     + "PawnIO 设备仅管理员可访问,因此启用时会创建一个登录时以最高权限静默启动的温度从属任务"
                     + "(隐藏进程,读取后经共享内存交给主程序,主程序退出时自动结束);首次启用只需一次管理员授权。"
                     + "未启用时显示 CPU 封装内 SoC 温度(满载时比 Tctl 略低)。"));
-                System.Threading.Tasks.Task.Run(ProbeSlaveTask);
-                EnsureTempStatusTimer();
                 RefreshNativeTempStatus();
             }
 
@@ -1175,12 +1179,11 @@ namespace DesktopBar
             ModulesHost.Children.Add(card);
             ModulesHost.Children.Add(BuildPresetsCard());
             ModulesHost.Children.Add(BuildAppSceneCard());
-
-            if (S.ShowMonitorGpu) LoadGpuOptions();
         }
 
         private ComboBox _gpuCombo;
         private bool _updatingGpuCombo;
+        private bool _gpuOptionsPending, _gpuOptionsLoaded;
         private int _gpuLoadVersion;
         private TextBlock _nativeTempStatus;
         private Button _nativeTempButton;
@@ -1215,30 +1218,45 @@ namespace DesktopBar
 
         private static bool TemperatureSlaveFresh() => DesktopBar.Services.TemperatureSlave.IsFresh;
 
+        private bool IsPagePresented(string page) =>
+            _currentPage == page && IsVisible && WindowState != WindowState.Minimized;
+
+        private void UpdatePageActivity()
+        {
+            OnUpdateStatusChanged();
+            if (!IsPagePresented("Modules"))
+            {
+                _tempStatusTimer?.Stop();
+                return;
+            }
+            if (S.ShowMonitorGpu && !_gpuOptionsLoaded) LoadGpuOptions();
+            if (_nativeTempStatus == null || _tempStatusTimer?.IsEnabled == true) return;
+            if (_tempStatusTimer == null)
+            {
+                _tempStatusTimer = new DispatcherTimer(DispatcherPriority.Background) { Interval = TimeSpan.FromSeconds(2) };
+                _tempStatusTimer.Tick += (_, _) => PollNativeTemperature();
+            }
+            PollNativeTemperature();
+            _tempStatusTimer.Start();
+        }
+
         /// <summary>
         /// 周期刷新温度状态:状态行只在构建时评估一次会永远停留旧值;
         /// 每 2 秒刷新一次(共享内存检测很轻),每 15 秒才真正查一次 schtasks(进程启动较重)。
         /// </summary>
-        private void EnsureTempStatusTimer()
+        private void PollNativeTemperature()
         {
-            if (_tempStatusTimer != null) return;
-            _tempStatusTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2) };
-            _tempStatusTimer.Tick += (s, e) =>
+            if (_pawnInstalling) return;
+            long now = Environment.TickCount64;
+            if (now - _lastTaskProbeTick > 15000)
             {
-                if (_pawnInstalling || _nativeTempStatus == null) return;
-                long now = Environment.TickCount64;
-                if (now - _lastTaskProbeTick > 15000)
-                {
-                    _lastTaskProbeTick = now;
-                    System.Threading.Tasks.Task.Run(ProbeSlaveTask);
-                    // 任务存在但从属没有数据时,主动 /Run 拉起一次(任务是本用户创建的,可直接运行)。
-                    if (_lastTaskExists && _lastTaskPathOk && !DesktopBar.Services.TemperatureSlave.IsFresh
-                        && !DesktopBar.Services.PawnIoTctl.IsAvailable)
-                        System.Threading.Tasks.Task.Run(RunSlaveTaskOnce);
-                }
-                RefreshNativeTempStatus();
-            };
-            _tempStatusTimer.Start();
+                _lastTaskProbeTick = now;
+                System.Threading.Tasks.Task.Run(ProbeSlaveTask);
+                // 任务存在但从属没有数据时，主动拉起一次。
+                if (_lastTaskExists && _lastTaskPathOk && !TemperatureSlaveFresh() && !PawnIoTctl.IsAvailable)
+                    System.Threading.Tasks.Task.Run(RunSlaveTaskOnce);
+            }
+            RefreshNativeTempStatus();
         }
 
         internal static (bool exists, bool pathOk) QuerySlaveTask()
@@ -1430,6 +1448,8 @@ namespace DesktopBar
 
         private async void LoadGpuOptions()
         {
+            if (_gpuOptionsPending) return;
+            _gpuOptionsPending = true;
             int version = ++_gpuLoadVersion;
             try
             {
@@ -1442,13 +1462,17 @@ namespace DesktopBar
                     if (string.Equals(gpus[i].Luid, S.MonitorGpuLuid, StringComparison.OrdinalIgnoreCase))
                     { selected = i; break; }
                 _gpuCombo.SelectedIndex = selected >= 0 ? selected : (gpus.Count > 0 ? 0 : -1);
-                _updatingGpuCombo = false;
-                if (gpus.Count == 0)
-                    _gpuCombo.IsEnabled = false;
+                _gpuOptionsLoaded = true;
+                _gpuCombo.IsEnabled = S.ShowMonitorGpu && gpus.Count > 0;
             }
             catch (Exception ex)
             {
                 App.Log("加载显卡列表失败: " + ex.Message);
+            }
+            finally
+            {
+                if (version == _gpuLoadVersion)
+                    _gpuOptionsPending = _updatingGpuCombo = false;
             }
         }
 
@@ -1754,6 +1778,11 @@ namespace DesktopBar
             System.Windows.Automation.AutomationProperties.SetName(button, $"{role} {login}，打开 GitHub 主页");
             button.Click += (_, _) => NativeMethods.ShellExecuteOpen(profile);
             return button;
+        }
+
+        private void OnUpdateStatusChanged()
+        {
+            if (IsPagePresented("About")) RefreshUpdateStatus();
         }
 
         private void RefreshUpdateStatus()
