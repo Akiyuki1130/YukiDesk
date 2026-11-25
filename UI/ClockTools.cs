@@ -32,8 +32,15 @@ namespace DesktopBar.UI
 
         private static long RemainingMs => _pausedRemaining > 0 ? _pausedRemaining : Math.Max(0, _timerDeadline - Environment.TickCount64);
         private static bool HasCountdown => _timerDeadline != 0 || _pausedRemaining > 0;
-        internal static bool CountdownRunning => _timerDeadline != 0;
         internal static string CapsuleCountdown => HasCountdown ? FormatRemaining(RemainingMs) : _finished ? "计时到点" : null;
+        internal static int UntilCountdownUpdate
+        {
+            get
+            {
+                long remaining = RemainingMs;
+                return _timerDeadline != 0 && remaining > 0 ? (int)((remaining - 1) % 1000) + 1 : int.MaxValue;
+            }
+        }
 
         internal ClockTools()
         {
@@ -243,16 +250,35 @@ namespace DesktopBar.UI
             if (Prompt.ShowCountdown() is not TimeSpan duration) return;
             StopCountdown();
             _timerDeadline = Environment.TickCount64 + (long)duration.TotalMilliseconds;
-            _countdown ??= new DispatcherTimer(TimeSpan.FromMilliseconds(250), DispatcherPriority.Background, (_, _) =>
-            {
-                if (_timerDeadline == 0 || Environment.TickCount64 < _timerDeadline) return;
-                StopCountdown();
-                _finished = true;
-                App.NotifyTimerDone();
-                CountdownChanged?.Invoke();
-            }, Dispatcher);
-            _countdown.Start();
+            ArmCountdown();
             RefreshCountdown();
+        }
+
+        private static void ArmCountdown()
+        {
+            if (_countdown == null)
+            {
+                _countdown = new DispatcherTimer(DispatcherPriority.Background);
+                _countdown.Tick += OnCountdownDeadline;
+            }
+            _countdown.Stop();
+            _countdown.Interval = TimeSpan.FromMilliseconds(Math.Max(1, RemainingMs));
+            _countdown.Start();
+        }
+
+        private static void OnCountdownDeadline(object sender, EventArgs e)
+        {
+            _countdown.Stop();
+            if (_timerDeadline == 0) return;
+            if (RemainingMs > 0)
+            {
+                ArmCountdown();
+                return;
+            }
+            StopCountdown();
+            _finished = true;
+            App.NotifyTimerDone();
+            CountdownChanged?.Invoke();
         }
 
         private void StopTimer() { StopCountdown(); RefreshCountdown(); }
@@ -263,7 +289,7 @@ namespace DesktopBar.UI
             {
                 _timerDeadline = Environment.TickCount64 + _pausedRemaining;
                 _pausedRemaining = 0;
-                _countdown?.Start();
+                ArmCountdown();
             }
             else if (_timerDeadline != 0 && RemainingMs > 0)
             {
@@ -277,7 +303,11 @@ namespace DesktopBar.UI
         private void ExtendTimer()
         {
             if (_pausedRemaining > 0) _pausedRemaining = Math.Min(720 * 60000L, _pausedRemaining + 60000);
-            else if (_timerDeadline != 0) _timerDeadline = Environment.TickCount64 + Math.Min(720 * 60000L, RemainingMs + 60000);
+            else if (_timerDeadline != 0)
+            {
+                _timerDeadline = Environment.TickCount64 + Math.Min(720 * 60000L, RemainingMs + 60000);
+                ArmCountdown();
+            }
             RefreshCountdown();
         }
 

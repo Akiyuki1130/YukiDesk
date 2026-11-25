@@ -186,8 +186,9 @@ namespace DesktopBar.UI
             var now = DateTime.Now;
             bool showSeconds = App.Settings.ShowSeconds;
             bool showDetails = Open || HasVisiblePanel;
-            int delay = ClockTools.CountdownRunning ? 250 : showSeconds || showDetails ? 1000 - now.Millisecond
+            int clockDelay = showSeconds || showDetails ? 1000 - now.Millisecond
                 : 60_000 - (now.Second * 1000 + now.Millisecond);
+            int delay = Math.Min(clockDelay, ClockTools.UntilCountdownUpdate);
             _timer.Interval = TimeSpan.FromMilliseconds(Math.Max(20, delay));
             string pill = now.ToString(showSeconds ? "HH:mm:ss" : "HH:mm");
             if (App.Settings.ShowDate) pill += "  " + now.ToString("M月d日");
