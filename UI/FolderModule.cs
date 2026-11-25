@@ -119,6 +119,7 @@ namespace DesktopBar.UI
 
         protected override void OnPanelHidden()
         {
+            _textFilterDelay?.Stop();
             _filterRequest?.Cancel();
             ClearSelection();
             CancelPreview();
@@ -278,7 +279,8 @@ namespace DesktopBar.UI
             int revision = _viewRevision;
             bool CanApply() => !_disposed && Open && !FileDropInteractionActive
                 && ReferenceEquals(_files, files) && revision == _viewRevision;
-            if (files == null || !CanApply() || (ReferenceEquals(_displayedFiles, files) && _displayedRevision == revision)
+            if (files == null || _textFilterDelay?.IsEnabled == true || !CanApply()
+                || (ReferenceEquals(_displayedFiles, files) && _displayedRevision == revision)
                 || (ReferenceEquals(_preparingFiles, files) && _preparingRevision == revision
                     && _filterRequest is { IsCancellationRequested: false })) return;
 
@@ -494,6 +496,7 @@ namespace DesktopBar.UI
         {
             _disposed = true;
             _filterRequest?.Cancel();
+            _textFilterDelay?.Stop();
             _debounce.Stop();
             _watcher?.Dispose();
             base.Dispose();

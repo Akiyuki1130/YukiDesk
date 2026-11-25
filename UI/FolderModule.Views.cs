@@ -10,6 +10,7 @@ using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
 using System.Windows.Media.Imaging;
+using System.Windows.Threading;
 using DesktopBar.Interop;
 using DesktopBar.Models;
 using DesktopBar.Services;
@@ -19,6 +20,7 @@ namespace DesktopBar.UI
     public partial class FolderModule
     {
         private TextBox _filter;
+        private DispatcherTimer _textFilterDelay;
         private Button _sortButton, _viewButton;
         private TextBlock _folderStatus;
         private StackPanel _folderBrowser;
@@ -82,14 +84,24 @@ namespace DesktopBar.UI
             _filter.SetResourceReference(TextBox.CaretBrushProperty, "ThemePanelText");
             System.Windows.Automation.AutomationProperties.SetName(_filter, "筛选文件名");
             _filter.PreviewMouseLeftButtonDown += (_, _) => EnterPanelKeyboardMode(_filter);
-            _filter.TextChanged += (_, _) => { _visibleLimit = 144; RefreshView(); };
-            _filter.PreviewKeyDown += (_, e) =>
+            _filter.TextChanged += (_, _) => OnTextFilterChanged();
+            _filter.PreviewKeyDown += async (_, e) =>
             {
-                if (e.Key == Key.Enter && !e.Handled && _displayedRevision == _viewRevision
-                    && _matchedFiles.FirstOrDefault() is FileSystemInfo first)
+                if (e.Key == Key.Enter && !e.Handled)
                 {
-                    OpenInside(first);
-                    e.Handled = true;
+                    if (_textFilterDelay?.IsEnabled == true)
+                    {
+                        _textFilterDelay.Stop();
+                        e.Handled = true;
+                        int revision = _viewRevision;
+                        await ShowFilesAsync();
+                        if (revision != _viewRevision || !_filter.IsKeyboardFocusWithin) return;
+                    }
+                    if (Open && _displayedRevision == _viewRevision && _matchedFiles.FirstOrDefault() is FileSystemInfo first)
+                    {
+                        OpenInside(first);
+                        e.Handled = true;
+                    }
                 }
                 else if (e.Key == Key.Down && _matchedFiles.Length > 0)
                 {
@@ -274,8 +286,36 @@ namespace DesktopBar.UI
 
         private void RefreshView()
         {
+            _textFilterDelay?.Stop();
             _viewRevision++;
             _ = ShowFilesAsync();
+        }
+
+        private void OnTextFilterChanged()
+        {
+            _visibleLimit = 144;
+            if (!Open || _files is not { Length: > 512 })
+            {
+                RefreshView();
+                return;
+            }
+
+            _viewRevision++;
+            _filterRequest?.Cancel();
+            if (_textFilterDelay == null)
+            {
+                _textFilterDelay = new DispatcherTimer(DispatcherPriority.Background, Dispatcher)
+                {
+                    Interval = TimeSpan.FromMilliseconds(45)
+                };
+                _textFilterDelay.Tick += (_, _) =>
+                {
+                    _textFilterDelay.Stop();
+                    _ = ShowFilesAsync();
+                };
+            }
+            _textFilterDelay.Stop();
+            _textFilterDelay.Start();
         }
 
         private void ShowFolderStatus(int count)
