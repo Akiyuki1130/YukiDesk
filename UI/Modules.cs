@@ -1050,6 +1050,7 @@ namespace DesktopBar.UI
         private string _lastPillText;
         private bool _active;
         private bool _sampleSubscribed;
+        private int _sampleUpdateQueued;
         private bool _disposed;
 
         public PerfModule(PerfMetric metric, TabStyle st) : base(st)
@@ -1401,17 +1402,19 @@ namespace DesktopBar.UI
 
         private void OnSample(PerfSample _)
         {
-            if (_disposed) return;
+            if (_disposed || Dispatcher.HasShutdownStarted
+                || Interlocked.Exchange(ref _sampleUpdateQueued, 1) != 0) return;
             try
             {
-                Dispatcher.BeginInvoke(new Action(() =>
+                Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() =>
                 {
+                    Interlocked.Exchange(ref _sampleUpdateQueued, 0);
                     if (_disposed) return;
                     if (_active && PerfService.Instance.LatestForConfiguration is { } current) Apply(current);
                     QueuePanelPreload();
                 }));
             }
-            catch (InvalidOperationException) { }
+            catch (InvalidOperationException) { Interlocked.Exchange(ref _sampleUpdateQueued, 0); }
         }
 
         private void Apply(PerfSample sample, bool preload = false)
@@ -1420,40 +1423,45 @@ namespace DesktopBar.UI
             switch (_metric)
             {
                 case PerfMetric.Summary:
-                    var first = EnabledMetrics().FirstOrDefault();
+                    var metrics = EnabledMetrics();
+                    var first = metrics.FirstOrDefault();
                     SetPillText(MetricName(first) + " " + FormatMetric(first));
-                    foreach (var metric in EnabledMetrics()) UpdateRow(MetricName(metric), FormatMetric(metric));
+                    if (refreshPanel)
+                        foreach (var metric in metrics) SetRow(MetricName(metric), FormatMetric(metric));
                     break;
                 case PerfMetric.Cpu:
-                    SetPillText(FmtPercent(sample.CpuPercent));
-                    UpdateRow("占用", FmtPercent(sample.CpuPercent));
-                    UpdateRow("温度", FmtTemp(sample.CpuTempC));
-                    UpdateRow("频率", FmtFreq(sample.CpuFreqMhz));
+                    string cpuUsage = FmtPercent(sample.CpuPercent);
+                    SetPillText(cpuUsage);
+                    if (refreshPanel)
+                    {
+                        SetRow("占用", cpuUsage);
+                        SetRow("温度", FmtTemp(sample.CpuTempC));
+                        SetRow("频率", FmtFreq(sample.CpuFreqMhz));
+                    }
                     break;
                 case PerfMetric.Gpu:
                     var gpu = PickGpu(sample.Gpus);
-                    SetPillText(gpu == null ? "--" : FmtPercent(gpu.UtilPercent));
-                    UpdateRow("型号", gpu == null ? "--" : gpu.Name);
-                    UpdateRow("占用", gpu == null ? "--" : FmtPercent(gpu.UtilPercent));
-                    UpdateRow("温度", FmtTemp(gpu == null ? -1 : gpu.TempC));
-                    UpdateRow("频率", FmtFreq(gpu == null ? -1 : gpu.ClockMhz));
+                    string gpuUsage = gpu == null ? "--" : FmtPercent(gpu.UtilPercent);
+                    SetPillText(gpuUsage);
+                    if (refreshPanel)
+                    {
+                        SetRow("型号", gpu?.Name ?? "--");
+                        SetRow("占用", gpuUsage);
+                        SetRow("温度", FmtTemp(gpu?.TempC ?? -1));
+                        SetRow("频率", FmtFreq(gpu?.ClockMhz ?? -1));
+                    }
                     break;
                 case PerfMetric.Memory:
-                    if (sample.MemTotalBytes <= 0)
+                    bool hasMemory = sample.MemTotalBytes > 0;
+                    string memoryUsage = hasMemory ? FmtPercent(100.0 * sample.MemUsedBytes / sample.MemTotalBytes) : "--";
+                    SetPillText(memoryUsage);
+                    if (refreshPanel)
                     {
-                        SetPillText("--");
+                        SetRow("占用", memoryUsage);
+                        SetRow("已用", hasMemory ? FmtGb(sample.MemUsedBytes) + " GB" : "--");
+                        SetRow("容量", hasMemory ? FmtGb(sample.MemTotalBytes) + " GB" : "--");
+                        SetRow("频率", sample.MemSpeedMts > 0 ? Math.Round(sample.MemSpeedMts) + " MT/s" : "--");
                     }
-                    else
-                    {
-                        double percent = 100.0 * sample.MemUsedBytes / sample.MemTotalBytes;
-                        SetPillText(FmtPercent(percent));
-                    }
-                    UpdateRow("占用", sample.MemTotalBytes <= 0
-                        ? "--"
-                        : FmtPercent(100.0 * sample.MemUsedBytes / sample.MemTotalBytes));
-                    UpdateRow("已用", sample.MemTotalBytes <= 0 ? "--" : FmtGb(sample.MemUsedBytes) + " GB");
-                    UpdateRow("容量", sample.MemTotalBytes <= 0 ? "--" : FmtGb(sample.MemTotalBytes) + " GB");
-                    UpdateRow("频率", sample.MemSpeedMts > 0 ? Math.Round(sample.MemSpeedMts) + " MT/s" : "--");
                     break;
                 default:
                     if (!IsValidRate(sample.NetUpBps) && !IsValidRate(sample.NetDownBps))
@@ -1465,8 +1473,11 @@ namespace DesktopBar.UI
                         SetPillText("↓" + FormatNetworkRate(sample.NetDownBps, compact: true)
                             + " ↑" + FormatNetworkRate(sample.NetUpBps, compact: true));
                     }
-                    UpdateRow("下行", FormatNetworkRate(sample.NetDownBps, compact: false));
-                    UpdateRow("上行", FormatNetworkRate(sample.NetUpBps, compact: false));
+                    if (refreshPanel)
+                    {
+                        SetRow("下行", FormatNetworkRate(sample.NetDownBps, compact: false));
+                        SetRow("上行", FormatNetworkRate(sample.NetUpBps, compact: false));
+                    }
                     break;
             }
             if (refreshPanel && !ReferenceEquals(_panelSample, sample))
@@ -1474,7 +1485,6 @@ namespace DesktopBar.UI
                 _panelSample = sample;
                 RefreshTrend();
             }
-            void UpdateRow(string label, string text) { if (refreshPanel) SetRow(label, text); }
             string FormatMetric(PerfMetric metric) => metric == PerfMetric.Network
                 ? FormatNetworkRate(sample.NetDownBps, compact: true) : FmtPercent(MetricValue(sample, metric));
         }
