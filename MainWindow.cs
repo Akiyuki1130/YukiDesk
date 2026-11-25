@@ -31,7 +31,8 @@ namespace DesktopBar
         private readonly List<ModuleBase> _folderModules = new List<ModuleBase>();
         private readonly DispatcherTimer _pinTimer;
         private readonly DispatcherTimer _moduleDemandTimer;
-        private readonly Dictionary<ModuleBase, int> _coveredDemand = new();
+        private const long CoveredModuleGraceMs = 4500;
+        private readonly Dictionary<ModuleBase, long> _coveredSince = new();
         private readonly BarRevealController _reveal;
         private readonly DispatcherTimer _folderRefresh;
         private FileSystemWatcher _folderRootWatcher;
@@ -191,6 +192,7 @@ namespace DesktopBar
         {
             if (_closing || _barLayout == null) return;
             var hwnd = new WindowInteropHelper(this).Handle;
+            long now = Environment.TickCount64;
             foreach (var module in _modules)
             {
                 if (module is not (PerfModule or SpectrumModule)) continue;
@@ -203,14 +205,27 @@ namespace DesktopBar
                     {
                         var center = pill.PointToScreen(new Point(pill.ActualWidth / 2, pill.ActualHeight / 2));
                         bool covered = !_reveal.IsRaised && NativeMethods.IsCoveredByApplication(hwnd, (int)center.X, (int)center.Y);
-                        int frames = covered ? Math.Min(2, _coveredDemand.GetValueOrDefault(module) + 1) : 0;
-                        _coveredDemand[module] = frames;
-                        active = frames < 2;
+                        active = StaysActiveWhileCovered(module, covered, now);
                     }
+                    else _coveredSince.Remove(module);
                 }
+                else _coveredSince.Remove(module);
                 if (module is PerfModule perf) perf.SetPresentationDemand(active);
                 else ((SpectrumModule)module).SetPresentationDemand(active);
             }
+        }
+
+        private bool StaysActiveWhileCovered(ModuleBase module, bool covered, long now)
+        {
+            if (!covered)
+            {
+                _coveredSince.Remove(module);
+                return true;
+            }
+
+            // 多次布局或唤出回调可能挤在同一帧，用实际遮挡时长避免反复创建采样线程。
+            if (!_coveredSince.TryGetValue(module, out long since)) _coveredSince[module] = since = now;
+            return now - since < CoveredModuleGraceMs;
         }
         internal void SetEdgeReveal(bool enabled) => _reveal.SetEdgeEnabled(enabled);
         internal bool TrySetRevealHotkey(bool enabled, BarHotkey shortcut) => _reveal.TrySetHotkey(enabled, shortcut);
@@ -595,7 +610,7 @@ namespace DesktopBar
             foreach (var module in _modules)
                 module.Dispose();
             _modules.Clear();
-            _coveredDemand.Clear();
+            _coveredSince.Clear();
             _folderModules.Clear();
             _staticEntries.Clear();
             _folderEntries.Clear();
