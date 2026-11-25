@@ -78,7 +78,7 @@ namespace DesktopBar.UI
                     MaxWidth = 250 * s,
                     TextTrimming = TextTrimming.CharacterEllipsis,
                     HorizontalAlignment = HorizontalAlignment.Stretch,
-                    ToolTip = value,
+                    ToolTip = new TextBlock { Text = value, MaxWidth = 280 * s, TextWrapping = TextWrapping.Wrap },
                     Margin = new Thickness(8 * s, (sp.Children.Count == 0 ? 2 : 10) * s, 8 * s, 2 * s)
                 };
                 captionText.SetResourceReference(TextBlock.ForegroundProperty, "ThemePanelText");

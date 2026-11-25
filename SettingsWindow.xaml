@@ -155,7 +155,7 @@
 
             <Grid Grid.Row="1">
                 <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="200"/>
+                    <ColumnDefinition x:Name="NavigationColumn" Width="200"/>
                     <ColumnDefinition Width="*"/>
                 </Grid.ColumnDefinitions>
 
@@ -184,6 +184,8 @@
                                         VerticalAlignment="Center" Visibility="Collapsed"/>
                         </Grid>
                         <Grid Grid.Row="1" Margin="14,0,14,11">
+                            <ScrollViewer x:Name="NavigationScroll" VerticalScrollBarVisibility="Auto"
+                                          HorizontalScrollBarVisibility="Disabled" Focusable="False">
                             <StackPanel x:Name="NavigationItems" VerticalAlignment="Top">
                                 <RadioButton Style="{StaticResource NavRadio}" GroupName="SettingsPages" IsChecked="True"
                                              AutomationProperties.Name="外观" Checked="Nav_Checked" Tag="Appearance">
@@ -228,6 +230,7 @@
                                     </StackPanel>
                                 </RadioButton>
                             </StackPanel>
+                            </ScrollViewer>
                             <ListBox x:Name="SettingsSearchResults" Style="{StaticResource DarkList}"
                                      ScrollViewer.HorizontalScrollBarVisibility="Disabled"
                                      ScrollViewer.VerticalScrollBarVisibility="Auto" AutomationProperties.Name="设置搜索结果"
@@ -235,6 +238,12 @@
                                 <ListBox.ItemTemplate>
                                     <DataTemplate>
                                         <StackPanel>
+                                            <StackPanel.ToolTip>
+                                                <StackPanel MaxWidth="280">
+                                                    <TextBlock Text="{Binding Label, Mode=OneTime}" FontWeight="SemiBold" TextWrapping="Wrap"/>
+                                                    <TextBlock Text="{Binding Context, Mode=OneTime}" Margin="0,3,0,0" TextWrapping="Wrap"/>
+                                                </StackPanel>
+                                            </StackPanel.ToolTip>
                                             <TextBlock Text="{Binding Label, Mode=OneTime}" TextTrimming="CharacterEllipsis"
                                                        Foreground="{DynamicResource SettingsTextBrush}"/>
                                             <TextBlock Text="{Binding Context, Mode=OneTime}" FontSize="11.5" Margin="0,3,0,0" TextTrimming="CharacterEllipsis"

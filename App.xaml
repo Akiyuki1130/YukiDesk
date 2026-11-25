@@ -56,10 +56,9 @@
             <Setter Property="Margin" Value="0,0,0,20"/>
         </Style>
 
-        <!-- 悬浮提示:WPF 默认那套方角浅色框太出戏,统一成深色圆角玻璃感。
-             故意不加 x:Key:隐式样式对全应用(顶栏面板、设置窗口、对话框)生效。 -->
+        <!-- 统一悬浮提示的圆角，并在设置窗口继承当前主题。 -->
         <Style TargetType="ToolTip">
-            <Setter Property="Foreground" Value="#F2F2F6"/>
+            <Setter Property="Foreground" Value="{DynamicResource SettingsTextBrush}"/>
             <Setter Property="FontFamily" Value="{x:Static ui:Ui.TextFont}"/>
             <Setter Property="FontSize" Value="13"/>
             <Setter Property="TextOptions.TextFormattingMode" Value="Display"/>
@@ -69,8 +68,9 @@
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="ToolTip">
-                        <Border Background="#F01B1C22" BorderBrush="#33FFFFFF" BorderThickness="1"
-                                CornerRadius="7" Padding="{TemplateBinding Padding}">
+                        <Border Background="{DynamicResource SettingsPopupBackground}"
+                                BorderBrush="{DynamicResource SettingsControlBorder}" BorderThickness="1"
+                                CornerRadius="9" Padding="{TemplateBinding Padding}">
                             <ContentPresenter TextElement.Foreground="{TemplateBinding Foreground}"
                                               TextElement.FontSize="{TemplateBinding FontSize}"/>
                         </Border>

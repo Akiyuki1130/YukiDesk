@@ -37,6 +37,11 @@ namespace DesktopBar
         internal SettingsWindow(string initialPage)
         {
             InitializeComponent();
+            FitStartupSize(SystemParameters.WorkArea);
+            SizeChanged += (_, args) =>
+            {
+                if (args.WidthChanged) UpdateNavigationWidth(args.NewSize.Width);
+            };
             // 先应用主题再创建动态控件，避免控件捕获初始化阶段的低对比度画刷。
             ApplyWindowTheme();
             TitleIconHost.Content = Ui.SnowflakeGlyph(18, "SettingsSubTextBrush");
@@ -65,6 +70,21 @@ namespace DesktopBar
                 _gpuLoadVersion++;
             };
         }
+
+        private void FitStartupSize(Rect workArea)
+        {
+            if (workArea.Width <= 0 || workArea.Height <= 0) return;
+            double width = workArea.Width - Math.Min(24, workArea.Width * .05);
+            double height = workArea.Height - Math.Min(24, workArea.Height * .05);
+            MinWidth = Math.Min(MinWidth, width);
+            MinHeight = Math.Min(MinHeight, height);
+            Width = Math.Min(Width, width);
+            Height = Math.Min(Height, height);
+            UpdateNavigationWidth(Width);
+        }
+
+        private void UpdateNavigationWidth(double windowWidth)
+            => NavigationColumn.Width = new GridLength(windowWidth < 710 ? 154 : 200);
 
         private void CommitPendingSliders()
         {
@@ -140,7 +160,12 @@ namespace DesktopBar
             SettingsSearchBox.Clear();
             var entry = NavigationItems.Children.OfType<RadioButton>()
                 .FirstOrDefault(button => (string)button.Tag == page);
-            if (entry != null) entry.IsChecked = true;
+            if (entry == null) return;
+            entry.IsChecked = true;
+            Dispatcher.BeginInvoke(DispatcherPriority.Loaded, new Action(() =>
+            {
+                if (_currentPage == page && entry.IsVisible) entry.BringIntoView();
+            }));
         }
 
         internal (string Page, double Offset) LocationInSettings => (_currentPage, FindPage(_currentPage)?.VerticalOffset ?? 0);
@@ -318,8 +343,10 @@ namespace DesktopBar
 
         private FrameworkElement Row(string label, FrameworkElement control, string aliases = null)
         {
+            const double labelWidth = 146;
             var g = new Grid { Margin = new Thickness(0, 10, 0, 0), MinHeight = 32 };
-            g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(146) });
+            var labelColumn = new ColumnDefinition { Width = new GridLength(labelWidth) };
+            g.ColumnDefinitions.Add(labelColumn);
             g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             var l = new TextBlock
             {
@@ -337,6 +364,22 @@ namespace DesktopBar
             Grid.SetColumn(control, 1);
             g.Children.Add(l);
             g.Children.Add(control);
+            if (control is not ToggleButton)
+                g.SizeChanged += (_, args) =>
+                {
+                    if (!args.WidthChanged) return;
+                    bool compact = args.NewSize.Width < 352;
+                    if (compact == (Grid.GetRow(control) == 1)) return;
+                    if (compact && g.RowDefinitions.Count == 0)
+                    {
+                        g.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+                        g.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+                    }
+                    labelColumn.Width = new GridLength(compact ? 0 : labelWidth);
+                    l.Margin = compact ? new Thickness(0, 0, 0, 5) : new Thickness(0, 0, 15, 0);
+                    Grid.SetColumn(l, compact ? 1 : 0);
+                    Grid.SetRow(control, compact ? 1 : 0);
+                };
             g.SetValue(SearchLabelProperty, label);
             if (aliases != null) g.SetValue(SearchAliasesProperty, aliases);
             return g;

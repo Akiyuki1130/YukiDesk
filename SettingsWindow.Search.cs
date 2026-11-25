@@ -55,7 +55,7 @@ namespace DesktopBar
             bool searching = query.Length != 0;
             SearchPlaceholder.Visibility = SettingsSearchBox.Text.Length == 0 ? Visibility.Visible : Visibility.Collapsed;
             ClearSettingsSearch.Visibility = SettingsSearchBox.Text.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
-            NavigationItems.Visibility = searching ? Visibility.Collapsed : Visibility.Visible;
+            NavigationScroll.Visibility = searching ? Visibility.Collapsed : Visibility.Visible;
             SettingsSearchResults.Visibility = searching ? Visibility.Visible : Visibility.Collapsed;
             var hits = searching ? FindSettings(query) : Array.Empty<SearchHit>();
             SettingsSearchResults.ItemsSource = hits;
