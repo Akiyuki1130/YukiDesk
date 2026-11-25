@@ -1,5 +1,6 @@
 using System;
 using System.Drawing;
+using System.Drawing.Imaging;
 using System.IO;
 using System.Runtime.InteropServices;
 using Microsoft.Win32;
@@ -121,27 +122,67 @@ namespace DesktopBar.Services
                 int red = (int)(state.Background & 255);
                 int green = (int)((state.Background >> 8) & 255);
                 int blue = (int)((state.Background >> 16) & 255);
+                var output = MemoryMarshal.Cast<byte, uint>(pixels.AsSpan());
+                output.Fill(0xff000000u | (uint)(red << 16 | green << 8 | blue));
+                if (wallpaper == null) return pixels;
                 int offsetX = x - state.Canvas.Left;
                 int offsetY = y - state.Canvas.Top;
-                for (int row = 0; row < height; row++)
+                int ww = wallpaper.Width, wh = wallpaper.Height;
+                int cw = state.Canvas.Width, ch = state.Canvas.Height;
+                bool Map(double sx, double sy, out double wx, out double wy) =>
+                    MicaService.MapWallpaper(state.Style, state.Style == 0, state.OriginX, state.OriginY,
+                        cw, ch, ww, wh, sx, sy, out wx, out wy);
+                // 两轴映射独立，每列只算一次横坐标，每行只算一次纵坐标。
+                var xPositions = new int[width];
                 for (int column = 0; column < width; column++)
+                    xPositions[column] = Map(offsetX + column * 2 + 0.5, ch * .5, out var wx, out _) ? (int)wx : -1;
+                var locked = TryLock(wallpaper, ww, wh);
+                try
                 {
-                    var pixel = wallpaper != null && MicaService.MapWallpaper(state.Style, state.Style == 0, state.OriginX, state.OriginY,
-                        state.Canvas.Width, state.Canvas.Height, wallpaper.Width, wallpaper.Height,
-                        offsetX + column * 2 + 0.5, offsetY + row * 2 + 0.5, out var wx, out var wy)
-                        ? wallpaper.GetPixel((int)wx, (int)wy) : Color.Transparent;
-                    int i = (row * width + column) * 4;
-                    pixels[i] = (byte)((blue * (255 - pixel.A) + pixel.B * pixel.A) / 255);
-                    pixels[i + 1] = (byte)((green * (255 - pixel.A) + pixel.G * pixel.A) / 255);
-                    pixels[i + 2] = (byte)((red * (255 - pixel.A) + pixel.R * pixel.A) / 255);
-                    pixels[i + 3] = 255;
+                    var rowBytes = locked == null ? null : new byte[ww * 4];
+                    var rowPixels = MemoryMarshal.Cast<byte, uint>(rowBytes.AsSpan());
+                    int copiedAt = -1;
+                    for (int row = 0; row < height; row++)
+                    {
+                        if (!Map(cw * .5, offsetY + row * 2 + 0.5, out _, out var wy)) continue;
+                        int sy = (int)wy;
+                        if (locked != null && sy != copiedAt)
+                        {
+                            Marshal.Copy(locked.Scan0 + sy * locked.Stride, rowBytes, 0, rowBytes.Length);
+                            copiedAt = sy;
+                        }
+                        int dest = row * width;
+                        for (int column = 0; column < width; column++)
+                        {
+                            int sx = xPositions[column];
+                            if (sx < 0) continue;
+                            uint pixel = locked == null ? unchecked((uint)wallpaper.GetPixel(sx, sy).ToArgb()) : rowPixels[sx];
+                            int alpha = (int)(pixel >> 24);
+                            if (alpha == 255) output[dest + column] = pixel;
+                            else if (alpha != 0)
+                            {
+                                int inverse = 255 - alpha;
+                                int b = (blue * inverse + (int)(pixel & 255) * alpha) / 255;
+                                int g = (green * inverse + (int)((pixel >> 8) & 255) * alpha) / 255;
+                                int r = (red * inverse + (int)((pixel >> 16) & 255) * alpha) / 255;
+                                output[dest + column] = 0xff000000u | (uint)(r << 16 | g << 8 | b);
+                            }
+                        }
+                    }
                 }
+                finally { if (locked != null) wallpaper.UnlockBits(locked); }
                 return pixels;
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ExternalException or ArgumentException)
             {
                 return null;
             }
+        }
+
+        private static BitmapData TryLock(Bitmap wallpaper, int width, int height)
+        {
+            try { return wallpaper.LockBits(new Rectangle(0, 0, width, height), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb); }
+            catch (Exception ex) when (ex is ExternalException or ArgumentException) { return null; }
         }
 
         internal static double? SampleTop(Snapshot state, double barHeight)

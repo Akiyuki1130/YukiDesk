@@ -445,6 +445,7 @@ namespace DesktopBar.Services
             double bleed = Math.Ceiling(blurPhys) + 8;
             int bw = (int)Math.Ceiling(physW);
             int bh = (int)Math.Ceiling(barPhysH) + (int)bleed * 2;
+            int physH = NativeMethods.ScreenHeight();
             if (bw < 8 || bh < 8) return null;
 
             // ---- 4. 采样壁纸 → 顶条缓冲 ----
@@ -457,7 +458,7 @@ namespace DesktopBar.Services
                 int row = by * bw * 4;
                 for (int bx = 0; bx < bw; bx++)
                 {
-                    if (!MapWallpaper(style, tile, ox, oy, physW, NativeMethods.ScreenHeight(),
+                    if (!MapWallpaper(style, tile, ox, oy, physW, physH,
                             ww, wh, bx, sy, out double wx, out double wy))
                     {
                         // 壁纸之外:用桌面背景色(深色桌默认接近黑)
