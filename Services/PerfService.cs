@@ -23,6 +23,7 @@ namespace DesktopBar.Services
         public string Name { get; set; }
         /// <summary>LUID "高32位:低32位",与 GPU 引擎计数器实例里的 luid 对应。</summary>
         public string Luid { get; set; }
+        internal ulong LuidValue { get; set; }
         /// <summary>PCI 厂商/设备 ID(0x1002=AMD,0x10DE=NVIDIA,0x8086=Intel),用于匹配 ADL/NVML 遥测。</summary>
         public int VendorId { get; set; }
         public int DeviceId { get; set; }
@@ -224,14 +225,7 @@ namespace DesktopBar.Services
                         bool readAdapters = readGpu || readCpu && pawnTctl < 0;
                         var adapters = readAdapters ? AdaptersSnapshot() : null;
                         sample.Gpus = readGpu ? adapters : new List<GpuAdapterInfo>();
-                        if (sample.Gpus.Count > 0 && pdh.GpuAvailable)
-                        {
-                            var sums = pdh.ReadGpuSums();
-                            foreach (var gpu in sample.Gpus)
-                                gpu.UtilPercent = sums.TryGetValue(gpu.Luid, out double v)
-                                    ? Math.Min(100.0, v)
-                                    : 0; // 计数器可用但无引擎实例 = 显卡完全空闲
-                        }
+                        if (sample.Gpus.Count > 0 && pdh.GpuAvailable) pdh.UpdateGpuUsage(sample.Gpus);
 
                         // GPU 温度/频率遥测:按厂商惰性初始化对应提供方,失败静默降级(面板显示 --)。
                         // 初始化失败后 60 秒内不重试:每秒 LoadLibrary/ADL_Create 的重试既泄漏句柄又空转。
@@ -330,7 +324,7 @@ namespace DesktopBar.Services
                 }
                 return _adapters.ConvertAll(adapter => new GpuAdapterInfo
                 {
-                    Name = adapter.Name, Luid = adapter.Luid,
+                    Name = adapter.Name, Luid = adapter.Luid, LuidValue = adapter.LuidValue,
                     VendorId = adapter.VendorId, DeviceId = adapter.DeviceId
                 });
             }
@@ -389,6 +383,8 @@ namespace DesktopBar.Services
             private IntPtr _netRecv = IntPtr.Zero;
             private IntPtr _netSent = IntPtr.Zero;
             private IntPtr _cpuPerf = IntPtr.Zero;
+            private IntPtr _counterBuffer;
+            private int _counterBufferSize;
             private bool _primed;
 
             public bool GpuAvailable => _gpuUtil != IntPtr.Zero;
@@ -443,30 +439,39 @@ namespace DesktopBar.Services
                 return v >= 0 && v < 10000 ? v : -1;
             }
 
-            /// <summary>按 LUID 键聚合 GPU 引擎占用率;无实例/读取失败返回空字典(视为 0%)。</summary>
-            public Dictionary<string, double> ReadGpuSums()
+            /// <summary>按 LUID 聚合 GPU 引擎占用率;无实例/读取失败视为 0%。</summary>
+            public void UpdateGpuUsage(List<GpuAdapterInfo> adapters)
             {
-                var sums = new Dictionary<string, double>();
-                if (_gpuUtil == IntPtr.Zero) return sums;
-                if (!ReadArray(_gpuUtil, out var items)) return sums;
-                foreach (var (name, value) in items)
+                foreach (var gpu in adapters) gpu.UtilPercent = 0;
+                if (!ReadArray(_gpuUtil, out int count)) return;
+                for (int i = 0; i < count; i++)
                 {
-                    string luid = GpuLuid.Parse(name);
-                    if (luid == null) continue;
-                    sums[luid] = (sums.TryGetValue(luid, out double s) ? s : 0) + value;
+                    if (!ReadItem(i, out IntPtr name, out double value)
+                        || !GpuLuid.TryParse(Marshal.PtrToStringUni(name), out ulong luid)) continue;
+                    foreach (var gpu in adapters)
+                    {
+                        if (gpu.LuidValue != luid) continue;
+                        gpu.UtilPercent += value;
+                    }
                 }
-                return sums;
+                foreach (var gpu in adapters) gpu.UtilPercent = Math.Min(100, gpu.UtilPercent);
             }
 
             /// <summary>聚合所有网络接口的收发字节速率;读取失败返回 (-1, -1)。</summary>
             public (double up, double down) ReadNetTotals()
             {
-                if (!ReadArray(_netRecv, out var recv)) return (-1, -1);
-                if (!ReadArray(_netSent, out var sent)) return (-1, -1);
-                double up = 0, down = 0;
-                foreach (var (_, value) in recv) down += value;
-                foreach (var (_, value) in sent) up += value;
-                return (up, down);
+                if (TryReadTotal(_netRecv, out double down) && TryReadTotal(_netSent, out double up))
+                    return (up, down);
+                return (-1, -1);
+            }
+
+            private bool TryReadTotal(IntPtr counter, out double total)
+            {
+                total = 0;
+                if (!ReadArray(counter, out int count)) return false;
+                for (int i = 0; i < count; i++)
+                    if (ReadItem(i, out _, out double value)) total += value;
+                return true;
             }
 
             // PDH_FMT_COUNTERVALUE_ITEM_W(x64): { LPWSTR szName; PDH_FMT_COUNTERVALUE(16B) } = 24B,
@@ -474,46 +479,35 @@ namespace DesktopBar.Services
             private const int ItemSize = 24;
             private const int MaxBufferSize = 16 * 1024 * 1024;
 
-            private bool ReadArray(IntPtr counter, out List<(string name, double value)> items)
+            private bool ReadArray(IntPtr counter, out int itemCount)
             {
-                items = new List<(string name, double value)>();
+                itemCount = 0;
+                if (counter == IntPtr.Zero) return false;
                 try
                 {
-                    int size = 64 * 1024;
-                    IntPtr buf = Marshal.AllocHGlobal(size);
-                    try
+                    int size = _counterBufferSize;
+                    int status = PerfNative.PdhGetFormattedCounterArrayW(counter, PerfNative.PDH_FMT_DOUBLE,
+                        ref size, ref itemCount, _counterBuffer);
+                    if (status == PerfNative.PDH_MORE_DATA)
                     {
-                        int itemCount = 0;
-                        int hr = PerfNative.PdhGetFormattedCounterArrayW(counter, PerfNative.PDH_FMT_DOUBLE,
-                            ref size, ref itemCount, buf);
-                        if (hr == PerfNative.PDH_MORE_DATA)
+                        // 从空缓冲询问尺寸，PDH 对非空但太小的缓冲返回的尺寸不保证有效。
+                        if (_counterBuffer != IntPtr.Zero)
                         {
-                            if (size <= 0 || size > MaxBufferSize) return false;
-                            Marshal.FreeHGlobal(buf);
-                            buf = Marshal.AllocHGlobal(size);
-                            itemCount = 0;
-                            hr = PerfNative.PdhGetFormattedCounterArrayW(counter, PerfNative.PDH_FMT_DOUBLE,
-                                ref size, ref itemCount, buf);
+                            size = itemCount = 0;
+                            status = PerfNative.PdhGetFormattedCounterArrayW(counter, PerfNative.PDH_FMT_DOUBLE,
+                                ref size, ref itemCount, IntPtr.Zero);
+                            if (status != PerfNative.PDH_MORE_DATA) return false;
                         }
-                        // PDH_INVALID_DATA(速率未就绪)/PDH_NO_DATA(实例为空)按无数据处理。
-                        if (hr != 0) return false;
-
-                        for (int i = 0; i < itemCount; i++)
-                        {
-                            IntPtr item = buf + i * ItemSize;
-                            IntPtr namePtr = Marshal.ReadIntPtr(item);
-                            if (namePtr == IntPtr.Zero) continue;
-                            if (Marshal.ReadInt32(item, 8) != 0) continue; // CStatus 非零 = 该实例数据无效
-                            double value = BitConverter.Int64BitsToDouble(Marshal.ReadInt64(item, 16));
-                            string name = Marshal.PtrToStringUni(namePtr);
-                            if (name != null) items.Add((name, value));
-                        }
-                        return true;
+                        if (size <= 0 || size > MaxBufferSize) return false;
+                        size = Math.Max(4096, size);
+                        IntPtr bigger = Marshal.AllocHGlobal(size);
+                        Marshal.FreeHGlobal(_counterBuffer);
+                        _counterBuffer = bigger;
+                        _counterBufferSize = size;
+                        status = PerfNative.PdhGetFormattedCounterArrayW(counter, PerfNative.PDH_FMT_DOUBLE,
+                            ref size, ref itemCount, _counterBuffer);
                     }
-                    finally
-                    {
-                        Marshal.FreeHGlobal(buf);
-                    }
+                    return status == 0 && itemCount >= 0 && itemCount <= _counterBufferSize / ItemSize;
                 }
                 catch
                 {
@@ -521,8 +515,21 @@ namespace DesktopBar.Services
                 }
             }
 
+            private bool ReadItem(int index, out IntPtr name, out double value)
+            {
+                IntPtr item = _counterBuffer + index * ItemSize;
+                name = Marshal.ReadIntPtr(item);
+                value = 0;
+                if (name == IntPtr.Zero || Marshal.ReadInt32(item, 8) != 0) return false;
+                value = BitConverter.Int64BitsToDouble(Marshal.ReadInt64(item, 16));
+                return true;
+            }
+
             public void Dispose()
             {
+                Marshal.FreeHGlobal(_counterBuffer);
+                _counterBuffer = IntPtr.Zero;
+                _counterBufferSize = 0;
                 if (_query != IntPtr.Zero)
                 {
                     try { PerfNative.PdhCloseQuery(_query); } catch { }
@@ -531,21 +538,22 @@ namespace DesktopBar.Services
             }
         }
 
-        /// <summary>GPU 引擎实例名解析:pid_10052_luid_0x00000000_0x00017171_phys_0_... → "00000000:00017171"。</summary>
+        /// <summary>从 GPU 引擎实例的名字读取 LUID 的高低两段。</summary>
         internal static class GpuLuid
         {
-            private static readonly Regex LuidRegex =
-                new Regex(@"luid_0x(?<high>[0-9A-Fa-f]{8})_0x(?<low>[0-9A-Fa-f]{8})", RegexOptions.Compiled);
-
-            public static string Parse(string instanceName)
+            public static bool TryParse(string instanceName, out ulong value)
             {
-                if (string.IsNullOrEmpty(instanceName)) return null;
-                var m = LuidRegex.Match(instanceName);
-                if (!m.Success) return null;
-                return ulong.Parse(m.Groups["high"].Value, NumberStyles.HexNumber, CultureInfo.InvariantCulture)
-                    .ToString("X8", CultureInfo.InvariantCulture)
-                    + ":" + ulong.Parse(m.Groups["low"].Value, NumberStyles.HexNumber, CultureInfo.InvariantCulture)
-                    .ToString("X8", CultureInfo.InvariantCulture);
+                value = 0;
+                const string prefix = "luid_0x";
+                int start = instanceName?.IndexOf(prefix, StringComparison.Ordinal) ?? -1;
+                if (start < 0) return false;
+                var parts = instanceName.AsSpan(start + prefix.Length);
+                if (parts.Length < 19 || !parts.Slice(8, 3).SequenceEqual("_0x")
+                    || !uint.TryParse(parts[..8], NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out uint high)
+                    || !uint.TryParse(parts.Slice(11, 8), NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out uint low))
+                    return false;
+                value = ((ulong)high << 32) | low;
+                return true;
             }
         }
 
@@ -1017,6 +1025,7 @@ namespace DesktopBar.Services
                             {
                                 Name = name,
                                 Luid = luid,
+                                LuidValue = ((ulong)(uint)desc.LuidHigh << 32) | desc.LuidLow,
                                 UtilPercent = -1,
                                 VendorId = (int)desc.VendorId,
                                 DeviceId = (int)desc.DeviceId
