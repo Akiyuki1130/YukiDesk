@@ -178,7 +178,7 @@ namespace DesktopBar.UI
                 _zone = null;
                 if (session == null) return 0;
 
-                uint performed = 0;
+                ShellFiles.DropResult performed = default;
                 _dropping = true;
                 try { zone.RunDrop(() => performed = CompleteDrop(session, _window, zone.Path, keys, point, allowed)); }
                 finally
@@ -186,8 +186,8 @@ namespace DesktopBar.UI
                     _dropping = false;
                     zone.SetActive(false);
                 }
-                effects = performed;
-                zone.Feedback.Finish(performed, false);
+                effects = performed.SourceEffect;
+                zone.Feedback.Finish(performed.FeedbackEffect, false);
             }
             catch (Exception ex)
             {
@@ -198,7 +198,7 @@ namespace DesktopBar.UI
             return 0;
         }
 
-        private static uint CompleteDrop(ShellFiles.DropSession session, IntPtr owner, string path, uint keys,
+        private static ShellFiles.DropResult CompleteDrop(ShellFiles.DropSession session, IntPtr owner, string path, uint keys,
             ShellFiles.ScreenPoint point, uint allowed)
         {
             using var payload = session.MarshalData();
@@ -207,8 +207,7 @@ namespace DesktopBar.UI
             var completion = payload.DropAsync(owner, path, session.EnterKeys, keys, point, allowed);
             if (!completion.IsCompleted)
             {
-                // OLE still needs the real result (especially for move). Pump WPF until the
-                // worker returns it so the bar and STA callbacks remain responsive in the meantime.
+                // OLE still needs the source effect. Pump WPF while the worker waits for the Shell.
                 var frame = new DispatcherFrame(exitWhenRequested: false);
                 _ = completion.ContinueWith(_ => frame.Continue = false,
                     System.Threading.CancellationToken.None, System.Threading.Tasks.TaskContinuationOptions.ExecuteSynchronously,

@@ -194,6 +194,42 @@ namespace DesktopBar.Interop
             OleUninitialize();
         }
 
+        // Keep the OLE response separate from the operation shown to the user.
+        internal readonly record struct DropResult(uint SourceEffect, uint FeedbackEffect);
+
+        private static readonly uint LogicalDropEffectFormat = RegisterClipboardFormatW("Logical Performed DropEffect");
+
+        private static uint ReadLogicalDropEffect(IDataObject data)
+        {
+            if (LogicalDropEffectFormat == 0) return 0;
+            var format = new FORMATETC
+            {
+                cfFormat = unchecked((short)LogicalDropEffectFormat),
+                dwAspect = DVASPECT.DVASPECT_CONTENT,
+                lindex = -1,
+                tymed = TYMED.TYMED_HGLOBAL
+            };
+            try
+            {
+                if (data.QueryGetData(ref format) != 0) return 0;
+                data.GetData(ref format, out var medium);
+                try
+                {
+                    if (medium.tymed != TYMED.TYMED_HGLOBAL || medium.unionmember == IntPtr.Zero
+                        || GlobalSize(medium.unionmember) < sizeof(uint)) return 0;
+                    var value = GlobalLock(medium.unionmember);
+                    if (value == IntPtr.Zero) return 0;
+                    try { return unchecked((uint)Marshal.ReadInt32(value)) & 7; }
+                    finally { GlobalUnlock(medium.unionmember); }
+                }
+                finally { ReleaseStgMedium(ref medium); }
+            }
+            catch (Exception ex) when (ex is COMException or NotImplementedException or InvalidComObjectException)
+            {
+                return 0;
+            }
+        }
+
         internal sealed class DropSession : IDisposable
         {
             private readonly IDropTarget _target;
@@ -233,11 +269,13 @@ namespace DesktopBar.Interop
                 return effects;
             }
 
-            internal uint Drop(uint keys, ScreenPoint point, uint effects)
+            internal DropResult Drop(uint keys, ScreenPoint point, uint effects)
             {
                 _entered = false;
                 Check(_target.Drop(_data, keys, point, ref effects));
-                return effects;
+                // An optimized move can report NONE to prevent the source removing files again.
+                uint logicalEffect = ReadLogicalDropEffect(_data);
+                return new DropResult(effects, logicalEffect != 0 ? logicalEffect : effects);
             }
 
             internal DropData MarshalData()
@@ -267,15 +305,15 @@ namespace DesktopBar.Interop
 
             internal DropData(IntPtr stream) => _stream = stream;
 
-            internal Task<uint> DropAsync(IntPtr owner, string target, uint enterKeys, uint dropKeys, ScreenPoint point, uint effects)
+            internal Task<DropResult> DropAsync(IntPtr owner, string target, uint enterKeys, uint dropKeys, ScreenPoint point, uint effects)
             {
-                var complete = new TaskCompletionSource<uint>(TaskCreationOptions.RunContinuationsAsynchronously);
+                var complete = new TaskCompletionSource<DropResult>(TaskCreationOptions.RunContinuationsAsynchronously);
                 var worker = new Thread(() =>
                 {
                     try
                     {
                         Check(OleInitialize(IntPtr.Zero));
-                        uint performed;
+                        DropResult performed;
                         try
                         {
                             var iid = typeof(IDataObject).GUID;
@@ -289,7 +327,7 @@ namespace DesktopBar.Interop
                                 // and replay DragEnter so Windows retains the source's original drag state.
                                 const uint TransferEffects = 7;
                                 performed = (session.Enter(enterKeys, point, effects) & TransferEffects) != 0
-                                    ? session.Drop(dropKeys, point, effects) : 0;
+                                    ? session.Drop(dropKeys, point, effects) : default;
                             }
                             finally
                             {
@@ -619,6 +657,8 @@ namespace DesktopBar.Interop
         private static extern int CoGetInterfaceAndReleaseStream(IntPtr stream, ref Guid iid, out IntPtr data);
         [DllImport("ole32.dll", ExactSpelling = true)]
         private static extern int CoReleaseMarshalData(IntPtr stream);
+        [DllImport("ole32.dll", ExactSpelling = true)]
+        private static extern void ReleaseStgMedium(ref STGMEDIUM medium);
         [DllImport("shell32.dll", CharSet = CharSet.Unicode, EntryPoint = "SHEmptyRecycleBinW")]
         private static extern int SHEmptyRecycleBin(IntPtr owner, string root, uint flags);
         [DllImport("shell32.dll", ExactSpelling = true)]
@@ -627,5 +667,13 @@ namespace DesktopBar.Interop
         private static extern IntPtr CreatePopupMenu();
         [DllImport("user32.dll")]
         private static extern bool DestroyMenu(IntPtr menu);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+        private static extern uint RegisterClipboardFormatW(string format);
+        [DllImport("kernel32.dll", ExactSpelling = true)]
+        private static extern nuint GlobalSize(IntPtr memory);
+        [DllImport("kernel32.dll", ExactSpelling = true)]
+        private static extern IntPtr GlobalLock(IntPtr memory);
+        [DllImport("kernel32.dll", ExactSpelling = true)]
+        private static extern bool GlobalUnlock(IntPtr memory);
     }
 }

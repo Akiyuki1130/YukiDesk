@@ -25,7 +25,13 @@ namespace DesktopBar.UI
 
         internal void Finish(uint effect, bool failed)
         {
-            Show(failed ? "拖放失败" : Label(effect) is string label ? label + "已提交" : "拖放未完成");
+            string label = Label(effect);
+            if (!failed && label == null)
+            {
+                Clear();
+                return;
+            }
+            Show(failed ? "拖放失败" : label + "已提交");
             _expiry ??= new DispatcherTimer(TimeSpan.FromMilliseconds(1250), DispatcherPriority.Background,
                 (_, _) => Clear(), Dispatcher);
             _expiry.Stop();
