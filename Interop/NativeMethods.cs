@@ -682,6 +682,7 @@ namespace DesktopBar.Interop
             out IntPtr screenDc, out IntPtr memoryDc, out IntPtr dib, out IntPtr bits)
         {
             screenDc = memoryDc = dib = bits = IntPtr.Zero;
+            bool created = false;
             try
             {
                 screenDc = GetDC(IntPtr.Zero);
@@ -699,10 +700,21 @@ namespace DesktopBar.Interop
                 };
                 dib = CreateDIBSection(screenDc, ref bmi, 0, out bits, IntPtr.Zero, 0);
                 if (dib == IntPtr.Zero || bits == IntPtr.Zero) return false;
-                SelectObject(memoryDc, dib);
-                return true;
+                IntPtr previous = SelectObject(memoryDc, dib);
+                created = previous != IntPtr.Zero && previous != new IntPtr(-1);
+                return created;
             }
             catch { return false; }
+            finally
+            {
+                if (!created)
+                {
+                    int error = Marshal.GetLastPInvokeError();
+                    DestroyStripCapture(ref screenDc, ref memoryDc, ref dib);
+                    bits = IntPtr.Zero;
+                    Marshal.SetLastPInvokeError(error);
+                }
+            }
         }
 
         // ---------- 合成节拍(dwmapi / gdi32) ----------
@@ -741,8 +753,9 @@ namespace DesktopBar.Interop
 
         internal static void DestroyStripCapture(ref IntPtr screenDc, ref IntPtr memoryDc, ref IntPtr dib)
         {
-            try { if (dib != IntPtr.Zero) DeleteObject(dib); } catch { }
+            // 先删除选中位图的内存 DC，确保随后能释放位图。
             try { if (memoryDc != IntPtr.Zero) DeleteDC(memoryDc); } catch { }
+            try { if (dib != IntPtr.Zero) DeleteObject(dib); } catch { }
             try { if (screenDc != IntPtr.Zero) ReleaseDC(IntPtr.Zero, screenDc); } catch { }
             screenDc = memoryDc = dib = IntPtr.Zero;
         }
