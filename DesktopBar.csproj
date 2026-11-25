@@ -11,9 +11,9 @@
     <ApplicationIcon>Assets\YukiDesk.ico</ApplicationIcon>
     <RootNamespace>DesktopBar</RootNamespace>
     <UseWindowsForms>true</UseWindowsForms>
-    <Version>2.3.5</Version>
-    <FileVersion>2.3.5.0</FileVersion>
-    <InformationalVersion>2.3.5</InformationalVersion>
+    <Version>2.3.6</Version>
+    <FileVersion>2.3.6.0</FileVersion>
+    <InformationalVersion>2.3.6</InformationalVersion>
     <RuntimeIdentifiers>win-x64;win-arm64</RuntimeIdentifiers>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
     <DebugType>embedded</DebugType>
